@@ -5,15 +5,17 @@ set -euxo pipefail
 
 INPUT_JSON=${INPUT_JSON:-./dataset/LongLive/CameraSFT/raw/clips.json}
 OUTPUT_DIR=${OUTPUT_DIR:-./dataset/LongLive/CameraSFT}
+VIDEO_DIR=${VIDEO_DIR:-}
 TARGET_H=${TARGET_H:-704}
 TARGET_W=${TARGET_W:-1280}
 MAX_FRAMES=${MAX_FRAMES:-77}
 NPROC=${NPROC:-8}
 
-torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} \
+torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b.py \
-    --input_json   ${INPUT_JSON} \
-    --output_dir   ${OUTPUT_DIR} \
-    --target_h     ${TARGET_H} \
-    --target_w     ${TARGET_W} \
-    --max_frames   ${MAX_FRAMES}
+    --input_json   "${INPUT_JSON}" \
+    --video_dir    "${VIDEO_DIR}" \
+    --output_dir   "${OUTPUT_DIR}" \
+    --target_h     "${TARGET_H}" \
+    --target_w     "${TARGET_W}" \
+    --max_frames   "${MAX_FRAMES}"

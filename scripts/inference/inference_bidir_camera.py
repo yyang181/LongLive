@@ -25,7 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -36,6 +35,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Reuse the camera-trajectory parsing from the data-prep script.
 from scripts.data_preprocessing.build_camera_lmdb_5b import poses_from_pose_str  # noqa: E402
+from utils.camera_dataset import build_viewmats_and_Ks  # noqa: E402
 from utils.config import normalize_config  # noqa: E402
 from utils.inference_utils import save_video  # noqa: E402
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper  # noqa: E402
@@ -45,57 +45,6 @@ from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper  # noqa: E402
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
-def _quat_to_R(quat: np.ndarray) -> np.ndarray:
-    """[x,y,z,w] -> 3x3 rotation matrix."""
-    x, y, z, w = quat
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-    return np.array([
-        [1 - 2 * (yy + zz),     2 * (xy - wz),     2 * (xz + wy)],
-        [    2 * (xy + wz), 1 - 2 * (xx + zz),     2 * (yz - wx)],
-        [    2 * (xz - wy),     2 * (yz + wx), 1 - 2 * (xx + yy)],
-    ], dtype=np.float32)
-
-
-def build_viewmats_and_Ks(
-    intrinsics_norm: np.ndarray,
-    poses: np.ndarray,
-    target_h: int,
-    target_w: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert (intrinsics_norm[4], poses[F,7]) to (viewmats[F,4,4], Ks[F,3,3]).
-
-    Mirrors `utils.camera_dataset.build_viewmats_and_Ks` so that training and
-    inference share an identical PRoPE input convention.
-    """
-    F = poses.shape[0]
-    fx_n, fy_n, cx_n, cy_n = intrinsics_norm.tolist()
-    fx, fy = fx_n * target_w, fy_n * target_h
-    cx, cy = cx_n * target_w, cy_n * target_h
-
-    Ks = np.zeros((F, 3, 3), dtype=np.float32)
-    Ks[:, 0, 0] = fx
-    Ks[:, 1, 1] = fy
-    Ks[:, 0, 2] = cx
-    Ks[:, 1, 2] = cy
-    Ks[:, 2, 2] = 1.0
-
-    viewmats = np.zeros((F, 4, 4), dtype=np.float32)
-    for i in range(F):
-        t = poses[i, :3]
-        q = poses[i, 3:]
-        viewmats[i, :3, :3] = _quat_to_R(q)
-        viewmats[i, :3, 3] = t
-        viewmats[i, 3, 3] = 1.0
-
-    # Normalize to first-frame camera coordinates (so PRoPE is translation-
-    # invariant within a clip).
-    inv0 = np.linalg.inv(viewmats[0])
-    viewmats = np.einsum("ij,fjk->fik", inv0, viewmats)
-    return torch.from_numpy(viewmats), torch.from_numpy(Ks)
-
-
 def load_generator(config, ckpt_path: str, device: torch.device) -> CameraWanDiffusionWrapper:
     mk = config.get("model_kwargs", {})
     gen = CameraWanDiffusionWrapper(
@@ -107,12 +56,23 @@ def load_generator(config, ckpt_path: str, device: torch.device) -> CameraWanDif
     if ckpt_path:
         print(f"[infer] loading generator weights from: {ckpt_path}")
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
-            sd = sd["model"]
+        if isinstance(sd, dict):
+            if "generator_ema" in sd and isinstance(sd["generator_ema"], dict):
+                sd = sd["generator_ema"]
+            elif "generator" in sd and isinstance(sd["generator"], dict):
+                sd = sd["generator"]
+            elif "model" in sd and isinstance(sd["model"], dict):
+                sd = sd["model"]
         # Strip optional "model." prefix dumped by some FSDP routines.
         cleaned = {
             (k[len("model."):] if k.startswith("model.") else k): v
             for k, v in sd.items()
+        }
+        cleaned = {
+            k.replace("_fsdp_wrapped_module.", "")
+             .replace("_checkpoint_wrapped_module.", "")
+             .replace("_orig_mod.", ""): v
+            for k, v in cleaned.items()
         }
         missing, unexpected = gen.model.load_state_dict(cleaned, strict=False)
         print(f"[infer] missing={len(missing)}  unexpected={len(unexpected)}")
@@ -172,10 +132,10 @@ def main() -> None:
     target_h = H_lat * 16
     target_w = W_lat * 16
     fps = int(inf_cfg.get("fps", 24))
-    intrinsics_norm = np.array([
+    intrinsics_norm = torch.tensor([
         float(inf_cfg["fx_norm"]), float(inf_cfg["fy_norm"]),
         float(inf_cfg["cx_norm"]), float(inf_cfg["cy_norm"]),
-    ], dtype=np.float32)
+    ], dtype=torch.float32).numpy()
 
     # ---------- scheduler ----------
     scheduler = generator.get_scheduler()
@@ -193,10 +153,9 @@ def main() -> None:
         # The data-prep script returns intrinsics already normalized; we
         # override with config-provided defaults here so inference can vary
         # focal/principal-point at test time.
-        viewmats, Ks = build_viewmats_and_Ks(
-            intrinsics_norm, poses_clip, target_h, target_w)
-        viewmats = viewmats[None].to(device=device, dtype=torch.float32)
-        Ks = Ks[None].to(device=device, dtype=torch.float32)
+        viewmats, Ks = build_viewmats_and_Ks(intrinsics_norm, poses_clip)
+        viewmats = torch.from_numpy(viewmats)[None].to(device=device, dtype=torch.float32)
+        Ks = torch.from_numpy(Ks)[None].to(device=device, dtype=torch.float32)
 
         # Text conditioning (CFG).
         cond = text_encoder([prompt])

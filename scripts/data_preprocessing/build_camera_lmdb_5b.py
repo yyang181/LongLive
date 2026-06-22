@@ -200,6 +200,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input_json", required=True,
                    help="JSON list of {video_path, caption, pose_str}")
+    p.add_argument("--video_dir", default="",
+                   help="Optional root used to resolve relative video_path values")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--target_h", type=int, default=704)
     p.add_argument("--target_w", type=int, default=1280)
@@ -208,8 +210,32 @@ def parse_args():
     return p.parse_args()
 
 
+def _resolve_video_path(video_path: str, video_dir: str, input_json: str) -> str:
+    if os.path.isabs(video_path) and os.path.exists(video_path):
+        return video_path
+    candidates = []
+    if video_dir:
+        candidates.append(os.path.join(video_dir, video_path))
+    candidates.append(video_path)
+    candidates.append(os.path.join(os.path.dirname(input_json), video_path))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0] if candidates else video_path
+
+
 def main():
     args = parse_args()
+    if (args.max_frames - 1) % 4 != 0:
+        raise ValueError(
+            f"max_frames={args.max_frames} is invalid for Wan2.2 VAE; "
+            "expected 4*k+1 raw frames so camera poses match latent frames."
+        )
+    if args.target_h % 16 != 0 or args.target_w % 16 != 0:
+        raise ValueError(
+            f"target_h/target_w must be divisible by 16, got "
+            f"{args.target_h}x{args.target_w}."
+        )
     n_latent = (args.max_frames - 1) // 4 + 1   # Wan2.2 VAE: 4x temporal
     h_lat = args.target_h // 16
     w_lat = args.target_w // 16
@@ -239,11 +265,15 @@ def main():
         print(f"Loaded {len(data_list)} clips from {args.input_json}")
         print(f"F_lat={n_latent}  H_lat={h_lat}  W_lat={w_lat}")
 
-    # Validate paths
+    # Validate and resolve paths
     valid = []
     for entry in data_list:
-        if os.path.exists(entry["video_path"]):
-            valid.append(entry)
+        resolved = _resolve_video_path(
+            entry["video_path"], args.video_dir, args.input_json)
+        if os.path.exists(resolved):
+            item = dict(entry)
+            item["video_path"] = resolved
+            valid.append(item)
     if global_rank == 0:
         print(f"Valid videos: {len(valid)}/{len(data_list)}")
 

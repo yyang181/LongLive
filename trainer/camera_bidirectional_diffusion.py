@@ -16,6 +16,7 @@ generator + EMA + optimizer states are needed).
 import gc
 import logging
 import os
+import re
 import time
 
 import torch
@@ -49,6 +50,36 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.disable_wandb = config.disable_wandb
+
+        total_batch_size = getattr(config, "total_batch_size", None)
+        micro_global_batch = int(config.batch_size) * int(world_size)
+        configured_accumulation = getattr(config, "gradient_accumulation_steps", None)
+        if configured_accumulation is None:
+            if total_batch_size is not None:
+                if int(total_batch_size) % micro_global_batch != 0:
+                    raise ValueError(
+                        f"total_batch_size={total_batch_size} must be divisible "
+                        f"by batch_size*world_size={micro_global_batch}."
+                    )
+                self.gradient_accumulation_steps = max(
+                    1, int(total_batch_size) // micro_global_batch)
+            else:
+                self.gradient_accumulation_steps = 1
+        else:
+            self.gradient_accumulation_steps = int(configured_accumulation)
+            if total_batch_size is not None:
+                effective = micro_global_batch * self.gradient_accumulation_steps
+                if int(total_batch_size) != effective:
+                    raise ValueError(
+                        f"total_batch_size={total_batch_size} but "
+                        f"batch_size*world_size*gradient_accumulation_steps={effective}."
+                    )
+        if self.is_main_process and self.gradient_accumulation_steps > 1:
+            eff_batch = micro_global_batch * self.gradient_accumulation_steps
+            print(
+                f"[CameraBiDiff] gradient_accumulation_steps="
+                f"{self.gradient_accumulation_steps}, effective batch size={eff_batch}"
+            )
 
         if config.seed == 0:
             random_seed = torch.randint(0, 10000000, (1,), device=self.device)
@@ -118,23 +149,16 @@ class Trainer:
             print(f"[CameraBiDiff] dataset size = {len(dataset)}")
         self.dataloader = cycle(loader)
 
-        # ---- Optional resume ----
-        ckpt_path = getattr(config, "generator_ckpt", None)
-        if ckpt_path and os.path.exists(ckpt_path):
-            if self.is_main_process:
-                print(f"[CameraBiDiff] loading generator from {ckpt_path}")
-            sd = torch.load(ckpt_path, map_location="cpu")
-            sd = sd.get("generator", sd.get("model", sd))
-            fixed = {}
-            for k, v in sd.items():
-                if k.startswith("model._fsdp_wrapped_module."):
-                    k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                fixed[k] = v
-            try:
-                self.model.generator.load_state_dict(fixed, strict=False)
-            except Exception as e:
-                if self.is_main_process:
-                    print(f"[CameraBiDiff] resume warning: {e}")
+        # ---- Optional resume / initialization ----
+        auto_resume = getattr(config, "auto_resume", True)
+        resume_ckpt = self._find_latest_checkpoint(self.output_path) if auto_resume else None
+        init_ckpt = getattr(config, "generator_ckpt", None)
+        if resume_ckpt is not None:
+            self._load_checkpoint(resume_ckpt, resume_training=True)
+        elif init_ckpt and os.path.exists(init_ckpt):
+            self._load_checkpoint(init_ckpt, resume_training=False)
+        elif init_ckpt and self.is_main_process:
+            print(f"[CameraBiDiff] generator_ckpt not found: {init_ckpt}")
 
         self.unconditional_dict = None
         self.max_grad_norm = getattr(config, "max_grad_norm", 10.0)
@@ -144,14 +168,104 @@ class Trainer:
         self.save_interval = getattr(config, "save_interval", 1000)
         self.max_iters = getattr(config, "max_iters", 100000)
 
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_state_key(key: str) -> str:
+        if key.startswith("model._fsdp_wrapped_module."):
+            key = key.replace("model._fsdp_wrapped_module.", "model.", 1)
+        if key.startswith("model."):
+            # Unwrapped inference checkpoints may store the inner Wan model only.
+            # FSDP-wrapped CameraWanDiffusionWrapper checkpoints keep this prefix.
+            pass
+        return (key.replace("_fsdp_wrapped_module.", "")
+                   .replace("_checkpoint_wrapped_module.", "")
+                   .replace("_orig_mod.", ""))
+
+    @classmethod
+    def _extract_generator_state_dict(cls, raw_state):
+        if isinstance(raw_state, dict):
+            if "generator" in raw_state and isinstance(raw_state["generator"], dict):
+                raw_state = raw_state["generator"]
+            elif "model" in raw_state and isinstance(raw_state["model"], dict):
+                raw_state = raw_state["model"]
+        if not isinstance(raw_state, dict):
+            raise TypeError("checkpoint does not contain a state dict")
+        return {cls._clean_state_key(k): v for k, v in raw_state.items()}
+
+    @staticmethod
+    def _find_latest_checkpoint(logdir):
+        if not logdir or not os.path.isdir(logdir):
+            return None
+        candidates = []
+        pat = re.compile(r"checkpoint_model_(\d+)$")
+        for name in os.listdir(logdir):
+            match = pat.match(name)
+            if not match:
+                continue
+            path = os.path.join(logdir, name, "model.pt")
+            if os.path.isfile(path):
+                candidates.append((int(match.group(1)), path))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _step_from_checkpoint_path(path):
+        match = re.search(r"checkpoint_model_(\d+)", path or "")
+        return int(match.group(1)) if match else 0
+
+    def _load_checkpoint(self, ckpt_path, resume_training: bool):
+        if self.is_main_process:
+            mode = "resuming" if resume_training else "initializing"
+            print(f"[CameraBiDiff] {mode} from {ckpt_path}")
+        raw_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        gen_sd = self._extract_generator_state_dict(raw_state)
+        missing, unexpected = self.model.generator.load_state_dict(gen_sd, strict=False)
+        if self.is_main_process:
+            print(f"[CameraBiDiff] load generator: missing={len(missing)} unexpected={len(unexpected)}")
+            if unexpected:
+                print(f"[CameraBiDiff] unexpected keys (first 5): {unexpected[:5]}")
+
+        if not resume_training:
+            return
+
+        self.step = int(raw_state.get("step", self._step_from_checkpoint_path(ckpt_path)))
+        if "generator_optimizer" in raw_state:
+            optim_sd = FSDP.optim_state_dict_to_load(
+                self.model.generator, self.generator_optimizer,
+                raw_state["generator_optimizer"],
+            )
+            self.generator_optimizer.load_state_dict(optim_sd)
+            if self.is_main_process:
+                print("[CameraBiDiff] resumed generator optimizer")
+        elif self.is_main_process:
+            print("[CameraBiDiff] optimizer state missing; continuing with a fresh optimizer")
+
+        ema_state = raw_state.get("generator_ema", None)
+        ema_path = os.path.join(os.path.dirname(ckpt_path), "model_ema.pt")
+        if ema_state is None and os.path.exists(ema_path):
+            ema_raw = torch.load(ema_path, map_location="cpu", weights_only=False)
+            ema_state = ema_raw.get("generator_ema", ema_raw)
+        if self.generator_ema is not None and ema_state is not None:
+            self.generator_ema.load_state_dict(ema_state)
+            if self.is_main_process:
+                print("[CameraBiDiff] resumed generator EMA")
+
     # ------------------------------------------------------------------
     # Train loop
     # ------------------------------------------------------------------
     def train(self):
         while self.step < self.max_iters:
-            batch = next(self.dataloader)
             t0 = time.time()
-            log = self.train_one_step(batch)
+            log = None
+            for accumulation_step in range(self.gradient_accumulation_steps):
+                batch = next(self.dataloader)
+                log = self.train_one_step(
+                    batch, accumulation_step=accumulation_step,
+                    accumulation_steps=self.gradient_accumulation_steps)
             elapsed = time.time() - t0
 
             if (self.step % self.log_interval == 0) and self.is_main_process:
@@ -173,7 +287,7 @@ class Trainer:
         if not getattr(self.config, "no_save", False):
             self.save()
 
-    def train_one_step(self, batch):
+    def train_one_step(self, batch, accumulation_step=0, accumulation_steps=1):
         self.model.generator.train()
 
         text_prompts = batch["prompts"]
@@ -208,8 +322,14 @@ class Trainer:
             Ks=Ks,
         )
 
-        self.generator_optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        if accumulation_step == 0:
+            self.generator_optimizer.zero_grad(set_to_none=True)
+        scaled_loss = loss / accumulation_steps
+        scaled_loss.backward()
+
+        if accumulation_step != accumulation_steps - 1:
+            return None
+
         grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)
         self.generator_optimizer.step()
 
@@ -231,10 +351,21 @@ class Trainer:
             os.makedirs(save_dir, exist_ok=True)
         barrier()
         gen_sd = fsdp_state_dict(self.model.generator)
+        gen_optim_sd = FSDP.optim_state_dict(
+            self.model.generator, self.generator_optimizer)
+        ema_sd = (self.generator_ema.state_dict()
+                  if self.generator_ema is not None else None)
         if self.is_main_process:
-            torch.save({"generator": gen_sd}, os.path.join(save_dir, "model.pt"))
-            if self.generator_ema is not None:
-                torch.save({"generator_ema": self.generator_ema.state_dict()},
+            payload = {
+                "step": self.step,
+                "generator": gen_sd,
+                "generator_optimizer": gen_optim_sd,
+            }
+            if ema_sd is not None:
+                payload["generator_ema"] = ema_sd
+            torch.save(payload, os.path.join(save_dir, "model.pt"))
+            if ema_sd is not None:
+                torch.save({"generator_ema": ema_sd},
                            os.path.join(save_dir, "model_ema.pt"))
             print(f"[CameraBiDiff] saved checkpoint to {save_dir}")
         barrier()
