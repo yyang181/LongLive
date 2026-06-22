@@ -33,8 +33,8 @@ training:
   ema_weight: 0.99
   ema_start_step: 100
   log_iters: 1
-  max_checkpoints: 20
-  max_iters: 600
+  max_checkpoints: 20000000000 # 20
+  max_iters: 9000000000000 # 600
   gc_interval: 100
   error_recycling:
     enabled: true
