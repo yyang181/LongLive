@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
-from transformers.models.x_clip.modeling_x_clip import x_clip_loss
+# from transformers.models.x_clip.modeling_x_clip import x_clip_loss
 from wan_5b.modules.attention import attention
 from wan_5b.modules.model import (
     WanRMSNorm,
