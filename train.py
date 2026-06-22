@@ -5,7 +5,11 @@ import os
 from omegaconf import OmegaConf
 import wandb
 
-from trainer import ScoreDistillationTrainer, DiffusionTrainer
+from trainer import (
+    ScoreDistillationTrainer,
+    DiffusionTrainer,
+    CameraBidirectionalDiffusionTrainer,
+)
 from utils.config import normalize_config
 
 
@@ -38,6 +42,10 @@ def main():
         trainer = ScoreDistillationTrainer(config)
     elif config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)
+    elif config.trainer == "camera_bidirectional_diffusion":
+        trainer = CameraBidirectionalDiffusionTrainer(config)
+    else:
+        raise ValueError(f"Unknown trainer type: {config.trainer}")
     trainer.train()
 
     wandb.finish()

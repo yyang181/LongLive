@@ -1,0 +1,34 @@
+# Inference config for Camera (PRoPE) Bidirectional Wan2.2-TI2V-5B.
+# Used by scripts/inference/inference_bidir_camera.py.
+
+algorithm:
+  causal: false
+  use_camera: true
+
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  use_camera: true
+
+inference:
+  sampling_steps: 50
+  guidance_scale: 5.0
+  num_latent_frames: 20      # F_lat (matches training)
+  height_latent: 44          # 704 / 16
+  width_latent: 80           # 1280 / 16
+  num_channels: 48
+  fps: 24
+  # Default WorldPlayGen-style intrinsics (1920x1080 capture, f≈969.7).
+  fx_norm: 0.5050505050505051   # 969.6969.../1920
+  fy_norm: 0.8978675264437377   # 969.6969.../1080
+  cx_norm: 0.5
+  cy_norm: 0.5
+  # Where to find prompts and trajectories (one per line).
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories.txt
+
+checkpoints:
+  generator_ckpt: ""   # filled at runtime via --generator_ckpt
+
+logging:
+  output_dir: videos/camera_bidir

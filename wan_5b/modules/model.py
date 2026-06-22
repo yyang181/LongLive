@@ -136,13 +136,18 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, prope_meta=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            prope_meta(dict, optional): Pass-through dict for PRoPE positional encoding.
+                Expected keys: ``viewmats`` (B, F, 4, 4), ``Ks`` (B, F, 3, 3),
+                ``F`` (int), ``H`` (int), ``W`` (int) — the post-patch latent
+                grid for the current sample. When None, this layer behaves
+                identically to the original (RoPE-only) path.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -155,17 +160,51 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
+        # ----- Default RoPE path (always runs) -----
+        x_rope = flash_attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+        x_rope = x_rope.flatten(2)
+        out = self.o(x_rope)
 
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        # ----- Optional PRoPE residual path -----
+        if prope_meta is not None and getattr(self, "prope_o", None) is not None:
+            from .prope import prope_qkv
+            viewmats = prope_meta["viewmats"]   # (B, F, 4, 4)
+            Ks = prope_meta.get("Ks", None)     # (B, F, 3, 3) or None
+            num_cams = viewmats.shape[1]
+            # Self-attn input is (B, S, n, d); PRoPE expects (B, n, S, d).
+            qp = q.permute(0, 2, 1, 3).contiguous()
+            kp = k.permute(0, 2, 1, 3).contiguous()
+            vp = v.permute(0, 2, 1, 3).contiguous()
+            # Tokens are laid out as (F, H, W) → contiguous along the latent
+            # frame axis, so ``cameras = num_latent_frames`` partitions the
+            # sequence correctly. ``patches_x * patches_y == H*W`` per camera.
+            assert qp.shape[2] % num_cams == 0, (
+                f"seqlen={qp.shape[2]} not divisible by num_cams={num_cams}; "
+                f"PRoPE expects token order (F, H, W).")
+            qp, kp, vp, apply_fn_o = prope_qkv(
+                qp, kp, vp, viewmats=viewmats.to(dtype=qp.dtype), Ks=(
+                    Ks.to(dtype=qp.dtype) if Ks is not None else None
+                ),
+            )
+            # Back to flash_attention layout: (B, S, n, d).
+            qf = qp.permute(0, 2, 1, 3).contiguous()
+            kf = kp.permute(0, 2, 1, 3).contiguous()
+            vf = vp.permute(0, 2, 1, 3).contiguous()
+            x_prope = flash_attention(
+                q=qf, k=kf, v=vf, k_lens=seq_lens, window_size=self.window_size,
+            )
+            # Apply PRoPE output projection: (B, S, n*d) → (B, n, S, d) → fn → flatten.
+            x_prope = x_prope.permute(0, 2, 1, 3).contiguous()  # (B, n, S, d)
+            x_prope = apply_fn_o(x_prope)
+            x_prope = x_prope.permute(0, 2, 1, 3).contiguous().flatten(2)
+            out = out + self.prope_o(x_prope)
+
+        return out
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -251,6 +290,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        prope_meta=None,
     ):
         r"""
         Args:
@@ -259,13 +299,14 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            prope_meta(dict, optional): forwarded to self_attn for PRoPE.
         """
         e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
 
         # self-attention
         y = self.self_attn(
             self.norm1(x).type_as(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens, grid_sizes, freqs, prope_meta=prope_meta)
         x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
@@ -447,6 +488,8 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        viewmats=None,
+        Ks=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -462,6 +505,14 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            viewmats (Tensor, *optional*):
+                Per-camera w2c view matrices of shape ``(B, F_lat, 4, 4)`` used
+                by PRoPE. ``F_lat`` MUST equal the post-patch latent frame
+                count (== ``F_in / patch_size[0]`` for ``patch_size=(1,2,2)``,
+                i.e. equal to F_in). When ``None``, the model runs the
+                original RoPE-only path.
+            Ks (Tensor, *optional*):
+                Per-camera intrinsics of shape ``(B, F_lat, 3, 3)``.
 
         Returns:
             List[Tensor]:
@@ -516,6 +567,30 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens)
+
+        # ---- Build PRoPE meta (if camera info provided) ----
+        prope_meta = None
+        if viewmats is not None:
+            # Move to model device/dtype lazily; keep float32 for the math.
+            viewmats = viewmats.to(device=device)
+            if Ks is not None:
+                Ks = Ks.to(device=device)
+            # Use the first sample's grid as canonical (all samples in a batch
+            # are expected to share the same latent shape during training).
+            f_lat = int(grid_sizes[0, 0].item())
+            h_lat = int(grid_sizes[0, 1].item())
+            w_lat = int(grid_sizes[0, 2].item())
+            assert viewmats.shape[1] == f_lat, (
+                f"viewmats has {viewmats.shape[1]} cameras but latent has "
+                f"{f_lat} frames after patch embedding. They must match.")
+            prope_meta = {
+                "viewmats": viewmats,
+                "Ks": Ks,
+                "F": f_lat,
+                "H": h_lat,
+                "W": w_lat,
+            }
+        kwargs["prope_meta"] = prope_meta
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
