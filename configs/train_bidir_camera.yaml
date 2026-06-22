@@ -33,11 +33,16 @@ training:
   ema_start_step: 0
   max_grad_norm: 10.0
   batch_size: 1
-  total_batch_size: 8        # 8 GPUs * batch_size 1 (no grad-accum by default)
+  # Leave total_batch_size unset so gradient_accumulation_steps == 1 always:
+  # the effective batch = batch_size * world_size, i.e. it auto-tracks
+  # --nproc_per_node (1 GPU -> 1, 2 GPUs -> 2, 8 GPUs -> 8) with no grad-accum.
+  # To force a fixed global batch with accumulation instead, set e.g.
+  # total_batch_size: 8 (must be divisible by batch_size * world_size).
+  total_batch_size: null
   max_iters: 30000
 
 data:
-  data_path: ./dataset/LongLive/CameraSFT/data
+  data_path: ./data/train/minWM-data/data # ./dataset/LongLive/CameraSFT/data 
   # [B, F_lat, C, H_lat, W_lat] for Wan2.2-TI2V-5B (4x temporal, 16x spatial).
   # 20 latent frames -> 77 raw frames; 44x80 latent grid -> 704x1280 raw.
   image_or_video_shape: [1, 20, 48, 44, 80]

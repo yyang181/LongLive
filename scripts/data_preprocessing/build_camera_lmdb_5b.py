@@ -41,7 +41,14 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import time
+
+# Make the repo root importable so ``utils.*`` resolves regardless of the
+# directory torchrun is launched from (this file lives two levels below root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import lmdb
 import numpy as np
@@ -207,7 +214,41 @@ def parse_args():
     p.add_argument("--target_w", type=int, default=1280)
     p.add_argument("--max_frames", type=int, default=77,
                    help="raw frame count (must give integer F_lat under 4x temporal)")
+    p.add_argument("--keep_shards", action="store_true",
+                   help="Keep the transient per-rank shard dirs after merge "
+                        "(debugging only). By default they are deleted; resume "
+                        "relies on the merged 'data/' LMDB, not on the shards.")
+    p.add_argument("--no_resume", action="store_true",
+                   help="Wipe any existing output ('data/' + shards) and "
+                        "reprocess everything from scratch.")
     return p.parse_args()
+
+
+def _read_paths_from_lmdb(lmdb_dir):
+    """Return (count, set_of_video_paths) stored in an existing LMDB.
+
+    Works for both the merged ``data/`` dir and a per-rank shard dir. Returns
+    ``(0, set())`` if the dir has no ``data.mdb`` yet.
+    """
+    if not os.path.isfile(os.path.join(lmdb_dir, "data.mdb")):
+        return 0, set()
+    env = lmdb.open(lmdb_dir, readonly=True, lock=False)
+    paths = set()
+    count = 0
+    with env.begin() as txn:
+        cnt_raw = txn.get(b"__count__")
+        if cnt_raw is not None:
+            count = int(cnt_raw.decode())
+        else:
+            ls = txn.get(b"latents_shape")
+            if ls is not None:
+                count = int(ls.decode().split()[0])
+        for j in range(count):
+            p = txn.get(f"paths_{j}_data".encode())
+            if p is not None:
+                paths.add(p.decode("utf-8"))
+    env.close()
+    return count, paths
 
 
 def _resolve_video_path(video_path: str, video_dir: str, input_json: str) -> str:
@@ -239,6 +280,11 @@ def main():
     n_latent = (args.max_frames - 1) // 4 + 1   # Wan2.2 VAE: 4x temporal
     h_lat = args.target_h // 16
     w_lat = args.target_w // 16
+    # Output tensor shapes are fully determined by the args, so we can rely on
+    # them for merge metadata even when a resumed run adds zero new samples.
+    lat_shape_det = (n_latent, 48, h_lat, w_lat)
+    intr_shape_det = (4,)
+    poses_shape_det = (n_latent, 7)
     per_sample_bytes = (
         n_latent * 48 * h_lat * w_lat * 2  # latent fp16
         + 4 * 4                            # intrinsics
@@ -289,18 +335,54 @@ def main():
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    final_dir = os.path.join(args.output_dir, "data")
     rank_dir = os.path.join(args.output_dir, f".rank_{global_rank}")
+
+    # ---- Optional clean slate ----
+    if args.no_resume:
+        if global_rank == 0 and os.path.exists(final_dir):
+            shutil.rmtree(final_dir)
+        if os.path.exists(rank_dir):
+            shutil.rmtree(rank_dir)
+        if world_size > 1:
+            torch.distributed.barrier()
+
     os.makedirs(rank_dir, exist_ok=True)
     rank_map = int(len(shard) * per_sample_bytes * 1.3) + 100_000_000
     rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
 
+    # ---- Resume ----
+    # The merged ``data/`` LMDB is the authoritative record of what is already
+    # done across runs (it stores each clip's video_path). Every rank reads it
+    # to know which clips to skip. A leftover shard from a run that was killed
+    # mid-encoding is also honoured so within-run progress is not lost.
+    done_paths = set()
+    if not args.no_resume:
+        _, merged_paths = _read_paths_from_lmdb(final_dir)
+        done_paths |= merged_paths
+    # own leftover shard (continue appending to it)
     count = 0
+    with rank_env.begin() as txn:
+        cnt_raw = txn.get(b"__count__")
+        if cnt_raw is not None:
+            count = int(cnt_raw.decode())
+            for j in range(count):
+                p = txn.get(f"paths_{j}_data".encode())
+                if p is not None:
+                    done_paths.add(p.decode("utf-8"))
+    if global_rank == 0 and done_paths:
+        print(f"[resume] {len(done_paths)} clips already processed "
+              f"(merged + shards); they will be skipped.")
+
     errors = 0
     first_shape = None
     t0 = time.time()
     pbar = tqdm(shard, desc=f"GPU{local_rank}", disable=(global_rank != 0),
                 dynamic_ncols=True)
     for idx, item in enumerate(pbar):
+        if item["video_path"] in done_paths:
+            pbar.set_postfix(ok=count, err=errors, skip=len(done_paths))
+            continue
         try:
             frames = load_video_frames(
                 item["video_path"], args.max_frames,
@@ -323,6 +405,11 @@ def main():
                     item["caption"].encode("utf-8"))
             txn.put(f"intrinsics_{count}_data".encode(), intrinsics.tobytes())
             txn.put(f"poses_{count}_data".encode(), poses.tobytes())
+            # Stored so a future run knows this clip is already processed.
+            txn.put(f"paths_{count}_data".encode(),
+                    item["video_path"].encode("utf-8"))
+            # Persist running count immediately so an interrupted run is resumable.
+            txn.put(b"__count__", str(count + 1).encode())
 
         if first_shape is None:
             first_shape = (latent_np.shape, intrinsics.shape, poses.shape)
@@ -339,55 +426,61 @@ def main():
 
     with rank_env.begin(write=True) as txn:
         txn.put(b"__count__", str(count).encode())
-        if first_shape:
-            txn.put(b"__lat_shape__", " ".join(map(str, first_shape[0])).encode())
-            txn.put(b"__intr_shape__", " ".join(map(str, first_shape[1])).encode())
-            txn.put(b"__poses_shape__", " ".join(map(str, first_shape[2])).encode())
+        txn.put(b"__lat_shape__", " ".join(map(str, lat_shape_det)).encode())
+        txn.put(b"__intr_shape__", " ".join(map(str, intr_shape_det)).encode())
+        txn.put(b"__poses_shape__", " ".join(map(str, poses_shape_det)).encode())
     rank_env.sync(); rank_env.close()
     print(f"GPU{local_rank}: {count} OK, {errors} errors, {time.time()-t0:.0f}s")
 
-    # ---- Phase 2: rank-0 merges all shards ----
+    # ---- Phase 2: rank-0 appends new shard samples into the merged data/ ----
     if world_size > 1:
         torch.distributed.barrier()
 
     if global_rank == 0:
-        total = 0
-        lat_shape = intr_shape = poses_shape = None
+        # New samples produced across all shards this run.
+        new_total = 0
         for r in range(world_size):
             rd = os.path.join(args.output_dir, f".rank_{r}")
-            if not os.path.exists(rd):
-                continue
-            renv = lmdb.open(rd, readonly=True, lock=False)
-            with renv.begin() as txn:
-                total += int(txn.get(b"__count__").decode())
-                if lat_shape is None:
-                    ls = txn.get(b"__lat_shape__")
-                    if ls:
-                        lat_shape = tuple(map(int, ls.decode().split()))
-                        intr_shape = tuple(map(int,
-                            txn.get(b"__intr_shape__").decode().split()))
-                        poses_shape = tuple(map(int,
-                            txn.get(b"__poses_shape__").decode().split()))
-            renv.close()
+            nc, _ = _read_paths_from_lmdb(rd)
+            new_total += nc
+        lat_shape, intr_shape, poses_shape = (
+            lat_shape_det, intr_shape_det, poses_shape_det)
 
-        if total == 0:
-            print("No valid samples produced.")
+        # Existing merged records (authoritative across runs) — we append after.
+        base_count, existing_paths = _read_paths_from_lmdb(final_dir)
+
+        if new_total == 0:
+            print(f"No new samples; merged data/ already has {base_count}.")
+            if not args.keep_shards:
+                for r in range(world_size):
+                    rd = os.path.join(args.output_dir, f".rank_{r}")
+                    if os.path.exists(rd):
+                        shutil.rmtree(rd)
+            if world_size > 1:
+                torch.distributed.barrier()
+                torch.distributed.destroy_process_group()
             return
 
-        print(f"Merging {total} samples from {world_size} ranks ...")
-        final_dir = os.path.join(args.output_dir, "data")
+        print(f"Appending up to {new_total} new samples to "
+              f"{base_count} existing ones ...")
         os.makedirs(final_dir, exist_ok=True)
-        fmap = int(total * per_sample_bytes * 1.3) + 1_000_000_000
+        fmap = int((base_count + new_total) * per_sample_bytes * 1.3) + 1_000_000_000
         env = lmdb.open(final_dir, map_size=fmap, subdir=True)
-        gi = 0
+        gi = base_count
         for r in tqdm(range(world_size), desc="Merge ranks"):
             rd = os.path.join(args.output_dir, f".rank_{r}")
             if not os.path.exists(rd):
                 continue
             renv = lmdb.open(rd, readonly=True, lock=False)
             with renv.begin() as rtxn:
-                rc = int(rtxn.get(b"__count__").decode())
+                rc_raw = rtxn.get(b"__count__")
+                rc = int(rc_raw.decode()) if rc_raw is not None else 0
                 for j in range(rc):
+                    path = rtxn.get(f"paths_{j}_data".encode())
+                    path = path.decode("utf-8") if path is not None else None
+                    # Skip clips already present in data/ (idempotent append).
+                    if path is not None and path in existing_paths:
+                        continue
                     lat = rtxn.get(f"latents_{j}_data".encode())
                     cap = rtxn.get(f"prompts_{j}_data".encode())
                     intr = rtxn.get(f"intrinsics_{j}_data".encode())
@@ -397,11 +490,18 @@ def main():
                         wtxn.put(f"prompts_{gi}_data".encode(), cap)
                         wtxn.put(f"intrinsics_{gi}_data".encode(), intr)
                         wtxn.put(f"poses_{gi}_data".encode(), pos)
+                        if path is not None:
+                            wtxn.put(f"paths_{gi}_data".encode(), path.encode("utf-8"))
+                    if path is not None:
+                        existing_paths.add(path)
                     gi += 1
             renv.close()
-            shutil.rmtree(rd)
+            if not args.keep_shards:
+                shutil.rmtree(rd)
 
+        total = gi  # base_count + actually appended
         with env.begin(write=True) as txn:
+            txn.put(b"__count__", str(total).encode())
             txn.put(b"latents_shape",
                     f"{total} {' '.join(map(str, lat_shape))}".encode())
             txn.put(b"prompts_shape", f"{total}".encode())
@@ -410,7 +510,7 @@ def main():
             txn.put(b"poses_shape",
                     f"{total} {' '.join(map(str, poses_shape))}".encode())
         env.sync(); env.close()
-        print(f"Done! {total} samples -> {final_dir}")
+        print(f"Done! {total} samples ({total - base_count} new) -> {final_dir}")
 
     if world_size > 1:
         torch.distributed.barrier()
