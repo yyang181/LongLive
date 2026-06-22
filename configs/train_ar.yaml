@@ -51,8 +51,8 @@ training:
     replacement_strategy: random
 
 data:
-  data_path: /path/to/longlive2/train_dataset
-  eval_data_path: /path/to/longlive2/eval_prompts
+  data_path: data/LongLive2.0-Toy-Dataset/ar_training
+  eval_data_path: data/LongLive2.0-Toy-Dataset/ar_training
   image_or_video_shape:
   - 1
   - 96

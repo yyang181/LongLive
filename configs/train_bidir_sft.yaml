@@ -1,0 +1,55 @@
+# Plain Bidirectional SFT — Wan2.2-TI2V-5B (no camera / no PRoPE)
+# Identical to train_bidir_camera.yaml but with use_camera disabled, so no
+# prope_o residual params are added and viewmats/Ks are ignored. The full 5B
+# backbone is fine-tuned with the flow-matching loss. Reuses the same LMDB
+# (latents + prompts are all that's needed; camera fields are simply unused).
+
+infra:
+  mixed_precision: true
+  sharding_strategy: hybrid_full
+  generator_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+  num_workers: 4
+  seed: 0
+  gc_interval: 100
+  log_interval: 10
+  save_interval: 1000
+
+algorithm:
+  trainer: camera_bidirectional_diffusion
+  causal: false
+  use_camera: false
+  num_train_timestep: 1000
+
+# 5B backbone, plain bidirectional (no PRoPE injected at construction time).
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  use_camera: false
+
+training:
+  lr: 2.0e-06
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+  ema_weight: 0.99
+  ema_start_step: 0
+  max_grad_norm: 10.0
+  batch_size: 1
+  # Leave total_batch_size unset so gradient_accumulation_steps == 1 always:
+  # the effective batch = batch_size * world_size, i.e. it auto-tracks
+  # --nproc_per_node (1 GPU -> 1, 2 GPUs -> 2, 8 GPUs -> 8) with no grad-accum.
+  # To force a fixed global batch with accumulation instead, set e.g.
+  # total_batch_size: 8 (must be divisible by batch_size * world_size).
+  total_batch_size: null
+  max_iters: 30000
+
+data:
+  data_path: ./data/train/minWM-data/data
+  # [B, F_lat, C, H_lat, W_lat] for Wan2.2-TI2V-5B (4x temporal, 16x spatial).
+  # 20 latent frames -> 77 raw frames; 44x80 latent grid -> 704x1280 raw.
+  image_or_video_shape: [1, 20, 48, 44, 80]
+
+logging:
+  wandb_entity: null
+  wandb_project: LongLive-SFT

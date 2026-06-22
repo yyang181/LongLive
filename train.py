@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import os
+import torch.distributed as dist
 from omegaconf import OmegaConf
 import wandb
 
@@ -11,6 +12,22 @@ from trainer import (
     CameraBidirectionalDiffusionTrainer,
 )
 from utils.config import normalize_config
+
+
+def _is_rank0():
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _validate_no_placeholder_paths(config, config_path):
+    for key in ("data_path", "eval_data_path"):
+        value = config.get(key, None)
+        if isinstance(value, str) and "/path/to/longlive2" in value:
+            raise ValueError(
+                f"{config_path} still contains placeholder {key}={value!r}. "
+                "Point it at a real dataset path, or use "
+                "configs/train_bidir_camera.yaml / configs/train_bidir_sft.yaml "
+                "for LMDB-based bidirectional SFT."
+            )
 
 
 def main():
@@ -27,6 +44,13 @@ def main():
     args = parser.parse_args()
 
     config = normalize_config(OmegaConf.load(args.config_path))
+    _validate_no_placeholder_paths(config, args.config_path)
+    if _is_rank0():
+        print(
+            f"[train.py] config={args.config_path} "
+            f"trainer={config.get('trainer', None)} "
+            f"data_path={config.get('data_path', None)}"
+        )
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
 
