@@ -143,6 +143,13 @@ def main() -> None:
     scheduler.set_timesteps(sampling_steps, training=False)
     timesteps = scheduler.timesteps.to(device)
 
+    # CFG negative prompt: use the configured negative prompt (matches minWM's
+    # BidirectionalDiffusionInferencePipeline, which encodes
+    # self.args.negative_prompt rather than an empty string). normalize_config
+    # injects DEFAULT_NEGATIVE_PROMPT when none is provided in the config.
+    neg_prompt = config.get("negative_prompt", "") or ""
+    uncond = text_encoder([neg_prompt])
+
     # ---------- generate ----------
     for clip_idx, (prompt, traj) in enumerate(zip(prompts, trajectories)):
         gen = torch.Generator(device=device).manual_seed(args.seed + clip_idx)
@@ -157,9 +164,9 @@ def main() -> None:
         viewmats = torch.from_numpy(viewmats)[None].to(device=device, dtype=torch.float32)
         Ks = torch.from_numpy(Ks)[None].to(device=device, dtype=torch.float32)
 
-        # Text conditioning (CFG).
+        # Text conditioning (CFG). The unconditional embedding (uncond) is
+        # prompt-independent and was computed once above.
         cond = text_encoder([prompt])
-        uncond = text_encoder([""])
 
         # Initial noise: [B=1, F_lat, C, H_lat, W_lat] (matches WanDiffusionWrapper input).
         x = torch.randn(

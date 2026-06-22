@@ -105,9 +105,8 @@ class Trainer:
 
         # ---- Model ----
         self.model = CameraBidirectionalDiffusion(config, device=self.device)
-        # Move VAE / TextEncoder modules
+        # Move VAE to device (kept unsharded; only used under no_grad).
         self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
-        self.model.text_encoder = self.model.text_encoder.to(device=self.device)
 
         # FSDP-wrap the generator (the only trainable module).
         self.model.generator = fsdp_wrap(
@@ -115,6 +114,17 @@ class Trainer:
             sharding_strategy=getattr(config, "sharding_strategy", "hybrid_full"),
             mixed_precision=config.mixed_precision,
             wrap_strategy=getattr(config, "generator_fsdp_wrap_strategy", "size"),
+        )
+
+        # FSDP-wrap the (frozen) text encoder, mirroring minWM. This shards the
+        # large umt5-xxl weights across ranks instead of replicating a full copy
+        # per GPU, which matters for the umt5-xxl + 5B memory footprint. The
+        # module is only ever called under torch.no_grad() during training.
+        self.model.text_encoder = fsdp_wrap(
+            self.model.text_encoder,
+            sharding_strategy=getattr(config, "sharding_strategy", "hybrid_full"),
+            mixed_precision=config.mixed_precision,
+            wrap_strategy=getattr(config, "text_encoder_fsdp_wrap_strategy", "size"),
         )
 
         # Optimizer

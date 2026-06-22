@@ -571,7 +571,11 @@ class WanModel(ModelMixin, ConfigMixin):
         # ---- Build PRoPE meta (if camera info provided) ----
         prope_meta = None
         if viewmats is not None:
-            # Move to model device/dtype lazily; keep float32 for the math.
+            # Move to the model device only. The PRoPE projective math then
+            # runs in the model compute dtype (bf16 under mixed precision),
+            # matching minWM, which feeds bf16 viewmats/Ks straight into
+            # prope_qkv (see Wan21/wan_trainer & pipeline: viewmats are cast
+            # to the training/inference dtype before reaching the attention).
             viewmats = viewmats.to(device=device)
             if Ks is not None:
                 Ks = Ks.to(device=device)
