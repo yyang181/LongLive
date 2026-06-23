@@ -14,6 +14,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from utils.i2v_conditioning import (
+    _get_i2v_context_frames,
+    _overwrite_i2v_context,
+)
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper
 from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper
 from model.base import BaseModel
@@ -45,9 +49,12 @@ class CameraBidirectionalDiffusion(BaseModel):
                 f"CameraBidirectionalDiffusion only supports Wan2.2-TI2V-5B, "
                 f"got {model_name}"
             )
+        # Cache the i2v switch on the model itself so generator_loss can read it
+        # without going back to ``self.args``. Defaults to False (pure T2V).
+        self.i2v = bool(getattr(args, "i2v", False))
         if (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"[CameraBidirectionalDiffusion] backbone={model_name} "
-                  f"use_camera={model_kwargs['use_camera']}")
+                  f"use_camera={model_kwargs['use_camera']} i2v={self.i2v}")
 
         self.generator = CameraWanDiffusionWrapper(is_causal=False, **model_kwargs)
         self.generator.model.requires_grad_(True)
@@ -91,6 +98,26 @@ class CameraBidirectionalDiffusion(BaseModel):
         timestep = self.scheduler.timesteps[index].to(
             dtype=self.dtype, device=self.device,
         )
+
+        # ---- I2V conditioning -------------------------------------------------
+        # The first ``context_frames`` latents are kept clean (no noise, no
+        # loss), exactly mirroring how Causal I2V handles the conditioning
+        # frame in ``model/diffusion.py`` and ``utils/i2v_conditioning.py``.
+        #
+        # Under sequence parallelism, ``clean_latent`` is the LOCAL chunk of
+        # the latent frame dimension. The trainer is responsible for passing
+        # ``initial_latent=None`` on the SP ranks that do NOT own global
+        # frame 0; here we just gate on ``self.i2v`` and the truthiness of
+        # ``initial_latent``.
+        context_frames = 0
+        if self.i2v and initial_latent is not None:
+            context_frames = _get_i2v_context_frames(clean_latent, initial_latent)
+            if context_frames > 0:
+                # Force the conditioning frames to t=0 in the schedule so the
+                # model never sees them noised at training time.
+                timestep[:, :context_frames] = 0
+        # ----------------------------------------------------------------------
+
         noisy_latents = self.scheduler.add_noise(
             clean_latent.flatten(0, 1),
             noise.flatten(0, 1),
@@ -100,6 +127,14 @@ class CameraBidirectionalDiffusion(BaseModel):
         training_target = self.scheduler.training_target(
             clean_latent, noise, timestep
         )
+
+        # Pin the first ``context_frames`` latents to the clean image latent
+        # both in the noisy input and the target.
+        if context_frames > 0:
+            noisy_latents = _overwrite_i2v_context(
+                noisy_latents, initial_latent, context_frames
+            )
+            training_target[:, :context_frames] = 0
 
         flow_pred, x0_pred = self.generator(
             noisy_image_or_video=noisy_latents,
@@ -113,9 +148,21 @@ class CameraBidirectionalDiffusion(BaseModel):
             0, (batch_size, num_frame)
         )
         weight = weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        loss = _flow_matching_loss(flow_pred, training_target, weight=weight)
+
+        # Per-element MSE; broadcast the schedule weight, then optionally mask
+        # out the I2V context frames before reducing.
+        diff = (flow_pred.float() - training_target.float()) ** 2
+        diff = diff * weight.float()
+        if context_frames > 0:
+            mask = torch.ones_like(diff)
+            mask[:, :context_frames] = 0.0
+            denom = mask.sum().clamp(min=1.0)
+            loss = (diff * mask).sum() / denom
+        else:
+            loss = diff.mean()
 
         return loss, {
             "x0": clean_latent.detach(),
             "x0_pred": x0_pred.detach(),
+            "i2v_context_frames": context_frames,
         }

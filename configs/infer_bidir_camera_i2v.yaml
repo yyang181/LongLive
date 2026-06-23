@@ -1,0 +1,47 @@
+# Inference config for Camera (PRoPE) Bidirectional + I2V Wan2.2-TI2V-5B.
+# Used by scripts/inference/inference_bidir_camera.py with the single
+# ``algorithm.i2v`` switch flipped to true.
+#
+# Differences vs configs/infer_bidir_camera.yaml:
+#   * algorithm.i2v: true            -> turns on I2V branch in the script
+#   * inference.image_path           -> path to a text file with one source
+#                                       image path per line, aligned 1-to-1
+#                                       with prompts and trajectories.
+# The script encodes each source image with the Wan VAE, pins it into x[:, :1],
+# and re-pins after every scheduler.step so the conditioning frame is never
+# disturbed by the predicted velocity.
+
+algorithm:
+  causal: false
+  use_camera: true
+  i2v: true
+
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  use_camera: true
+
+inference:
+  sampling_steps: 50
+  guidance_scale: 5.0
+  num_latent_frames: 20      # F_lat (matches training)
+  height_latent: 44          # 704 / 16
+  width_latent: 80           # 1280 / 16
+  num_channels: 48
+  fps: 24
+  # Default WorldPlayGen-style intrinsics (1920x1080 capture, f≈969.7).
+  fx_norm: 0.5050505050505051
+  fy_norm: 0.8978675264437377
+  cx_norm: 0.5
+  cy_norm: 0.5
+  # Where to find prompts and trajectories (one per line).
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories.txt
+  # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
+  image_path: prompts/images.txt
+
+checkpoints:
+  generator_ckpt: ""   # filled at runtime via --generator_ckpt
+
+logging:
+  output_dir: videos/camera_bidir_i2v

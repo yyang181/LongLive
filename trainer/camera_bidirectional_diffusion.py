@@ -263,6 +263,15 @@ class Trainer:
         self.previous_time = None
         self.gc_interval = getattr(config, "gc_interval", 100)
         self.log_interval = getattr(config, "log_interval", 10)
+        # ---- I2V switch -----------------------------------------------------
+        # ``algorithm.i2v: true`` (flattened by normalize_config to ``i2v``)
+        # turns the same Bidirectional + camera (PRoPE) SFT loop into an I2V
+        # SFT that pins the first latent frame to the source image's clean
+        # latent and masks it out of the flow-matching loss. Defaults to T2V
+        # (False) so existing configs keep their previous semantics.
+        self.i2v = bool(getattr(config, "i2v", False))
+        if self.is_main_process:
+            print(f"[CameraBiDiff] i2v={self.i2v}")
         self.save_interval = getattr(config, "save_interval", 1000)
         self.max_iters = getattr(config, "max_iters", 100000)
 
@@ -435,7 +444,15 @@ class Trainer:
             conditional_dict=conditional_dict,
             unconditional_dict=self.unconditional_dict,
             clean_latent=clean_latent,
-            initial_latent=clean_latent[:, 0:1],
+            # I2V: pin the global first latent on the SP rank that actually
+            # owns it (sp_rank == 0). On all other SP ranks, leave
+            # initial_latent=None so the loss treats their local frame 0 as a
+            # normal training frame. T2V mode never sets a context frame.
+            initial_latent=(
+                clean_latent[:, 0:1]
+                if self.i2v and self.sp_rank == 0
+                else None
+            ),
             viewmats=viewmats,
             Ks=Ks,
         )

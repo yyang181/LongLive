@@ -30,6 +30,10 @@ algorithm:
   trainer: camera_bidirectional_diffusion
   causal: false
   use_camera: false
+  # T2V (default). Flip to ``true`` to turn this same trainer into plain
+  # Bidirectional I2V SFT (no camera, no PRoPE). See
+  # configs/train_bidir_sft_i2v.yaml for the I2V variant.
+  i2v: false
   num_train_timestep: 1000
   # Bidirectional SFT shares one timestep across all frames; kept explicit so
   # _get_timestep behaves uniformly under sequence parallelism.

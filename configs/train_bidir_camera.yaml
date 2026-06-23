@@ -27,6 +27,11 @@ algorithm:
   trainer: camera_bidirectional_diffusion
   causal: false
   use_camera: true
+  # T2V (default). Flip to ``true`` to turn this same trainer into Bidirectional
+  # + camera (PRoPE) I2V SFT — the first latent frame is then pinned to the
+  # clean image latent and masked out of the flow-matching loss. See
+  # configs/train_bidir_camera_i2v.yaml for the I2V variant.
+  i2v: false
   num_train_timestep: 1000
   # Bidirectional SFT shares one timestep across all frames; kept explicit so
   # _get_timestep behaves uniformly under sequence parallelism.

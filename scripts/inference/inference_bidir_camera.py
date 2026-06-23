@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -40,6 +42,11 @@ from utils.config import normalize_config  # noqa: E402
 from utils.inference_utils import save_video  # noqa: E402
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper  # noqa: E402
 from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper  # noqa: E402
+
+try:  # PIL is only needed for the I2V branch.
+    from PIL import Image  # noqa: E402
+except ImportError:  # pragma: no cover - PIL is in requirements but be defensive.
+    Image = None
 
 
 # --------------------------------------------------------------------------
@@ -82,6 +89,28 @@ def load_generator(config, ckpt_path: str, device: torch.device) -> CameraWanDif
     return gen
 
 
+def _load_image_as_pixel(
+    image_path: str,
+    target_h: int,
+    target_w: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load an image and return a [1, 3, 1, target_h, target_w] tensor in [-1, 1]
+    suitable for ``WanVAEWrapper.encode_to_latent``.
+    """
+    if Image is None:
+        raise RuntimeError(
+            "PIL is required for I2V inference; please ``pip install pillow``."
+        )
+    img = Image.open(image_path).convert("RGB")
+    img = img.resize((target_w, target_h), Image.BICUBIC)
+    arr = torch.from_numpy(np.array(img, dtype=np.float32))  # (H, W, 3)
+    arr = (arr / 127.5) - 1.0
+    pixel = arr.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
+    return pixel.to(device=device, dtype=dtype)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -99,7 +128,30 @@ def main() -> None:
 
     config = normalize_config(OmegaConf.load(args.config_path))
     inf_cfg = config["inference"]
-    out_dir = Path(args.output_dir or config["logging"]["output_dir"])
+
+    # ---------- resolve generator ckpt ----------
+    # Allow passing a checkpoint *directory* (e.g. ``logs/.../checkpoint_model_000200``);
+    # auto-append ``/model.pt`` so users don't have to spell it out every time.
+    ckpt = args.generator_ckpt or config.get("checkpoints", {}).get("generator_ckpt", "")
+    if ckpt and not ckpt.endswith(".pt") and not ckpt.endswith(".pth"):
+        candidate = os.path.join(ckpt, "model.pt")
+        if os.path.isdir(ckpt) or os.path.exists(candidate):
+            ckpt = candidate
+
+    # ---------- resolve output dir ----------
+    # If the ckpt path encodes a training step (e.g. ``checkpoint_model_000200``),
+    # append that suffix to the user-supplied output_dir so different checkpoints
+    # don't clobber each other (e.g. ``videos/camera_bidir`` -> ``videos/camera_bidir_000200``).
+    base_out_dir = args.output_dir or config["logging"]["output_dir"]
+    step_suffix = ""
+    if ckpt:
+        m = re.search(r"checkpoint_model_(\d+)", ckpt)
+        if m:
+            step_suffix = m.group(1)
+    if step_suffix:
+        out_dir = Path(base_out_dir) / step_suffix
+    else:
+        out_dir = Path(base_out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,7 +162,6 @@ def main() -> None:
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
     # ---------- generator ----------
-    ckpt = args.generator_ckpt or config.get("checkpoints", {}).get("generator_ckpt", "")
     generator = load_generator(config, ckpt, device)
 
     # ---------- prompts and trajectories ----------
@@ -120,9 +171,39 @@ def main() -> None:
         trajectories = [ln.strip() for ln in f if ln.strip()]
     assert len(prompts) == len(trajectories), \
         f"prompts ({len(prompts)}) and trajectories ({len(trajectories)}) must align"
+
+    # ---------- I2V switch -----------------------------------------------
+    # ``algorithm.i2v: true`` (or top-level ``i2v: true`` after
+    # normalize_config flattens it) turns this into image-to-video inference:
+    # the source image is VAE-encoded into the first latent frame, that
+    # frame is pinned across all denoising steps, and only frames >=1 are
+    # sampled.  When False (default), behaves exactly like the original T2V
+    # bidirectional + camera (PRoPE) inference.
+    is_i2v = bool(
+        config.get("i2v", False)
+        or (config.get("algorithm", {}) or {}).get("i2v", False)
+    )
+    image_paths: list[str] = []
+    if is_i2v:
+        img_path_cfg = inf_cfg.get("image_path", None)
+        assert img_path_cfg, (
+            "I2V inference requires inference.image_path to point to a text "
+            "file containing one source image path per line (aligned with "
+            "prompts/trajectories)."
+        )
+        with open(img_path_cfg) as f:
+            image_paths = [ln.strip() for ln in f if ln.strip()]
+        assert len(image_paths) == len(prompts), (
+            f"image_paths ({len(image_paths)}) must align with prompts "
+            f"({len(prompts)}) for I2V inference."
+        )
+        print(f"[infer] I2V mode enabled, {len(image_paths)} source images "
+              f"loaded from {img_path_cfg}")
     if args.max_clips > 0:
         prompts = prompts[: args.max_clips]
         trajectories = trajectories[: args.max_clips]
+        if is_i2v:
+            image_paths = image_paths[: args.max_clips]
 
     # ---------- shapes ----------
     F_lat = int(inf_cfg["num_latent_frames"])
@@ -149,9 +230,18 @@ def main() -> None:
     # injects DEFAULT_NEGATIVE_PROMPT when none is provided in the config.
     neg_prompt = config.get("negative_prompt", "") or ""
     uncond = text_encoder([neg_prompt])
+    # Generator runs in bfloat16; cast text embeddings to match its dtype to
+    # avoid `mat1 and mat2 must have the same dtype` in text_embedding.
+    uncond = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) else v)
+              for k, v in uncond.items()}
 
     # ---------- generate ----------
     for clip_idx, (prompt, traj) in enumerate(zip(prompts, trajectories)):
+        out_path = out_dir / f"clip_{clip_idx:03d}.mp4"
+        if out_path.exists() and out_path.stat().st_size > 0:
+            print(f"[clip {clip_idx}] skip (already exists -> {out_path})")
+            continue
+
         gen = torch.Generator(device=device).manual_seed(args.seed + clip_idx)
 
         # Pose -> viewmats / Ks for this trajectory.
@@ -167,6 +257,8 @@ def main() -> None:
         # Text conditioning (CFG). The unconditional embedding (uncond) is
         # prompt-independent and was computed once above.
         cond = text_encoder([prompt])
+        cond = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) else v)
+                for k, v in cond.items()}
 
         # Initial noise: [B=1, F_lat, C, H_lat, W_lat] (matches WanDiffusionWrapper input).
         x = torch.randn(
@@ -174,9 +266,35 @@ def main() -> None:
             device=device, dtype=torch.bfloat16, generator=gen,
         )
 
+        # ---- I2V: encode source image and pin its latent into x[:, :1] ----
+        image_latent = None
+        if is_i2v:
+            img_pixel = _load_image_as_pixel(
+                image_paths[clip_idx],
+                target_h=target_h, target_w=target_w,
+                device=device, dtype=torch.bfloat16,
+            )
+            image_latent = vae.encode_to_latent(img_pixel)  # [1, 1, C, H_lat, W_lat]
+            assert image_latent.shape[1] == 1, (
+                f"expected single-frame image latent, got "
+                f"shape={tuple(image_latent.shape)}"
+            )
+            assert image_latent.shape[2:] == x.shape[2:], (
+                f"image latent shape {tuple(image_latent.shape[2:])} does not "
+                f"match noise latent shape {tuple(x.shape[2:])}"
+            )
+            image_latent = image_latent.to(dtype=torch.bfloat16)
+            x[:, :1] = image_latent
+
         cfg_scale = float(inf_cfg.get("guidance_scale", 5.0))
         for ti, t_scalar in enumerate(timesteps):
             t = t_scalar.expand(1, F_lat).to(device)
+            if is_i2v:
+                # Tell the backbone the first latent is clean. Mirrors how
+                # ``model/diffusion.py`` zeroes timestep[:, :1] for the
+                # I2V context frame at training time.
+                t = t.clone()
+                t[:, 0] = 0
             flow_c, _ = generator(
                 noisy_image_or_video=x,
                 conditional_dict=cond,
@@ -199,6 +317,13 @@ def main() -> None:
             x_flat = scheduler.step(f_flat, t.flatten(0, 1), x_flat)
             x = x_flat.unflatten(0, x.shape[:2]).to(torch.bfloat16)
 
+            # Re-pin the I2V context latent: scheduler.step still updates the
+            # first frame with a (small) flow_pred since we only zeroed its
+            # timestep, but the cleanest contract is to keep it bit-identical
+            # to the encoded source image at every step.
+            if is_i2v and image_latent is not None:
+                x[:, :1] = image_latent
+
             if (ti + 1) % 10 == 0:
                 print(f"[clip {clip_idx}] step {ti + 1}/{sampling_steps}")
 
@@ -215,6 +340,8 @@ def main() -> None:
         with open(out_path.with_suffix(".txt"), "w") as f:
             f.write(f"prompt:     {prompt}\n")
             f.write(f"trajectory: {traj}\n")
+            if is_i2v:
+                f.write(f"image:      {image_paths[clip_idx]}\n")
 
     print(f"\nAll clips written to: {out_dir}")
 

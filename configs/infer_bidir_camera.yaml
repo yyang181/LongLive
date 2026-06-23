@@ -4,6 +4,10 @@
 algorithm:
   causal: false
   use_camera: true
+  # T2V inference (default). Flip to ``true`` for Bidirectional + camera
+  # (PRoPE) I2V inference; that path also requires inference.image_path.
+  # See configs/infer_bidir_camera_i2v.yaml for an I2V example.
+  i2v: false
 
 model_kwargs:
   model_name: Wan2.2-TI2V-5B
