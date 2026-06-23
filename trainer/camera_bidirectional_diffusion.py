@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+import types
 
 import torch
 import torch.distributed as dist
@@ -28,6 +29,7 @@ import wandb
 
 from model.camera_bidirectional_diffusion import CameraBidirectionalDiffusion
 from utils.camera_dataset import CameraLatentLMDBDataset, cycle
+from utils.config import wan_default_config
 from utils.distributed import (
     EMA_FSDP, barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
 )
@@ -51,8 +53,68 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.disable_wandb = config.disable_wandb
 
+        # ---- Sequence Parallel (SP) ----
+        # The 5B backbone + bidirectional camera-PRoPE SFT does not fit in
+        # memory for the full latent on a single GPU, so we shard the latent
+        # *frame* dimension across an SP group. ``world_size = sp_size * dp_size``.
+        self.sequence_parallel_size = int(getattr(config, "sequence_parallel_size", 1) or 1)
+        self.data_parallel_size = (
+            world_size // self.sequence_parallel_size
+            if self.sequence_parallel_size > 1 else world_size
+        )
+        self.sp_group = None
+        self.dp_group = None
+        self.sp_rank = 0
+        self.dp_rank = global_rank
+
+        if self.sequence_parallel_size > 1:
+            from wan_5b.distributed.sp_training import (
+                set_data_parallel_group,
+                set_sequence_parallel_group,
+            )
+            model_name = getattr(
+                getattr(config, "model_kwargs", None), "model_name",
+                getattr(config, "model_name", "")) or ""
+            assert "Wan2.2-TI2V-5B" in model_name, (
+                f"sequence_parallel_size>1 is only supported for "
+                f"Wan2.2-TI2V-5B, got model_name={model_name!r}")
+            assert world_size % self.sequence_parallel_size == 0, (
+                f"world_size ({world_size}) must be divisible by "
+                f"sequence_parallel_size ({self.sequence_parallel_size})")
+            # The sharded frame count must divide evenly across the SP group and
+            # the head count must be divisible by sp_size (Ulysses head split).
+            num_latent_frames = int(list(config.image_or_video_shape)[1])
+            num_heads = int(wan_default_config[model_name]["num_heads"])
+            assert num_latent_frames % self.sequence_parallel_size == 0, (
+                f"latent frames ({num_latent_frames}) must be divisible by "
+                f"sequence_parallel_size ({self.sequence_parallel_size})")
+            assert num_heads % self.sequence_parallel_size == 0, (
+                f"num_heads ({num_heads}) must be divisible by "
+                f"sequence_parallel_size ({self.sequence_parallel_size})")
+
+            sp_size = self.sequence_parallel_size
+            dp_size = self.data_parallel_size
+            # SP groups: contiguous ranks [g*sp, (g+1)*sp). DP groups: strided
+            # [k, sp+k, ...] so peers with the same SP rank own the same chunk
+            # position across DP replicas.
+            sp_groups = [dist.new_group(ranks=list(range(g * sp_size, (g + 1) * sp_size)))
+                         for g in range(dp_size)]
+            self.sp_group = sp_groups[global_rank // sp_size]
+            set_sequence_parallel_group(self.sp_group)
+
+            dp_groups = [dist.new_group(ranks=[g * sp_size + k for g in range(dp_size)])
+                         for k in range(sp_size)]
+            self.dp_group = dp_groups[global_rank % sp_size]
+            set_data_parallel_group(self.dp_group)
+
+            self.sp_rank = global_rank % sp_size
+            self.dp_rank = global_rank // sp_size
+            if self.is_main_process:
+                print(f"[CameraBiDiff][SP] enabled sp_size={sp_size} "
+                      f"dp_size={dp_size} world_size={world_size}")
+
         total_batch_size = getattr(config, "total_batch_size", None)
-        micro_global_batch = int(config.batch_size) * int(world_size)
+        micro_global_batch = int(config.batch_size) * int(self.data_parallel_size)
         configured_accumulation = getattr(config, "gradient_accumulation_steps", None)
         if configured_accumulation is None:
             if total_batch_size is not None:
@@ -85,7 +147,11 @@ class Trainer:
             random_seed = torch.randint(0, 10000000, (1,), device=self.device)
             dist.broadcast(random_seed, src=0)
             config.seed = random_seed.item()
-        set_seed(config.seed + global_rank)
+        # SP peers (same dp_rank, different sp_rank) MUST share the RNG seed so
+        # that the per-sample uniform timestep drawn inside generator_loss is
+        # identical across the group; otherwise the frame chunks would be
+        # denoised at inconsistent noise levels.
+        set_seed(config.seed + self.dp_rank)
 
         if self.is_main_process and not self.disable_wandb:
             if getattr(config, "wandb_key", None):
@@ -107,6 +173,25 @@ class Trainer:
         self.model = CameraBidirectionalDiffusion(config, device=self.device)
         # Move VAE to device (kept unsharded; only used under no_grad).
         self.model.vae = self.model.vae.to(device=self.device, dtype=self.dtype)
+
+        # Bind the SP self-attention before FSDP wrapping. The rest of
+        # ``WanModel._forward`` already runs on the local frame chunk, so only
+        # the self-attention needs an Ulysses all-to-all around flash_attention.
+        if self.sequence_parallel_size > 1:
+            from wan_5b.distributed.sequence_parallel_camera import (
+                sp_camera_attn_forward,
+            )
+            wan_model = self.model.generator.model
+            self._sp_attn_blocks = []
+            for block in wan_model.blocks:
+                sa = block.self_attn
+                if not hasattr(sa, "_orig_forward"):
+                    sa._orig_forward = sa.forward
+                sa.forward = types.MethodType(sp_camera_attn_forward, sa)
+                self._sp_attn_blocks.append(sa)
+            if self.is_main_process:
+                print("[CameraBiDiff][SP] sp_camera_attn_forward enabled on "
+                      f"{len(self._sp_attn_blocks)} self-attention blocks")
 
         # FSDP-wrap the generator (the only trainable module).
         self.model.generator = fsdp_wrap(
@@ -143,9 +228,12 @@ class Trainer:
         self.ema_start_step = getattr(config, "ema_start_step", 0)
 
         # ---- Data ----
+        # Under SP, all ranks in an SP group must load the SAME sample (they
+        # process different frame chunks of it), so sampling is indexed by the
+        # DP rank/size rather than the global rank/world size.
         dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
-        sampler = DistributedSampler(dataset, num_replicas=world_size,
-                                     rank=global_rank, shuffle=True, drop_last=True)
+        sampler = DistributedSampler(dataset, num_replicas=self.data_parallel_size,
+                                     rank=self.dp_rank, shuffle=True, drop_last=True)
         self.dataset = dataset
         loader = torch.utils.data.DataLoader(
             dataset,
@@ -279,9 +367,11 @@ class Trainer:
             elapsed = time.time() - t0
 
             if (self.step % self.log_interval == 0) and self.is_main_process:
+                now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 msg = (f"[step {self.step}] loss={log['generator_loss']:.4f} "
                        f"grad={log['generator_grad_norm']:.3f} "
-                       f"t/it={elapsed:.2f}s")
+                       f"t/it={elapsed:.2f}s "
+                       f"time={now_str}")
                 print(msg, flush=True)
                 if not self.disable_wandb:
                     wandb.log(log, step=self.step)
@@ -311,9 +401,27 @@ class Trainer:
         viewmats = batch["viewmats"].to(device=self.device, dtype=self.dtype)
         Ks = batch["Ks"].to(device=self.device, dtype=self.dtype)
 
+        # ---- Sequence Parallel: shard the latent frame dimension ----
+        # Each SP rank keeps frames [sp_rank*F_local, (sp_rank+1)*F_local). The
+        # per-frame view matrices / intrinsics are sharded the same way so the
+        # local PRoPE cameras stay aligned with the local token sequence. The
+        # generator then computes noise / target / loss purely on local frames
+        # (local ``.mean()``), and FSDP-over-world averaging reproduces the
+        # exact data-parallel gradient.
+        if self.sequence_parallel_size > 1:
+            sp = self.sequence_parallel_size
+            assert clean_latent.shape[1] % sp == 0, (
+                f"latent frames ({clean_latent.shape[1]}) must be divisible "
+                f"by sequence_parallel_size ({sp})")
+            clean_latent = clean_latent.chunk(sp, dim=1)[self.sp_rank].contiguous()
+            viewmats = viewmats.chunk(sp, dim=1)[self.sp_rank].contiguous()
+            Ks = Ks.chunk(sp, dim=1)[self.sp_rank].contiguous()
+
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
+        # Local frame count (== full count when SP is disabled).
+        image_or_video_shape[1] = clean_latent.shape[1]
 
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(text_prompts=text_prompts)

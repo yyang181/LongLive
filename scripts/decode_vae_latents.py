@@ -69,25 +69,116 @@ def decode_latent_to_video(vae, latent: torch.Tensor, device: torch.device, dtyp
     return video
 
 
+_DEFAULT_LOGS_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "logs", "train_ar")
+)
+_DEFAULT_VIS_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "logs", "train_ar", "decoded_videos")
+)
+
+
+def _find_latest_generated_video_dir(logs_dir: str) -> str:
+    """Find the latest `generated_video_*` subdirectory under logs_dir."""
+    candidates = sorted(glob.glob(os.path.join(logs_dir, "generated_video_*")))
+    candidates = [c for c in candidates if os.path.isdir(c)]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No 'generated_video_*' directories found under {logs_dir}. "
+            f"Please pass --input_dir explicitly."
+        )
+    return candidates[-1]
+
+
+def _latent_to_mp4_name(pt_path: str) -> str:
+    basename = os.path.splitext(os.path.basename(pt_path))[0]
+    if basename.startswith("latents_"):
+        return basename.replace("latents_", "video_", 1) + ".mp4"
+    return f"video_{basename}.mp4"
+
+
+def _collect_tasks(input_dir: str, pattern: str, output_dir_arg, vis_root: str,
+                   skip_existing: bool = True):
+    """
+    Build a list of (latent_path, out_dir) tasks.
+
+    Supports:
+      1) input_dir directly contains <pattern> files.
+      2) input_dir is a parent dir containing 'generated_video_*' subdirs.
+
+    Returns:
+        tasks, out_dirs, skipped_count
+    """
+    def _filter_existing(files, sub_out):
+        kept, skipped = [], 0
+        for p in files:
+            mp4 = os.path.join(sub_out, _latent_to_mp4_name(p))
+            if skip_existing and os.path.exists(mp4) and os.path.getsize(mp4) > 0:
+                skipped += 1
+                continue
+            kept.append(p)
+        return kept, skipped
+
+    # Case 1: input_dir itself has latent files.
+    direct = sorted(glob.glob(os.path.join(input_dir, pattern)))
+    if direct:
+        out_dir = output_dir_arg or os.path.join(
+            vis_root, os.path.basename(os.path.normpath(input_dir))
+        )
+        kept, skipped = _filter_existing(direct, out_dir)
+        return [(p, out_dir) for p in kept], [out_dir], skipped
+
+    # Case 2: scan generated_video_* subdirs.
+    sub_dirs = sorted(
+        d for d in glob.glob(os.path.join(input_dir, "generated_video_*"))
+        if os.path.isdir(d)
+    )
+    tasks = []
+    out_dirs = []
+    total_skipped = 0
+    for sub in sub_dirs:
+        sub_files = sorted(glob.glob(os.path.join(sub, pattern)))
+        if not sub_files:
+            continue
+        if output_dir_arg:
+            sub_out = os.path.join(output_dir_arg, os.path.basename(sub))
+        else:
+            sub_out = os.path.join(vis_root, os.path.basename(sub))
+        kept, skipped = _filter_existing(sub_files, sub_out)
+        total_skipped += skipped
+        if not kept:
+            # Fully decoded already; no need to (re)create dir or add tasks.
+            continue
+        out_dirs.append(sub_out)
+        for p in kept:
+            tasks.append((p, sub_out))
+    return tasks, out_dirs, total_skipped
+
+
 def main():
     parser = argparse.ArgumentParser(description="Decode saved latents to video.")
     parser.add_argument(
         "--input_dir",
         type=str,
-        required=True,
-        help="Directory containing .pt latent files (e.g. latents_rank00_idx000000.pt).",
+        default=None,
+        help=(
+            "Directory containing .pt latent files (e.g. latents_rank00_idx000000.pt). "
+            f"Default: latest 'generated_video_*' under {_DEFAULT_LOGS_DIR}."
+        ),
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to save decoded .mp4 videos. Default: input_dir/decoded_videos",
+        help=(
+            "Directory to save decoded .mp4 videos. "
+            f"Default: {_DEFAULT_VIS_ROOT}/<input_dir basename>"
+        ),
     )
     parser.add_argument(
         "--fps",
         type=int,
         default=24,
-        help="FPS for output video (default: 16).",
+        help="FPS for output video (default: 24).",
     )
     parser.add_argument(
         "--pattern",
@@ -95,14 +186,41 @@ def main():
         default="latents_*.pt",
         help="Glob pattern for latent files (default: latents_*.pt).",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-decode and overwrite even if the target .mp4 already exists.",
+    )
     args = parser.parse_args()
 
     rank, world_size, local_rank = init_distributed()
     is_main = (rank == 0)
 
-    output_dir = args.output_dir or os.path.join(args.input_dir, "decoded_videos")
+    if args.input_dir is None:
+        args.input_dir = _find_latest_generated_video_dir(_DEFAULT_LOGS_DIR)
+        if is_main:
+            print(f"[Auto] --input_dir not given, using latest: {args.input_dir}")
+
+    tasks, out_dirs, skipped = _collect_tasks(
+        args.input_dir, args.pattern, args.output_dir, _DEFAULT_VIS_ROOT,
+        skip_existing=(not args.overwrite),
+    )
+    if is_main and skipped > 0:
+        print(f"[Skip] {skipped} latent(s) already decoded (mp4 exists). Use --overwrite to redo.")
+    if not tasks:
+        if is_main:
+            if skipped > 0:
+                print("All latents already decoded. Nothing to do.")
+            else:
+                print(
+                    f"No files matching '{args.pattern}' found under "
+                    f"'{args.input_dir}' (also scanned its 'generated_video_*' subdirs). Exiting."
+                )
+        return
+
     if is_main:
-        os.makedirs(output_dir, exist_ok=True)
+        for d in out_dirs:
+            os.makedirs(d, exist_ok=True)
     if world_size > 1:
         dist.barrier()
 
@@ -115,23 +233,21 @@ def main():
     vae = get_vae()
     vae = vae.to(device=device, dtype=dtype).eval()
 
-    search_path = os.path.join(args.input_dir, args.pattern)
-    pt_files = sorted(glob.glob(search_path))
-    if not pt_files:
-        if is_main:
-            print(f"No files matching '{search_path}' found. Exiting.")
-        return
-
-    # Shard files across ranks
-    pt_files_local = pt_files[rank::world_size]
+    # Shard tasks across ranks
+    tasks_local = tasks[rank::world_size]
     if is_main:
-        print(f"Found {len(pt_files)} latent file(s), {world_size} GPU(s), ~{len(pt_files_local)} per GPU.")
+        print(
+            f"Found {len(tasks)} latent file(s) to decode across {len(out_dirs)} output dir(s), "
+            f"{world_size} GPU(s), ~{len(tasks_local)} per GPU."
+        )
 
-    pbar = tqdm(pt_files_local, desc=f"[Rank {rank}] Decoding", disable=(not is_main))
-    for pt_path in pbar:
-        basename = os.path.splitext(os.path.basename(pt_path))[0]
-        video_name = basename.replace("latents_", "video_", 1) if basename.startswith("latents_") else f"video_{basename}"
-        out_path = os.path.join(output_dir, f"{video_name}.mp4")
+    pbar = tqdm(tasks_local, desc=f"[Rank {rank}] Decoding", disable=(not is_main))
+    for pt_path, out_dir in pbar:
+        out_path = os.path.join(out_dir, _latent_to_mp4_name(pt_path))
+
+        # Race-safe re-check (another rank/run might have produced it).
+        if (not args.overwrite) and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            continue
 
         try:
             data = torch.load(pt_path, map_location="cpu", weights_only=True)
@@ -158,7 +274,8 @@ def main():
     if world_size > 1:
         dist.barrier()
     if is_main:
-        print(f"Done. Decoded {len(pt_files)} latent(s) to {output_dir}")
+        print(f"Done. Decoded {len(tasks)} latent(s) into {len(out_dirs)} dir(s) under "
+              f"{args.output_dir or _DEFAULT_VIS_ROOT}")
     if world_size > 1:
         dist.destroy_process_group()
 

@@ -14,12 +14,26 @@ infra:
   gc_interval: 100
   log_interval: 10
   save_interval: 1000
+  # ---- Sequence Parallel (REQUIRED for the 5B backbone) ----
+  # The full 20-frame latent + bidirectional camera-PRoPE forward does not fit
+  # on a single GPU at 5B, so we shard the latent frame dimension across an SP
+  # group. world_size = sequence_parallel_size * data_parallel_size, so this
+  # value MUST divide --nproc_per_node.
+  #   * Valid here: 1 (disabled), 2 (F_local=10), or 4 (F_local=5).
+  #     It must divide BOTH the latent frame count (20) AND num_heads (24),
+  #     whose common divisors are {1, 2, 4}.
+  #   * Example: 8 GPUs + sequence_parallel_size=4 -> dp_size=2, F_local=5.
+  #   * Example: 4 GPUs + sequence_parallel_size=4 -> dp_size=1, F_local=5.
+  sequence_parallel_size: 4
 
 algorithm:
   trainer: camera_bidirectional_diffusion
   causal: false
   use_camera: false
   num_train_timestep: 1000
+  # Bidirectional SFT shares one timestep across all frames; kept explicit so
+  # _get_timestep behaves uniformly under sequence parallelism.
+  num_frame_per_block: 1
 
 # 5B backbone, plain bidirectional (no PRoPE injected at construction time).
 model_kwargs:
@@ -45,7 +59,7 @@ training:
   max_iters: 30000
 
 data:
-  data_path: ./data/train/minWM-data/data
+  data_path: data/train/minWM-data/data
   # [B, F_lat, C, H_lat, W_lat] for Wan2.2-TI2V-5B (4x temporal, 16x spatial).
   # 20 latent frames -> 77 raw frames; 44x80 latent grid -> 704x1280 raw.
   image_or_video_shape: [1, 20, 48, 44, 80]
