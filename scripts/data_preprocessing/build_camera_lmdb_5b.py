@@ -251,6 +251,107 @@ def _read_paths_from_lmdb(lmdb_dir):
     return count, paths
 
 
+def _flush_pending_shards_into_final(output_dir, world_size, lat_shape_det,
+                                     intr_shape_det, poses_shape_det,
+                                     per_sample_bytes):
+    """Merge any leftover ``.rank_*`` shards from a previous interrupted run
+    into ``data/`` and delete them, so the current run can repartition the
+    remaining clips cleanly.
+
+    Only invoked on rank-0 before processing starts. Idempotent: if no shards
+    exist, this is a no-op.
+    """
+    final_dir = os.path.join(output_dir, "data")
+    pending = []
+    for r in range(max(world_size, 1)):
+        rd = os.path.join(output_dir, f".rank_{r}")
+        if os.path.isfile(os.path.join(rd, "data.mdb")):
+            cnt, _ = _read_paths_from_lmdb(rd)
+            if cnt > 0:
+                pending.append((rd, cnt))
+    # Also catch shards from a previous run that used a different world_size.
+    if os.path.isdir(output_dir):
+        for name in sorted(os.listdir(output_dir)):
+            if not name.startswith(".rank_"):
+                continue
+            rd = os.path.join(output_dir, name)
+            if any(rd == p[0] for p in pending):
+                continue
+            if os.path.isfile(os.path.join(rd, "data.mdb")):
+                cnt, _ = _read_paths_from_lmdb(rd)
+                if cnt > 0:
+                    pending.append((rd, cnt))
+
+    if not pending:
+        # Still clean up any empty leftover shard dirs so a fresh run starts tidy.
+        if os.path.isdir(output_dir):
+            for name in sorted(os.listdir(output_dir)):
+                if name.startswith(".rank_"):
+                    rd = os.path.join(output_dir, name)
+                    shutil.rmtree(rd, ignore_errors=True)
+        return
+
+    new_total = sum(c for _, c in pending)
+    base_count, existing_paths = _read_paths_from_lmdb(final_dir)
+    print(f"[pre-merge] found {len(pending)} leftover rank shard(s) with "
+          f"{new_total} samples; merging into {final_dir} (existing: {base_count}) "
+          f"before resuming.")
+
+    os.makedirs(final_dir, exist_ok=True)
+    fmap = int((base_count + new_total) * per_sample_bytes * 1.3) + 1_000_000_000
+    env = lmdb.open(final_dir, map_size=fmap, subdir=True)
+    gi = base_count
+    for rd, _ in tqdm(pending, desc="Pre-merge ranks"):
+        renv = lmdb.open(rd, readonly=True, lock=False)
+        with renv.begin() as rtxn:
+            rc_raw = rtxn.get(b"__count__")
+            rc = int(rc_raw.decode()) if rc_raw is not None else 0
+            for j in range(rc):
+                path = rtxn.get(f"paths_{j}_data".encode())
+                path = path.decode("utf-8") if path is not None else None
+                if path is not None and path in existing_paths:
+                    continue
+                lat = rtxn.get(f"latents_{j}_data".encode())
+                cap = rtxn.get(f"prompts_{j}_data".encode())
+                intr = rtxn.get(f"intrinsics_{j}_data".encode())
+                pos = rtxn.get(f"poses_{j}_data".encode())
+                if lat is None or cap is None or intr is None or pos is None:
+                    # Partial / corrupt record from a hard kill — drop it.
+                    continue
+                with env.begin(write=True) as wtxn:
+                    wtxn.put(f"latents_{gi}_data".encode(), lat)
+                    wtxn.put(f"prompts_{gi}_data".encode(), cap)
+                    wtxn.put(f"intrinsics_{gi}_data".encode(), intr)
+                    wtxn.put(f"poses_{gi}_data".encode(), pos)
+                    if path is not None:
+                        wtxn.put(f"paths_{gi}_data".encode(), path.encode("utf-8"))
+                if path is not None:
+                    existing_paths.add(path)
+                gi += 1
+        renv.close()
+
+    total = gi
+    with env.begin(write=True) as txn:
+        txn.put(b"__count__", str(total).encode())
+        txn.put(b"latents_shape",
+                f"{total} {' '.join(map(str, lat_shape_det))}".encode())
+        txn.put(b"prompts_shape", f"{total}".encode())
+        txn.put(b"intrinsics_shape",
+                f"{total} {' '.join(map(str, intr_shape_det))}".encode())
+        txn.put(b"poses_shape",
+                f"{total} {' '.join(map(str, poses_shape_det))}".encode())
+    env.sync(); env.close()
+    print(f"[pre-merge] data/ now has {total} samples "
+          f"({total - base_count} added from leftover shards).")
+
+    # Delete every .rank_* dir in output_dir (including empties / mismatched ws).
+    for name in sorted(os.listdir(output_dir)):
+        if name.startswith(".rank_"):
+            rd = os.path.join(output_dir, name)
+            shutil.rmtree(rd, ignore_errors=True)
+    print("[pre-merge] removed leftover rank shard dirs.")
+
+
 def _resolve_video_path(video_path: str, video_dir: str, input_json: str) -> str:
     if os.path.isabs(video_path) and os.path.exists(video_path):
         return video_path
@@ -346,21 +447,40 @@ def main():
             shutil.rmtree(rank_dir)
         if world_size > 1:
             torch.distributed.barrier()
+    else:
+        # ---- Pre-merge any leftover .rank_* shards from a previous run ----
+        # If a previous run was killed *after* per-rank encoding but *before*
+        # rank-0 finished merging, the .rank_* dirs still hold valid samples.
+        # Folding them into data/ and deleting them now lets the current run
+        # repartition the remaining (truly unprocessed) clips across ranks
+        # without re-encoding clips that happen to fall on a different rank
+        # under a new world_size.
+        if global_rank == 0:
+            _flush_pending_shards_into_final(
+                args.output_dir, world_size,
+                lat_shape_det, intr_shape_det, poses_shape_det,
+                per_sample_bytes,
+            )
+        if world_size > 1:
+            torch.distributed.barrier()
 
     os.makedirs(rank_dir, exist_ok=True)
     rank_map = int(len(shard) * per_sample_bytes * 1.3) + 100_000_000
     rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
 
     # ---- Resume ----
-    # The merged ``data/`` LMDB is the authoritative record of what is already
-    # done across runs (it stores each clip's video_path). Every rank reads it
-    # to know which clips to skip. A leftover shard from a run that was killed
-    # mid-encoding is also honoured so within-run progress is not lost.
+    # ``data/`` is the authoritative record of finished clips (it stores each
+    # clip's video_path). Any leftover ``.rank_*`` shards from a previous
+    # interrupted run were already folded into ``data/`` (see pre-merge above)
+    # and deleted, so the per-rank LMDB opened just now is guaranteed to be
+    # empty. We still defensively read it in case the user disabled the
+    # pre-merge or pointed --output_dir at unusual state.
     done_paths = set()
     if not args.no_resume:
         _, merged_paths = _read_paths_from_lmdb(final_dir)
         done_paths |= merged_paths
-    # own leftover shard (continue appending to it)
+    # Defensive: if for any reason this rank's shard already has entries,
+    # continue appending instead of overwriting.
     count = 0
     with rank_env.begin() as txn:
         cnt_raw = txn.get(b"__count__")
