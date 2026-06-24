@@ -63,10 +63,12 @@ def main():
     args, unknown = parser.parse_known_args()
 
     config = OmegaConf.load(args.config_path)
-    # Allow CLI overrides like: sequence_parallel_size=4 trainer.lr=1e-5
+    # Allow CLI overrides like: infra.sequence_parallel_size=2 batch_size=4
     if unknown:
         cli_conf = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(config, cli_conf)
+        if _is_rank0():
+            print(f"[train.py] CLI overrides applied: {unknown}")
     config = normalize_config(config)
     _validate_no_placeholder_paths(config, args.config_path)
     _resolve_relative_paths(config, args.config_path)
