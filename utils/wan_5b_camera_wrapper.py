@@ -80,11 +80,57 @@ class CameraWanDiffusionWrapper(WanDiffusionWrapper):
         """Bidirectional forward with optional PRoPE camera conditioning."""
         prompt_embeds = conditional_dict["prompt_embeds"]
 
-        # All frames share the same timestep in bidirectional mode.
+        # ------------------------------------------------------------------
+        # Timestep handling.
+        #
+        # Bidirectional Wan was originally trained with a *single* timestep
+        # shared across all frames (T2V), so the WanDiffusionWrapper base
+        # class collapses ``timestep`` -> ``timestep[:, 0]`` when
+        # ``uniform_timestep=True`` and lets WanModel broadcast that scalar
+        # across every patch token.
+        #
+        # That collapse is **wrong** for I2V on this trainer/inference path:
+        # we explicitly want frame 0 to carry ``t=0`` (the conditioning
+        # frame is clean) while every other frame carries the current
+        # schedule timestep. Taking ``timestep[:, 0]`` would force the whole
+        # latent (including the noisy frames) to be re-embedded with t=0
+        # and the model would treat the entire video as already denoised —
+        # which collapses both training (the loss is computed against the
+        # backbone's t=0 prediction for genuinely noisy frames) and
+        # inference (every step thinks the video is clean and emits a
+        # near-zero flow → outputs explode).
+        #
+        # Fix: detect the per-frame case (any frame has a different
+        # timestep than frame 0) and feed a per-token timestep
+        # ``[B, seq_len]`` to WanModel, expanded so every patch token
+        # inside frame ``f`` carries ``timestep[:, f]``. Patch tokens are
+        # laid out (F, H_p, W_p) by ``patch_embedding`` + ``flatten(2)``,
+        # so each frame occupies a contiguous block of ``H_p * W_p`` tokens.
+        # When all frames share the same timestep (T2V), we keep the
+        # original 1-D scalar path so behavior is bit-identical.
+        # ------------------------------------------------------------------
+        _, F, _, H, W = noisy_image_or_video.shape
+        # patch_size = (1, 2, 2) for Wan2.2-TI2V-5B.
+        H_p = H // 2
+        W_p = W // 2
+        per_token = H_p * W_p
+
         if self.uniform_timestep:
-            input_timestep = timestep[:, 0]
+            # Are all frames at the same timestep? If so keep the cheap
+            # 1-D scalar path. Otherwise expand to per-token.
+            same_across_frames = bool(
+                torch.equal(
+                    timestep,
+                    timestep[:, :1].expand_as(timestep),
+                )
+            )
+            if same_across_frames:
+                input_timestep = timestep[:, 0]
+            else:
+                # [B, F] -> [B, F * H_p * W_p] = [B, seq_len]
+                input_timestep = timestep.repeat_interleave(per_token, dim=1)
         else:
-            input_timestep = timestep
+            input_timestep = timestep.repeat_interleave(per_token, dim=1)
 
         rope_offset_was_set = (
             rope_temporal_offset is not None

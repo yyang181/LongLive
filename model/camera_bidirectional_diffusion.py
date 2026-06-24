@@ -161,6 +161,32 @@ class CameraBidirectionalDiffusion(BaseModel):
         else:
             loss = diff.mean()
 
+        # ---- DEBUG: temporary instrumentation to diagnose loss=0 ------------
+        # Remove once the I2V loss path is confirmed healthy.
+        if dist.is_initialized() and dist.get_rank() == 0 and 0:
+            try:
+                fp_abs = flow_pred.detach().float().abs()
+                tgt_abs = training_target.detach().float().abs()
+                w_t = weight.detach().float()
+                tnumel = float(training_target.numel())
+                tgt_zeros = float((training_target.detach() == 0).sum().item())
+                print(
+                    f"[DBG][rank0] cf={context_frames} "
+                    f"ts[0]={timestep[0].tolist()} "
+                    f"flow_pred|abs|.mean={fp_abs.mean().item():.4e} "
+                    f"target|abs|.mean={tgt_abs.mean().item():.4e} "
+                    f"target==0 frac={tgt_zeros/tnumel:.4f} "
+                    f"weight.min={w_t.min().item():.4e} "
+                    f"weight.max={w_t.max().item():.4e} "
+                    f"weight.mean={w_t.mean().item():.4e} "
+                    f"diff.sum={diff.detach().sum().item():.4e} "
+                    f"loss={loss.detach().item():.4e}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[DBG] failed: {_e}", flush=True)
+        # --------------------------------------------------------------------
+
         return loss, {
             "x0": clean_latent.detach(),
             "x0_pred": x0_pred.detach(),

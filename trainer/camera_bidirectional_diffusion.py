@@ -377,8 +377,8 @@ class Trainer:
 
             if (self.step % self.log_interval == 0) and self.is_main_process:
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                msg = (f"[step {self.step}] loss={log['generator_loss']:.4f} "
-                       f"grad={log['generator_grad_norm']:.3f} "
+                msg = (f"[step {self.step}] loss={log['generator_loss']:.6e} "
+                       f"grad={log['generator_grad_norm']:.3e} "
                        f"t/it={elapsed:.2f}s "
                        f"time={now_str}")
                 print(msg, flush=True)
