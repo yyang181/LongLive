@@ -329,39 +329,60 @@ def main() -> None:
 
         cfg_scale = float(inf_cfg.get("guidance_scale", 5.0))
         for ti, t_scalar in enumerate(timesteps):
-            t = t_scalar.expand(1, F_lat).to(device)
+            # Per-frame timestep ONLY for the model: in I2V mode, frame 0=0
+            # tells the backbone "frame 0 is clean" (mirrors training-time
+            # ``model/diffusion.py`` which zeroes timestep[:, :1] for the
+            # context frame). The scheduler must NEVER see this t[:,0]=0
+            # (see comment below).
+            t_per_frame = t_scalar.expand(1, F_lat).to(device)
             if is_i2v:
-                # Tell the backbone the first latent is clean. Mirrors how
-                # ``model/diffusion.py`` zeroes timestep[:, :1] for the
-                # I2V context frame at training time.
-                t = t.clone()
-                t[:, 0] = 0
+                t_per_frame = t_per_frame.clone()
+                t_per_frame[:, 0] = 0
+
             flow_c, _ = generator(
                 noisy_image_or_video=x,
                 conditional_dict=cond,
-                timestep=t,
+                timestep=t_per_frame,
                 viewmats=viewmats,
                 Ks=Ks,
             )
             flow_u, _ = generator(
                 noisy_image_or_video=x,
                 conditional_dict=uncond,
-                timestep=t,
+                timestep=t_per_frame,
                 viewmats=viewmats,
                 Ks=Ks,
             )
             flow_pred = flow_u + cfg_scale * (flow_c - flow_u)
 
             # FlowMatchScheduler.step expects 4-D tensors; flatten F.
+            #
+            # CRITICAL: feed the SCALAR denoising timestep `t_scalar` (broadcast
+            # to every flattened row) into the scheduler, NOT the per-frame
+            # timestep. ``FlowMatchScheduler.step`` uses argmin to map t -> sigma:
+            #
+            #     timestep_id = argmin(|self.timesteps - t|, dim=1)
+            #     if (timestep_id + 1 >= len(self.timesteps)).any():
+            #         sigma_ = 0
+            #
+            # In I2V mode frame 0 has t=0, which argmin maps to the LAST sigma
+            # (sigma_min). The ``.any()`` check then forces ``sigma_=0`` for
+            # the WHOLE batch, so every frame is single-stepped from the
+            # current sigma straight to 0. The model's flow was estimated at
+            # the current t (not at the final step), so this overshoots and
+            # blows up the noisy frames -> VAE decodes them as all-black /
+            # all-white. Mirrors official Wan2.2 ``WanTI2V.i2v``, which also
+            # uses a scalar t for ``sample_scheduler.step``.
             x_flat = x.flatten(0, 1)              # (F, C, H, W)
             f_flat = flow_pred.flatten(0, 1)
-            x_flat = scheduler.step(f_flat, t.flatten(0, 1), x_flat)
+            t_flat = t_scalar.to(device).expand(x_flat.shape[0])
+            x_flat = scheduler.step(f_flat, t_flat, x_flat)
             x = x_flat.unflatten(0, x.shape[:2]).to(torch.bfloat16)
 
             # Re-pin the I2V context latent: scheduler.step still updates the
-            # first frame with a (small) flow_pred since we only zeroed its
-            # timestep, but the cleanest contract is to keep it bit-identical
-            # to the encoded source image at every step.
+            # first frame (we now use the same scalar t for all frames), so
+            # we must restore the encoded source image. Mirrors the official
+            # Wan2.2 line ``latent = (1.-mask2)*z[0] + mask2*latent``.
             if is_i2v and image_latent is not None:
                 x[:, :1] = image_latent
 
