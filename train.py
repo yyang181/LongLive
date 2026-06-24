@@ -60,9 +60,14 @@ def main():
     parser.add_argument("--no-auto-resume", action="store_true", help="Disable auto resume from latest checkpoint in logdir")
     parser.add_argument("--generate-before-train", action="store_true", help="Run one evaluation inference before training starts")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
 
-    config = normalize_config(OmegaConf.load(args.config_path))
+    config = OmegaConf.load(args.config_path)
+    # Allow CLI overrides like: sequence_parallel_size=4 trainer.lr=1e-5
+    if unknown:
+        cli_conf = OmegaConf.from_dotlist(unknown)
+        config = OmegaConf.merge(config, cli_conf)
+    config = normalize_config(config)
     _validate_no_placeholder_paths(config, args.config_path)
     _resolve_relative_paths(config, args.config_path)
     if _is_rank0():
