@@ -30,6 +30,25 @@ def _validate_no_placeholder_paths(config, config_path):
             )
 
 
+def _resolve_relative_paths(config, config_path):
+    """Resolve relative dataset paths to absolute paths.
+
+    Relative ``data_path`` / ``eval_data_path`` entries are resolved against
+    the repository root (the directory containing this ``train.py`` file) so
+    that training works regardless of the cwd from which ``torchrun`` was
+    launched.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    for key in ("data_path", "eval_data_path"):
+        value = config.get(key, None)
+        if not isinstance(value, str) or not value:
+            continue
+        if os.path.isabs(value):
+            continue
+        resolved = os.path.normpath(os.path.join(repo_root, value))
+        config[key] = resolved
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
@@ -45,6 +64,7 @@ def main():
 
     config = normalize_config(OmegaConf.load(args.config_path))
     _validate_no_placeholder_paths(config, args.config_path)
+    _resolve_relative_paths(config, args.config_path)
     if _is_rank0():
         print(
             f"[train.py] config={args.config_path} "

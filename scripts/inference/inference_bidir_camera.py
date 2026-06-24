@@ -63,13 +63,24 @@ def load_generator(config, ckpt_path: str, device: torch.device) -> CameraWanDif
     if ckpt_path:
         print(f"[infer] loading generator weights from: {ckpt_path}")
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # Selection priority: env var USE_EMA=1 forces EMA; otherwise prefer
+        # the nominal `generator` weights, because EMA(decay=0.99) needs
+        # ~1/(1-decay)=100s of steps before it represents a sane model — in
+        # an early training run picking EMA gives a mixture of pretrained +
+        # training weights that produces all-black / all-white videos.
+        use_ema = os.environ.get("USE_EMA", "0") == "1"
         if isinstance(sd, dict):
-            if "generator_ema" in sd and isinstance(sd["generator_ema"], dict):
-                sd = sd["generator_ema"]
+            picked = None
+            if use_ema and "generator_ema" in sd and isinstance(sd["generator_ema"], dict):
+                picked = "generator_ema"; sd = sd["generator_ema"]
             elif "generator" in sd and isinstance(sd["generator"], dict):
-                sd = sd["generator"]
+                picked = "generator"; sd = sd["generator"]
+            elif "generator_ema" in sd and isinstance(sd["generator_ema"], dict):
+                picked = "generator_ema"; sd = sd["generator_ema"]
             elif "model" in sd and isinstance(sd["model"], dict):
-                sd = sd["model"]
+                picked = "model"; sd = sd["model"]
+            print(f"[infer] using checkpoint section: {picked!r} "
+                  f"(set USE_EMA=1 to force EMA)")
         # Strip optional "model." prefix dumped by some FSDP routines.
         cleaned = {
             (k[len("model."):] if k.startswith("model.") else k): v
@@ -163,6 +174,22 @@ def main() -> None:
 
     # ---------- generator ----------
     generator = load_generator(config, ckpt, device)
+
+    # ---------- Optional ablation: disable the PRoPE residual branch ----
+    # Set NO_PROPE=1 to zero out every block's `prope_o` and skip the PRoPE
+    # path. This isolates whether the all-black/white outputs come from the
+    # PRoPE residual (mis-conditioned cameras) or from the RoPE backbone
+    # itself. If the video looks fine with NO_PROPE=1, the PRoPE branch is
+    # the culprit; if it still looks broken, the issue is elsewhere
+    # (e.g. checkpoint mismatch or backbone divergence).
+    if os.environ.get("NO_PROPE", "0") == "1":
+        n_disabled = 0
+        for blk in generator.model.blocks:
+            sa = blk.self_attn
+            if hasattr(sa, "prope_o") and sa.prope_o is not None:
+                sa.prope_o = None
+                n_disabled += 1
+        print(f"[infer] NO_PROPE=1: disabled prope_o on {n_disabled} blocks")
 
     # ---------- prompts and trajectories ----------
     with open(inf_cfg["prompt_path"]) as f:
@@ -266,6 +293,20 @@ def main() -> None:
             device=device, dtype=torch.bfloat16, generator=gen,
         )
 
+        if os.environ.get("DEBUG_INFER", "0") == "1":
+            print(f"[clip {clip_idx}] shapes: "
+                  f"x={tuple(x.shape)} "
+                  f"viewmats={tuple(viewmats.shape)} "
+                  f"Ks={tuple(Ks.shape)} "
+                  f"cond.keys={list(cond.keys())} "
+                  f"is_i2v={is_i2v} cfg_scale={float(inf_cfg.get('guidance_scale',5.0))} "
+                  f"shift={generator.scheduler.shift if hasattr(generator,'scheduler') else 'n/a'}")
+            for k, v in cond.items():
+                if torch.is_tensor(v):
+                    print(f"    cond[{k}]: shape={tuple(v.shape)} dtype={v.dtype} "
+                          f"|v|.mean={v.float().abs().mean().item():.3e} "
+                          f"|v|.max={v.float().abs().max().item():.3e}")
+
         # ---- I2V: encode source image and pin its latent into x[:, :1] ----
         image_latent = None
         if is_i2v:
@@ -324,7 +365,27 @@ def main() -> None:
             if is_i2v and image_latent is not None:
                 x[:, :1] = image_latent
 
-            if (ti + 1) % 10 == 0:
+            # ---- Diagnostic: track flow / x stats per frame ------------
+            # Train-vs-infer mismatch typically shows up as flow_pred or x
+            # blowing up on non-context frames after a few denoising steps.
+            # Frame 0 is pinned, so its stats stay flat; if non-zero frames
+            # diverge wildly the cause is in the model output, not the
+            # scheduler. Set DEBUG_INFER=1 to enable.
+            if os.environ.get("DEBUG_INFER", "0") == "1" and ti % 5 == 0:
+                with torch.no_grad():
+                    fp = flow_pred.float()
+                    xf = x.float()
+                    f0 = fp[0, 0].abs().mean().item()
+                    f1 = fp[0, 1:].abs().mean().item()
+                    fmax = fp[0, 1:].abs().max().item()
+                    x1 = xf[0, 1:].abs().mean().item()
+                    xmax = xf[0, 1:].abs().max().item()
+                print(f"[clip {clip_idx}] step {ti+1}/{sampling_steps} "
+                      f"t={float(t_scalar):.2f} "
+                      f"|flow_pred[f=0]|={f0:.3e} "
+                      f"|flow_pred[f>=1]|={f1:.3e} (max {fmax:.3e}) "
+                      f"|x[f>=1]|={x1:.3e} (max {xmax:.3e})")
+            elif (ti + 1) % 10 == 0:
                 print(f"[clip {clip_idx}] step {ti + 1}/{sampling_steps}")
 
         # Decode latent to pixel: vae expects [B, F_lat, C, H, W].
