@@ -22,6 +22,32 @@ inference:
   width_latent: 80           # 1280 / 16
   num_channels: 48
   fps: 24
+
+  # Trajectory parser:
+  #   * worldplaygen (default) — single-token "w-N,left-N,..." DSL, parsed by
+  #     scripts/data_preprocessing/build_camera_lmdb_5b.poses_from_pose_str.
+  #     Use this for training-aligned inference.
+  #   * sana_dsl — sana-WM action DSL ("w-10,iw-5,none-3" with combo keys,
+  #     exponential velocity smoother, ground-locked translation). Goes
+  #     through utils/sana_camera_control.py and the same build_viewmats_and_Ks.
+  trajectory_format: sana_dsl
+
+  # Intrinsics source (priority order):
+  #   1. The four *_norm fields below, when present (highest priority).
+  #   2. estimate_intrinsics: true → run Pi3X on the first I2V source image
+  #      (per clip). Requires algorithm.i2v: true and the Pi3X repo on
+  #      PYTHONPATH (vendored under code/Pi3).
+  #   3. Otherwise fall back to poses_from_pose_str's WorldPlayGen defaults.
+  estimate_intrinsics: true
+
+  # Action overlay (Genie-3 / sana-WM style WASD-cluster + rotation
+  # joystick painted onto each output frame). Driven by the raw-frame c2w
+  # trajectory so it tracks every key press at the video frame rate.
+  # ``overlay_corner`` is one of bottom-left / bottom-right / top-left /
+  # top-right. Disabled by default; enable for debug / demo videos.
+  action_overlay: true
+  overlay_corner: bottom-left
+
   # Default WorldPlayGen-style intrinsics (1920x1080 capture, f≈969.7).
   fx_norm: 0.5050505050505051   # 969.6969.../1920
   fy_norm: 0.8978675264437377   # 969.6969.../1080
