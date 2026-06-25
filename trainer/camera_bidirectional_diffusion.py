@@ -274,6 +274,8 @@ class Trainer:
             print(f"[CameraBiDiff] i2v={self.i2v}")
         self.save_interval = getattr(config, "save_interval", 1000)
         self.max_iters = getattr(config, "max_iters", 100000)
+        # 默认只保留最新的 N 个 checkpoint，<=0 表示不清理（保留全部）
+        self.keep_last_n_checkpoints = int(getattr(config, "keep_last_n_checkpoints", 3))
 
 
     # ------------------------------------------------------------------
@@ -503,4 +505,39 @@ class Trainer:
                 torch.save({"generator_ema": ema_sd},
                            os.path.join(save_dir, "model_ema.pt"))
             print(f"[CameraBiDiff] saved checkpoint to {save_dir}")
+            self._prune_old_checkpoints()
         barrier()
+
+    def _prune_old_checkpoints(self):
+        """只保留最新的 ``keep_last_n_checkpoints`` 个 checkpoint 目录，删除更旧的。
+
+        仅 main process 调用。``keep_last_n_checkpoints <= 0`` 时不做清理。
+        """
+        keep = int(getattr(self, "keep_last_n_checkpoints", 0) or 0)
+        if keep <= 0:
+            return
+        logdir = self.output_path
+        if not logdir or not os.path.isdir(logdir):
+            return
+        pat = re.compile(r"checkpoint_model_(\d+)$")
+        candidates = []
+        for name in os.listdir(logdir):
+            match = pat.match(name)
+            if not match:
+                continue
+            full = os.path.join(logdir, name)
+            if not os.path.isdir(full):
+                continue
+            candidates.append((int(match.group(1)), full))
+        if len(candidates) <= keep:
+            return
+        # 按 step 升序排序，删除最早的那些
+        candidates.sort(key=lambda item: item[0])
+        to_remove = candidates[:-keep]
+        import shutil
+        for step, path in to_remove:
+            try:
+                shutil.rmtree(path)
+                print(f"[CameraBiDiff] pruned old checkpoint: {path}")
+            except Exception as e:
+                print(f"[CameraBiDiff] failed to prune {path}: {e}")
