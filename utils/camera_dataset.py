@@ -121,11 +121,18 @@ class CameraLatentLMDBDataset(Dataset):
             poses = _retrieve_row(self.env, "poses", np.float32, idx, self.poses_shape[1:])
 
         # latents may be (F, C, H, W) -> add T (denoising-step) axis if absent.
+        # Keep storage dtype (fp16) here: the trainer immediately re-casts to
+        # ``self.dtype`` (bf16) on the GPU, so an intermediate fp32 promotion
+        # in the worker would only double the worker→pin-memory→GPU bytes for
+        # no benefit. ``_retrieve_row`` returns a read-only view over the
+        # LMDB mmap (``np.frombuffer``); ``torch.from_numpy`` requires a
+        # writable buffer, so we ``.copy()`` once into a writable np array
+        # (this is the only required allocation in this hot path).
         if latents.ndim == 4:
-            latents_t = torch.tensor(latents, dtype=torch.float32)
+            latents_t = torch.from_numpy(latents.copy())
         else:
             # (T, F, C, H, W) -> take last (clean) step
-            latents_t = torch.tensor(latents, dtype=torch.float32)[-1]
+            latents_t = torch.from_numpy(latents[-1].copy())
 
         viewmats, Ks = build_viewmats_and_Ks(intrinsics, poses)
         return {

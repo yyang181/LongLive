@@ -36,10 +36,19 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Reuse the camera-trajectory parsing from the data-prep script.
-from scripts.data_preprocessing.build_camera_lmdb_5b import poses_from_pose_str  # noqa: E402
+from scripts.data_preprocessing.build_camera_lmdb_5b import (  # noqa: E402
+    _generate_camera_trajectory_local,
+    _parse_pose_string,
+    poses_from_pose_str,
+)
+from utils.action_overlay import apply_overlay  # noqa: E402
 from utils.camera_dataset import build_viewmats_and_Ks  # noqa: E402
 from utils.config import normalize_config  # noqa: E402
 from utils.inference_utils import save_video  # noqa: E402
+from utils.sana_camera_control import (  # noqa: E402
+    action_string_to_c2w,
+    poses_from_action_string,
+)
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper  # noqa: E402
 from utils.wan_5b_wrapper import WanTextEncoder, WanVAEWrapper  # noqa: E402
 
@@ -240,10 +249,81 @@ def main() -> None:
     target_h = H_lat * 16
     target_w = W_lat * 16
     fps = int(inf_cfg.get("fps", 24))
-    intrinsics_norm = torch.tensor([
-        float(inf_cfg["fx_norm"]), float(inf_cfg["fy_norm"]),
-        float(inf_cfg["cx_norm"]), float(inf_cfg["cy_norm"]),
-    ], dtype=torch.float32).numpy()
+
+    # ---------- trajectory format ----------
+    # ``trajectory_format``:
+    #   * ``worldplaygen`` (default): WorldPlayGen DSL parsed by
+    #     ``poses_from_pose_str`` in build_camera_lmdb_5b.py — single-token
+    #     segments like ``"w-10,left-5"`` (left/right=yaw, up/down=pitch,
+    #     a/d=strafe), constant-speed, no smoothing. This is what the LMDB
+    #     training data was generated with, so for training-aligned inference
+    #     keep this default.
+    #   * ``sana_dsl``: sana-WM action DSL (``"w-10,iw-5,none-3"``) — combo
+    #     keys, exponential velocity smoother, ground-plane-locked translation,
+    #     ±60° pitch clamp; key map a/d=yaw, j/l=strafe, i/k=pitch. Roll-out
+    #     is converted to LongLive's (w2c, 7-dim) storage and then through the
+    #     same ``build_viewmats_and_Ks`` so the downstream PRoPE path is
+    #     bit-identical.
+    trajectory_format = str(inf_cfg.get("trajectory_format", "worldplaygen")).lower()
+    if trajectory_format not in {"worldplaygen", "sana_dsl"}:
+        raise ValueError(
+            f"inference.trajectory_format must be 'worldplaygen' or 'sana_dsl', "
+            f"got {trajectory_format!r}"
+        )
+    print(f"[infer] trajectory_format = {trajectory_format}")
+
+    # ---------- action overlay ----------
+    # ``action_overlay``: render a Genie-3-style WASD-cluster + rotation
+    # joystick on top of every output frame, driven by the per-frame
+    # relative pose extracted from the *raw* (pre-VAE-stride) c2w
+    # trajectory. The overlay key/joystick mapping is the sana-WM
+    # convention (W/S = forward/back, A/D = strafe, joystick = yaw/pitch),
+    # regardless of which DSL produced the trajectory.
+    action_overlay = bool(inf_cfg.get("action_overlay", False))
+    overlay_corner = str(inf_cfg.get("overlay_corner", "bottom-left")).lower()
+    if action_overlay and overlay_corner not in {
+        "bottom-left", "bottom-right", "top-left", "top-right",
+    }:
+        raise ValueError(
+            f"inference.overlay_corner must be one of "
+            f"bottom-left/bottom-right/top-left/top-right, got {overlay_corner!r}"
+        )
+    if action_overlay:
+        print(f"[infer] action_overlay = True (corner={overlay_corner})")
+
+    # ---------- intrinsics source ----------
+    # Three modes, in priority order:
+    #   1. Explicit YAML fx_norm/fy_norm/cx_norm/cy_norm        (highest)
+    #   2. ``inference.estimate_intrinsics: true`` + I2V image  (Pi3X estimate)
+    #   3. Whatever ``poses_from_pose_str`` returns by default  (legacy)
+    # Mode (2) requires I2V (we estimate from the first frame). The estimated
+    # ``[fx, fy, cx, cy]`` is in source-image pixel units; we resize-scale it
+    # to (target_w, target_h) and then normalize, since LongLive's loader
+    # uses a pure ``Image.resize`` (no aspect-preserving crop).
+    has_explicit_intrinsics = all(
+        k in inf_cfg for k in ("fx_norm", "fy_norm", "cx_norm", "cy_norm")
+    )
+    estimate_intrinsics = bool(inf_cfg.get("estimate_intrinsics", False))
+    if has_explicit_intrinsics:
+        intrinsics_norm = np.array([
+            float(inf_cfg["fx_norm"]), float(inf_cfg["fy_norm"]),
+            float(inf_cfg["cx_norm"]), float(inf_cfg["cy_norm"]),
+        ], dtype=np.float32)
+        print(f"[infer] using YAML intrinsics_norm = {intrinsics_norm.tolist()}")
+    else:
+        intrinsics_norm = None  # filled in per-clip if estimating, else default
+        if estimate_intrinsics and not is_i2v:
+            raise ValueError(
+                "inference.estimate_intrinsics=true requires I2V mode "
+                "(algorithm.i2v: true) — Pi3X needs a source image."
+            )
+        if estimate_intrinsics:
+            print("[infer] estimate_intrinsics=true: will run Pi3X on the "
+                  "first source image (per clip).")
+        else:
+            print("[infer] no explicit intrinsics in YAML and "
+                  "estimate_intrinsics=false; falling back to "
+                  "poses_from_pose_str defaults (WorldPlayGen-style).")
 
     # ---------- scheduler ----------
     scheduler = generator.get_scheduler()
@@ -271,13 +351,71 @@ def main() -> None:
 
         gen = torch.Generator(device=device).manual_seed(args.seed + clip_idx)
 
-        # Pose -> viewmats / Ks for this trajectory.
-        intrinsics_clip, poses_clip = poses_from_pose_str(
-            traj, F_lat, target_h, target_w)
-        # The data-prep script returns intrinsics already normalized; we
-        # override with config-provided defaults here so inference can vary
-        # focal/principal-point at test time.
-        viewmats, Ks = build_viewmats_and_Ks(intrinsics_norm, poses_clip)
+        # ---- Per-clip intrinsics resolution -----------------------------
+        # If neither explicit YAML intrinsics nor Pi3X estimation was
+        # requested, fall back to the defaults baked into
+        # ``poses_from_pose_str``. With Pi3X estimation we run on the
+        # first source image (only opened here once, then re-loaded by
+        # ``_load_image_as_pixel`` below — Pi3X frees its weights after
+        # estimation so the peak VRAM impact is small).
+        if intrinsics_norm is None and estimate_intrinsics:
+            from utils.intrinsics_estimation import (
+                estimate_intrinsics_with_pi3x,
+                normalize_intrinsics,
+                transform_intrinsics_for_resize,
+            )
+            if Image is None:
+                raise RuntimeError(
+                    "PIL is required for Pi3X intrinsics estimation; "
+                    "please ``pip install pillow``."
+                )
+            src_img = Image.open(image_paths[clip_idx]).convert("RGB")
+            intr_pix_src = estimate_intrinsics_with_pi3x(src_img, device)
+            intr_pix_tgt = transform_intrinsics_for_resize(
+                intr_pix_src,
+                src_size=src_img.size,
+                target_size=(target_w, target_h),
+            )
+            intrinsics_norm_clip = normalize_intrinsics(
+                intr_pix_tgt, target_size=(target_w, target_h),
+            )
+            print(f"[clip {clip_idx}] Pi3X intrinsics_norm = "
+                  f"{intrinsics_norm_clip.tolist()}")
+        elif intrinsics_norm is not None:
+            intrinsics_norm_clip = intrinsics_norm
+        else:
+            intrinsics_norm_clip = None  # use whatever poses_from_pose_str returns
+
+        # ---- Trajectory -> (w2c, 7-dim) latent-frame poses --------------
+        # We additionally materialise the *raw* (pre-VAE-stride) c2w
+        # trajectory so the action overlay can be driven at the video's
+        # native frame rate (the latent-stride-4 sub-sampled poses would
+        # under-sample fast key presses and produce a flickery overlay).
+        raw_c2w_full: np.ndarray | None = None
+        if trajectory_format == "worldplaygen":
+            intrinsics_clip, poses_clip = poses_from_pose_str(
+                traj, F_lat, target_h, target_w)
+            if intrinsics_norm_clip is None:
+                intrinsics_norm_clip = intrinsics_clip
+            if action_overlay:
+                # Re-roll the raw per-frame c2w trajectory used by
+                # poses_from_pose_str internally. Returns a list of
+                # (Σ duration + 1) 4×4 c2w matrices.
+                _raw_c2w_list = _generate_camera_trajectory_local(
+                    _parse_pose_string(traj))
+                raw_c2w_full = np.stack(_raw_c2w_list, axis=0).astype(np.float32)
+        else:  # sana_dsl
+            poses_clip = poses_from_action_string(traj, F_lat)
+            if intrinsics_norm_clip is None:
+                # Sana DSL doesn't carry intrinsics; reuse WorldPlayGen
+                # defaults so behaviour matches the existing path.
+                _intr_def, _ = poses_from_pose_str(
+                    "w-1", F_lat, target_h, target_w)
+                intrinsics_norm_clip = _intr_def
+            if action_overlay:
+                raw_c2w_full = action_string_to_c2w(traj).astype(np.float32)
+
+        viewmats, Ks = build_viewmats_and_Ks(intrinsics_norm_clip, poses_clip)
         viewmats = torch.from_numpy(viewmats)[None].to(device=device, dtype=torch.float32)
         Ks = torch.from_numpy(Ks)[None].to(device=device, dtype=torch.float32)
 
@@ -413,6 +551,18 @@ def main() -> None:
         with torch.no_grad():
             video = vae.decode_to_pixel(x.to(torch.bfloat16))   # in [-1, 1]
         video = ((video.float()[0] + 1.0) * 0.5).clamp(0, 1)    # (F_raw, C, H, W) in [0,1]
+
+        # Optional: composite WASD + joystick action overlay onto each frame.
+        # We do this in uint8 HWC space and then convert back to float CHW
+        # in [0,1], so save_video / video_to_uint8 produce identical bytes
+        # to a no-overlay run apart from the painted panel.
+        if action_overlay and raw_c2w_full is not None:
+            video_thwc = (video.permute(0, 2, 3, 1).cpu().numpy()
+                          * 255.0).clip(0, 255).astype(np.uint8)
+            video_thwc = apply_overlay(video_thwc, raw_c2w_full,
+                                        corner=overlay_corner)
+            video = (torch.from_numpy(video_thwc).to(video.device)
+                     .permute(0, 3, 1, 2).float() / 255.0)
 
         out_path = out_dir / f"clip_{clip_idx:03d}.mp4"
         save_video(video, str(out_path), fps=fps)
