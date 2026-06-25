@@ -1,0 +1,68 @@
+# Camera (PRoPE) Bidirectional I2V SFT — Wan2.2-TI2V-5B
+# This is configs/train_bidir_camera.yaml with the single ``algorithm.i2v``
+# switch flipped to true. The trainer (trainer/camera_bidirectional_diffusion.py)
+# then:
+#   * pins the first latent frame (clean_latent[:, :1]) as the I2V context
+#     latent on the SP rank that owns global frame 0,
+#   * forces the schedule timestep of that frame to 0,
+#   * overwrites the noisy input with the clean image latent on every step,
+#   * masks that frame out of the flow-matching loss.
+# This mirrors how Causal I2V (configs/train_i2v_ar.yaml) treats its first
+# context frame.
+#
+# Dataset note: configs/train_bidir_camera_i2v.yaml reuses the existing
+# CameraLatentLMDBDataset because the LMDB already stores the full clean
+# latent sequence — taking ``clean_latent[:, :1]`` from the same record is
+# bit-identical to VAE-encoding the source image's first frame, which is the
+# I2V conditioning contract.
+
+infra:
+  mixed_precision: true
+  sharding_strategy: hybrid_full
+  generator_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+  num_workers: 4
+  seed: 0
+  gc_interval: 100
+  log_interval: 10
+  save_interval: 1000
+  # See train_bidir_camera.yaml for the full SP rationale; same constraints
+  # apply (must divide both num_latent_frames and num_heads).
+  sequence_parallel_size: 4
+
+algorithm:
+  trainer: camera_bidirectional_diffusion
+  causal: false
+  use_camera: true
+  # >>> The I2V switch <<<
+  i2v: true
+  num_train_timestep: 1000
+  num_frame_per_block: 1
+
+# 5B backbone with PRoPE injected at construction time.
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  use_camera: true
+
+training:
+  lr: 2.0e-06
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+  ema_weight: 0.99
+  ema_start_step: 0
+  max_grad_norm: 10.0
+  batch_size: 1
+  total_batch_size: null
+  max_iters: 9999999999990000
+
+data:
+  data_path: data/train/sekai_game/data_f40_h44_w80
+  # [B, F_lat, C, H_lat, W_lat] for Wan2.2-TI2V-5B (4x temporal, 16x spatial).
+  # image_or_video_shape: [1, 20, 48, 44, 80]
+  image_or_video_shape: [1, 40, 48, 44, 80]
+
+logging:
+  wandb_entity: null
+  wandb_project: LongLive-CameraSFT-I2V
