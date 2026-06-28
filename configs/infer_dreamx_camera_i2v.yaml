@@ -57,7 +57,7 @@ inference:
   #             (``sigma_min=0.0, extra_one_step=True``); this is the
   #             pre-fix LongLive behaviour where the final shift=5
   #             timestep stays at ``t≈92.6`` (~9% noise unresolved).
-  scheduler_mode: dreamx
+  scheduler_mode: legacy # dreamx
 
   # Wan2.2-TI2V-5B at 704x1280 with VAE temporal stride 4:
   #   raw_frames = 121  →  num_latent_frames = 1 + (121-1)//4 = 31
