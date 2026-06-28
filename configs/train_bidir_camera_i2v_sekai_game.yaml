@@ -55,6 +55,11 @@ training:
   max_grad_norm: 10.0
   batch_size: 1
   total_batch_size: null
+  # Optional gradient accumulation. Effective global batch =
+  #   batch_size * world_size/sequence_parallel_size * gradient_accumulation_steps.
+  # Leave commented (or set to 1) to disable. If both this and total_batch_size
+  # are set, the trainer cross-checks they agree.
+  # gradient_accumulation_steps: 1
   max_iters: 9999999999990000
 
 data:

@@ -303,10 +303,28 @@ class WanAttentionBlock(nn.Module):
         """
         e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
 
-        # self-attention
+        # self-attention (RoPE branch). Materialize ``temp_x`` so that the
+        # optional DreamX-style parallel ``cam_self_attn`` branch (added by
+        # ``wan_5b/modules/dreamx_camera.py::add_dreamx_cam_self_attn``) can
+        # share the *same* normalized+modulated input with the RoPE self-attn.
+        temp_x = self.norm1(x).type_as(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
         y = self.self_attn(
-            self.norm1(x).type_as(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs, prope_meta=prope_meta)
+            temp_x, seq_lens, grid_sizes, freqs, prope_meta=prope_meta)
+
+        # ----- Optional DreamX-style parallel PRoPE self-attn -----
+        # Active iff (a) ``add_dreamx_cam_self_attn`` was called on this model
+        # and (b) the caller supplied viewmats/Ks via ``prope_meta``. This is
+        # mutually exclusive with ``WanSelfAttention.prope_o`` (the LongLive
+        # zero-init residual): the wrapper either patches ``cam_self_attn``
+        # (DreamX path) or ``prope_o`` (legacy path), never both.
+        if (getattr(self, "cam_self_attn", None) is not None
+                and prope_meta is not None):
+            cam_emb = {
+                "viewmats": prope_meta["viewmats"],
+                "K": prope_meta.get("Ks", None),
+            }
+            y = y + self.cam_self_attn(temp_x, cam_emb, seq_lens=seq_lens)
+
         x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function

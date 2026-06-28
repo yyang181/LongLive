@@ -1,0 +1,124 @@
+# Inference config for DreamX-World style camera + I2V Wan2.2-TI2V-5B.
+#
+# This config switches LongLive's bidirectional camera-PRoPE inference into
+# the **DreamX-World** code path: a full ``cam_self_attn`` (Q/K/V/out_proj +
+# RMSNorm, out_proj zero-init) is attached to every WanAttentionBlock as a
+# parallel branch, and the official ``DreamX-World-5B-Cam`` safetensors load
+# 1:1 into ``blocks.{i}.cam_self_attn.*``. Mirrors:
+#
+#   DreamX-World/inference_dreamx_5b_yyx.sh
+#   DreamX-World/inference_dreamx5b.py
+#
+# Run:
+#   CUDA_VISIBLE_DEVICES=0 python scripts/inference/inference_bidir_camera.py \
+#       --config_path  configs/infer_dreamx_camera_i2v.yaml \
+#       --output_dir   videos/dreamx_camera_i2v
+#
+# The trajectory format is DreamX's action DSL: each input record carries
+# ``action_seq`` (e.g. ["w","a","w","d"]) and ``action_speed_list``
+# (e.g. [4,4,4,4]). The corresponding (viewmats, Ks) are computed by
+# ``utils.dreamx_trajectory.action_to_viewmats_Ks`` and fed straight into
+# WanModel via the existing ``prope_meta`` plumbing.
+
+algorithm:
+  causal: false
+  use_camera: true
+  i2v: true
+  # >>> THE DREAMX SWITCH <<<
+  # When true, ``load_generator`` constructs DreamXCameraWanDiffusionWrapper
+  # (full cam_self_attn branch) instead of the legacy CameraWanDiffusionWrapper
+  # (zero-init prope_o residual). The two are mutually exclusive; flip back
+  # to false to use the original LongLive PRoPE path with this same script.
+  dreamx_camera: true
+
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  # DreamX-specific:
+  attn_compress: 1            # 5B-Cam config has attn_compress=1 (cam attn dim == model dim)
+  qk_norm: true               # 5B-Cam uses RMSNorm on Q/K
+  # If --generator_ckpt is NOT supplied, this directory is loaded as the
+  # DreamX backbone+camera weights. When --generator_ckpt IS supplied, that
+  # checkpoint is the authoritative source (it should already include
+  # cam_self_attn weights from a LongLive-side fine-tune).
+  dreamx_ckpt: /nfs/yixinyang/code/checkpoints/DreamX-World-5B-Cam
+
+inference:
+  sampling_steps: 50
+  guidance_scale: 3.0
+
+  # ---- Sampler scheduler selection ----
+  # ``dreamx``  (default): rebuild FlowMatchScheduler with
+  #             ``sigma_min=1/1000, extra_one_step=False`` so the N=50
+  #             timestep sequence is numerically identical to DreamX's
+  #             diffusers ``FlowMatchEulerDiscreteScheduler`` (shift comes
+  #             from ``model_kwargs.timestep_shift``; max|Δt|≈1e-4).
+  # ``legacy`` : reuse the wrapper's training-time scheduler unchanged
+  #             (``sigma_min=0.0, extra_one_step=True``); this is the
+  #             pre-fix LongLive behaviour where the final shift=5
+  #             timestep stays at ``t≈92.6`` (~9% noise unresolved).
+  scheduler_mode: dreamx
+
+  # Wan2.2-TI2V-5B at 704x1280 with VAE temporal stride 4:
+  #   raw_frames = 121  →  num_latent_frames = 1 + (121-1)//4 = 31
+  num_latent_frames: 31
+  height_latent: 44             # 704 / 16
+  width_latent: 80              # 1280 / 16
+  num_channels: 48
+  fps: 24
+
+  # >>> Trajectory format <<<
+  # We deliberately reuse the *same* line-aligned trajectory file as the
+  # bidirectional (non-DreamX) inference config — ``prompts/trajectories.txt``
+  # — so a single set of prompts/trajectories/images drives both code paths.
+  # That file uses tokens like ``"dw-40,aw-40"`` (combo keys + frame counts),
+  # which is the **sana_dsl** grammar, not DreamX's per-segment-speed DSL:
+  #
+  #   * ``dw``  : combo key — hold ``d`` and ``w`` simultaneously
+  #   * ``-40`` : duration in *raw frames* (must be a positive integer)
+  #
+  # ``utils/sana_camera_control.py`` rolls this out into a per-frame c2w
+  # trajectory with smoothed velocity + ground-locked translation + a ±60°
+  # pitch clamp; the resulting ``(viewmats, Ks)`` are then fed straight into
+  # DreamX's ``cam_self_attn`` branch via the same ``prope_meta`` plumbing
+  # used by the worldplaygen / dreamx_action_dsl paths.
+  #
+  # If you instead want DreamX's native ``"<token>-<speed>"`` grammar
+  # (e.g. ``"w-4,a-4,w-4,d-4"`` where ``4`` is a per-segment speed scalar),
+  # set ``trajectory_format: dreamx_action_dsl`` and point trajectory_path
+  # at a file using that DSL — the inference script handles all three
+  # dialects (worldplaygen / sana_dsl / dreamx_action_dsl) uniformly.
+  duration_per_segment: 33      # only consumed by dreamx_action_dsl; harmless here
+
+  # ---- Default: shared sana_dsl three-file set (active) ----
+  trajectory_format: sana_dsl
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories.txt
+  # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
+  image_path: prompts/images.txt
+
+  # ---- Legacy: native DreamX action-DSL three-file set (commented out) ----
+  # To run with DreamX's per-segment speed grammar instead, comment out the
+  # three lines above and uncomment the block below. Each line of
+  # ``prompts/dreamx_trajectories.txt`` is e.g. ``"dw-4,aw-4"`` where the
+  # number is a *speed scalar* applied for ``duration_per_segment`` (=33)
+  # frames; ``utils.dreamx_trajectory.action_to_viewmats_Ks`` rolls it out.
+  #
+  # trajectory_format: dreamx_action_dsl
+  # prompt_path: prompts/dreamx_prompts.txt
+  # trajectory_path: prompts/dreamx_trajectories.txt
+  # image_path: prompts/dreamx_images.txt
+
+  # Intrinsics: action_to_viewmats_Ks bakes in DreamX's normalized 1080p
+  # intrinsic defaults (fx_norm≈0.505, fy_norm≈0.898, cx=cy=0). Pi3X
+  # estimation is intentionally disabled here so the trajectory math
+  # matches the DreamX reference end-to-end.
+  estimate_intrinsics: true
+
+  action_overlay: true
+
+checkpoints:
+  generator_ckpt: ""            # leave empty to use DreamX-World-5B-Cam directly
+
+logging:
+  output_dir: videos/dreamx_camera_i2v

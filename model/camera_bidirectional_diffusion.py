@@ -52,12 +52,58 @@ class CameraBidirectionalDiffusion(BaseModel):
         # Cache the i2v switch on the model itself so generator_loss can read it
         # without going back to ``self.args``. Defaults to False (pure T2V).
         self.i2v = bool(getattr(args, "i2v", False))
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"[CameraBidirectionalDiffusion] backbone={model_name} "
-                  f"use_camera={model_kwargs['use_camera']} i2v={self.i2v}")
 
-        self.generator = CameraWanDiffusionWrapper(is_causal=False, **model_kwargs)
-        self.generator.model.requires_grad_(True)
+        # ---- DreamX-World style camera path -------------------------------
+        # When ``algorithm.dreamx_camera = true`` (or top-level
+        # ``dreamx_camera = true`` after normalize_config), use the full
+        # PropeSelfAttention branch (matching DreamX-World-5B-Cam) instead of
+        # the LongLive zero-init ``prope_o`` residual. The wrapper subclass
+        # is a drop-in replacement: forward() / get_scheduler() / model.* are
+        # all inherited from CameraWanDiffusionWrapper.
+        algo = getattr(args, "algorithm", {}) or {}
+        if hasattr(algo, "get"):
+            use_dreamx = bool(algo.get("dreamx_camera", False))
+        else:  # OmegaConf DictConfig has __contains__
+            use_dreamx = bool(getattr(algo, "dreamx_camera", False))
+        use_dreamx = use_dreamx or bool(getattr(args, "dreamx_camera", False))
+
+        if use_dreamx:
+            # DreamX-specific options live under ``model_kwargs`` so they
+            # flow naturally through the existing config plumbing.
+            attn_compress = int(model_kwargs.pop("attn_compress", 1))
+            qk_norm = bool(model_kwargs.pop("qk_norm", True))
+            dreamx_ckpt = model_kwargs.pop("dreamx_ckpt", None)
+            freeze_backbone = bool(model_kwargs.pop("freeze_backbone", True))
+            # The DreamX wrapper installs cam_self_attn itself, so drop the
+            # legacy ``use_camera`` flag (which would otherwise trigger
+            # ``add_prope_parameters`` in the parent).
+            model_kwargs.pop("use_camera", None)
+
+            from utils.dreamx_camera_wrapper import DreamXCameraWanDiffusionWrapper
+            self.generator = DreamXCameraWanDiffusionWrapper(
+                is_causal=False,
+                attn_compress=attn_compress,
+                qk_norm=qk_norm,
+                dreamx_ckpt=dreamx_ckpt,
+                freeze_backbone_for_train=freeze_backbone,
+                **model_kwargs,
+            )
+            # When freeze_backbone=True, only cam_self_attn parameters are
+            # trainable; otherwise everything is trainable. We do NOT call
+            # ``self.generator.model.requires_grad_(True)`` here because that
+            # would un-freeze the backbone right after the wrapper froze it.
+            if not freeze_backbone:
+                self.generator.model.requires_grad_(True)
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"[CameraBidirectionalDiffusion] dreamx_camera=True "
+                      f"backbone={model_name} freeze_backbone={freeze_backbone} "
+                      f"attn_compress={attn_compress} i2v={self.i2v}")
+        else:
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"[CameraBidirectionalDiffusion] backbone={model_name} "
+                      f"use_camera={model_kwargs['use_camera']} i2v={self.i2v}")
+            self.generator = CameraWanDiffusionWrapper(is_causal=False, **model_kwargs)
+            self.generator.model.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)

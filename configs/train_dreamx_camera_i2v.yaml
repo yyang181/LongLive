@@ -1,0 +1,77 @@
+# DreamX-World style Camera + I2V SFT — Wan2.2-TI2V-5B
+#
+# Train recipe matching the DreamX paper:
+#   * Full backbone is FROZEN (Wan2.2-TI2V-5B base weights).
+#   * Only ``blocks.{i}.cam_self_attn.*`` is trainable — the parallel
+#     PropeSelfAttention branch (q_proj, k_proj, v_proj, out_proj,
+#     norm_q, norm_k). out_proj is zero-init so the first forward pass is
+#     mathematically identical to the frozen-backbone-only model.
+#   * Reuses CameraLatentLMDBDataset: the LMDB stores precomputed
+#     (latents, prompts, intrinsics, poses); ``viewmats``/``Ks`` are built
+#     in ``CameraLatentLMDBDataset.__getitem__`` via build_viewmats_and_Ks
+#     and reach the wrapper as keyword args, exactly like the legacy
+#     CameraWanDiffusionWrapper path. No dataset code changes required.
+#
+# Differences vs configs/train_bidir_camera_i2v.yaml:
+#   * algorithm.dreamx_camera: true   -> DreamXCameraWanDiffusionWrapper
+#   * model_kwargs.attn_compress / qk_norm / freeze_backbone (DreamX hp)
+#   * Optional dreamx_ckpt to warm-start cam_self_attn from the official
+#     DreamX-World-5B-Cam release (or set to null to train from zero-init).
+
+infra:
+  mixed_precision: true
+  sharding_strategy: hybrid_full
+  generator_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+  num_workers: 4
+  seed: 0
+  gc_interval: 100
+  log_interval: 10
+  save_interval: 1000
+  sequence_parallel_size: 4
+
+algorithm:
+  trainer: camera_bidirectional_diffusion
+  causal: false
+  use_camera: true
+  i2v: true
+  # >>> THE DREAMX SWITCH <<<
+  dreamx_camera: true
+  num_train_timestep: 1000
+  num_frame_per_block: 1
+
+# 5B backbone with cam_self_attn injected at construction time.
+model_kwargs:
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  # DreamX-specific:
+  attn_compress: 1
+  qk_norm: true
+  # Only cam_self_attn is trained when freeze_backbone=true (DreamX recipe).
+  # Set false to fine-tune the whole backbone alongside cam_self_attn.
+  freeze_backbone: true
+  # Optional: warm-start cam_self_attn from the official DreamX release.
+  # Comment out to train cam_self_attn from zero-init (out_proj=0 means the
+  # first iteration is a no-op residual).
+  dreamx_ckpt: /nfs/yixinyang/code/checkpoints/DreamX-World-5B-Cam
+
+training:
+  lr: 1.0e-05         # DreamX trains the small cam branch at a higher LR than
+                      # the full-fine-tune setting (2e-6). Tune as needed.
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+  ema_weight: 0.99
+  ema_start_step: 0
+  max_grad_norm: 10.0
+  batch_size: 1
+  total_batch_size: null
+  max_iters: 9999999999990000
+
+data:
+  data_path: data/train/minWM-data/data
+  image_or_video_shape: [1, 20, 48, 44, 80]
+
+logging:
+  wandb_entity: null
+  wandb_project: LongLive-DreamXCamera-I2V
