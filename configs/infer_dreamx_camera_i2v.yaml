@@ -61,7 +61,7 @@ inference:
 
   # Wan2.2-TI2V-5B at 704x1280 with VAE temporal stride 4:
   #   raw_frames = 121  →  num_latent_frames = 1 + (121-1)//4 = 31
-  num_latent_frames: 31
+  num_latent_frames: 41 # 31
   height_latent: 44             # 704 / 16
   width_latent: 80              # 1280 / 16
   num_channels: 48
@@ -93,7 +93,8 @@ inference:
   # ---- Default: shared sana_dsl three-file set (active) ----
   trajectory_format: sana_dsl
   prompt_path: prompts/prompts.txt
-  trajectory_path: prompts/trajectories.txt
+  # trajectory_path: prompts/trajectories.txt
+  trajectory_path: prompts/trajectories_complex.txt
   # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
   image_path: prompts/images.txt
 
