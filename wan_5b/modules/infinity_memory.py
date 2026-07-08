@@ -1,0 +1,799 @@
+"""Echo-Infinity's Relative-RoPE + learnable-memory forward, adapted for
+LongLive's Wan2.2-TI2V-5B ``CausalWanSelfAttention`` / ``CausalWanAttentionBlock``.
+
+Design goals
+------------
+1) **Zero-overhead when disabled.** The wrapper only calls :func:`attach_infmem`
+   when the config asks for it; unpatched forwards behave bit-exact like the
+   stock LongLive I2V AR path.
+
+2) **Additive KV branch.** When memory is enabled, self-attn attends over
+   ``concat([sink, memory, local])`` where the memory K/V are produced by an
+   external :class:`QueryMemoryEncoder` (kept **outside** FSDP via
+   ``object.__setattr__``, see ``utils/infinity_memory_wrapper.py``).
+
+3) **Relative RoPE.** The rope layout used inside this file pins Q to
+   ``[q_last-B+1 .. q_last]`` where ``q_last = min(current_start_frame+B-1,
+   pmax-1)``. All other segments (sink, memory, local KV) are placed to the
+   LEFT of Q inside the same ``[0, pmax-1]`` window. This keeps the RoPE
+   support bounded regardless of true video length -- the key idea from
+   Echo-Infinity.
+
+4) **Compatible with LongLive's KV cache path.** We reuse LongLive's
+   ``_apply_cache_updates`` (unchanged), including the ``pinned_shift`` /
+   multi-shot sink protocol. The only path we override is:
+     * ``CausalWanSelfAttention.forward``  -> :func:`_self_attn_infmem_forward`
+     * ``CausalWanAttentionBlock.forward`` -> :func:`_block_infmem_forward`
+   All extra state (``relative_rope_pmax``, ``num_frame_per_block_attr``,
+   ``_layer_id``, and the ``memory_kv`` kwarg) is added purely as attributes
+   / kwargs, so nothing else in the codebase needs to change.
+
+5) **5B-specific adaptations vs Echo-Infinity's 1.3B reference:**
+     * ``frame_seqlen`` is derived from ``_CURRENT_GRID_META`` (dynamic,
+       ``= h * w``) rather than hard-coded to 1560.
+     * ``num_frame_per_block`` defaults to 8 (I2V AR) rather than 3.
+     * We forward LongLive's rope extras (``t_scale``, ``method``,
+       ``original_seq_len``, ``temporal_offset``) into ``causal_rope_apply``.
+     * The multi-shot sink / global_sink / pinned protocol is respected by
+       treating ``effective_sink`` as the "left-boundary" of the local window
+       (identical to LongLive's stock formula).
+
+The mechanism is orthogonal to LongLive's ``use_relative_rope``: when infmem
+is attached, the layer ignores ``use_relative_rope`` and uses infmem's own
+relative-window layout instead. To use LongLive's own relative rope, simply
+do NOT attach infmem.
+"""
+
+from __future__ import annotations
+
+import math
+import types
+import torch
+import torch.distributed as dist
+
+from wan_5b.modules.attention import attention
+from wan_5b.modules.causal_model import (
+    causal_rope_apply,
+    _CURRENT_GRID_META,
+    _TRITON_ADALN_ENABLED,
+)
+
+
+# Log flags mirror Echo-Infinity for parity with training logs.
+_FIRST_LONG_LOGGED = {"flag": False}
+_FIRST_BULK_LOGGED = {"flag": False}
+
+
+def _reset_log_flags() -> None:
+    _FIRST_LONG_LOGGED["flag"] = False
+    _FIRST_BULK_LOGGED["flag"] = False
+
+
+def _compute_relative_positions(
+    current_start_frame: int,
+    B: int,
+    R: int,
+    N_Q: int,
+    N_S: int,
+    pmax: int,
+    num_frame_per_block: int,
+):
+    """1:1 with Echo-Infinity's `CausalWanSelfAttention._compute_relative_positions`.
+
+    Returns a dict describing the relative frame windows used for RoPE:
+      * sink_start = 0 (always)
+      * memory : [mem_start, mem_end] (only when use_memory is True)
+      * local  : [local_start, local_end] (only when R > 0)
+      * Q      : [q_start, q_last]
+
+    ``q_last`` is pinned at ``pmax - 1`` when the AR has advanced past the
+    training rope horizon; earlier chunks use their true position.
+    """
+    is_bulk_forward = B > num_frame_per_block
+    q_last = min(current_start_frame + B - 1, pmax - 1)
+    q_start = q_last - B + 1
+    local_end = q_last
+    local_start = local_end - R + 1 if R > 0 else q_last
+    if is_bulk_forward or N_Q == 0:
+        use_memory = False
+        mem_start = -1
+        mem_end = -1
+    else:
+        use_memory = True
+        mem_end = local_start - 1
+        mem_start = mem_end - N_Q + 1
+    return dict(
+        is_bulk_forward=is_bulk_forward,
+        use_memory=use_memory,
+        q_start=q_start,
+        q_last=q_last,
+        local_start=local_start,
+        local_end=local_end,
+        mem_start=mem_start,
+        mem_end=mem_end,
+        sink_start=0,
+    )
+
+
+def _self_attn_infmem_forward(
+    self,
+    x,
+    seq_lens,
+    grid_sizes,
+    freqs,
+    block_mask,
+    kv_cache=None,
+    current_start=0,
+    cache_start=None,
+    # LongLive-only rope extras; accepted so the stock block forward can pass
+    # them through without knowing about infmem.
+    t_scale=1.0,
+    use_relative_rope=False,
+    method="linear",
+    original_seq_len=None,
+    temporal_offset=0.0,
+    # infmem-only kwargs
+    memory_kv=None,
+):
+    """Drop-in replacement for :meth:`CausalWanSelfAttention.forward`.
+
+    Differences vs the stock forward:
+      * When ``kv_cache is None`` we fall back to the original forward path
+        so that teacher-forcing / non-KV-cache training keeps working.
+      * When ``kv_cache is not None``, we always run the RELATIVE-RoPE layout
+        below, regardless of ``use_relative_rope`` (infmem's rope is stricter).
+      * If ``memory_kv`` is provided AND ``B <= num_frame_per_block`` AND
+        history exists, an additional segment ``mem_k_roped`` is spliced in
+        between sink and local.
+    """
+    # -------- Fallback for training (no KV cache): reuse stock forward ---
+    if kv_cache is None:
+        # Restore the original forward for this one call. This path is used
+        # by teacher-forcing training (Wan2.2 flex_attention), which does not
+        # benefit from infmem/relative-rope (the whole clip is materialized).
+        orig = getattr(self, "_original_forward", None)
+        if orig is None:
+            raise RuntimeError(
+                "_self_attn_infmem_forward called without kv_cache and no "
+                "_original_forward is bound; did attach_infmem run?"
+            )
+        return orig(
+            x, seq_lens, grid_sizes, freqs, block_mask,
+            kv_cache=None, current_start=current_start, cache_start=cache_start,
+            t_scale=t_scale, use_relative_rope=use_relative_rope,
+            method=method, original_seq_len=original_seq_len,
+            temporal_offset=temporal_offset,
+        )
+
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+    if cache_start is None:
+        cache_start = current_start
+
+    def qkv_fn(_x):
+        q = self.norm_q(self.q(_x)).view(b, s, n, d)
+        k = self.norm_k(self.k(_x)).view(b, s, n, d)
+        v = self.v(_x).view(b, s, n, d)
+        return q, k, v
+
+    q, k, v = qkv_fn(x)
+
+    # -------- geometry pulled from LongLive's _CURRENT_GRID_META -----------
+    if _CURRENT_GRID_META:
+        frame_seqlen = _CURRENT_GRID_META["frame_seqlen"]
+        num_new_frames = _CURRENT_GRID_META["num_new_frames"]
+        h = _CURRENT_GRID_META["h"]
+        w = _CURRENT_GRID_META["w"]
+    else:  # unit-test fallback
+        frame_seqlen = int(math.prod(grid_sizes[0][1:]).item())
+        num_new_frames = int(grid_sizes[0][0].item())
+        h = int(grid_sizes[0][1].item()); w = int(grid_sizes[0][2].item())
+
+    num_new_tokens = q.shape[1]
+    current_end = current_start + num_new_tokens
+
+    # Sink / global-sink / pinned handling (identical to LongLive stock).
+    sink_tokens = self.sink_size * frame_seqlen
+    global_sink_tokens = getattr(self, "global_sink_size", 0) * frame_seqlen
+    if _CURRENT_GRID_META and "pinned_start" in _CURRENT_GRID_META:
+        pinned_start_val = _CURRENT_GRID_META["pinned_start"]
+        pinned_len_val = _CURRENT_GRID_META["pinned_len"]
+    else:
+        _ps = kv_cache.get("pinned_start", None)
+        if _ps is not None and hasattr(_ps, "item"):
+            pinned_start_val = _ps.item()
+            pinned_len_val = kv_cache["pinned_len"].item()
+        else:
+            pinned_start_val = -1
+            pinned_len_val = 0
+    has_pinned = pinned_start_val >= 0 and pinned_len_val > 0
+    if has_pinned and pinned_start_val == global_sink_tokens:
+        effective_sink = global_sink_tokens + pinned_len_val
+    elif has_pinned:
+        effective_sink = global_sink_tokens
+    else:
+        effective_sink = max(global_sink_tokens, sink_tokens)
+
+    if _CURRENT_GRID_META and "global_end_index" in _CURRENT_GRID_META:
+        _cache_global_end = _CURRENT_GRID_META["global_end_index"]
+        _cache_local_end = _CURRENT_GRID_META["local_end_index"]
+    else:
+        _cache_global_end = kv_cache["global_end_index"].item()
+        _cache_local_end = kv_cache["local_end_index"].item()
+
+    kv_cache_size = kv_cache["k"].shape[1]
+    is_recompute = current_end <= _cache_global_end and current_start > 0
+
+    # -------- KV write path (mirrors stock LongLive; not quantized) --------
+    cache_k = kv_cache["k"]
+    cache_v = kv_cache["v"]
+
+    if (
+        self.local_attn_size != -1
+        and current_end > _cache_global_end
+        and num_new_tokens + _cache_local_end > kv_cache_size
+    ):
+        num_evicted_tokens = num_new_tokens + _cache_local_end - kv_cache_size
+        num_rolled_tokens = _cache_local_end - num_evicted_tokens - effective_sink
+        local_end_index = (
+            _cache_local_end + current_end - _cache_global_end - num_evicted_tokens
+        )
+        local_start_index = local_end_index - num_new_tokens
+
+        temp_k = cache_k.clone()
+        temp_v = cache_v.clone()
+        temp_k[:, effective_sink:effective_sink + num_rolled_tokens] = temp_k[
+            :,
+            effective_sink + num_evicted_tokens:
+            effective_sink + num_evicted_tokens + num_rolled_tokens,
+        ].clone()
+        temp_v[:, effective_sink:effective_sink + num_rolled_tokens] = temp_v[
+            :,
+            effective_sink + num_evicted_tokens:
+            effective_sink + num_evicted_tokens + num_rolled_tokens,
+        ].clone()
+
+        write_start_index = max(local_start_index, effective_sink) if is_recompute else local_start_index
+        roped_offset = max(0, write_start_index - local_start_index)
+        write_len = max(0, local_end_index - write_start_index)
+        if write_len > 0:
+            temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
+            temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+        pinned_shift = num_evicted_tokens if (has_pinned and pinned_start_val >= effective_sink) else 0
+        cache_update_info = {
+            "action": "roll_and_insert",
+            "sink_tokens": effective_sink,
+            "num_rolled_tokens": num_rolled_tokens,
+            "num_evicted_tokens": num_evicted_tokens,
+            "local_start_index": local_start_index,
+            "local_end_index": local_end_index,
+            "new_k": k[:, roped_offset:roped_offset + write_len],
+            "new_v": v[:, roped_offset:roped_offset + write_len],
+            "current_end": current_end,
+            "pinned_shift": pinned_shift,
+        }
+    else:
+        local_end_index = _cache_local_end + current_end - _cache_global_end
+        local_start_index = local_end_index - num_new_tokens
+
+        temp_k = cache_k.clone()
+        temp_v = cache_v.clone()
+        write_start_index = max(local_start_index, effective_sink) if is_recompute else local_start_index
+        roped_offset = max(0, write_start_index - local_start_index)
+        write_len = max(0, local_end_index - write_start_index)
+        if write_len > 0:
+            temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
+            temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+        cache_update_info = {
+            "action": "direct_insert",
+            "local_start_index": local_start_index,
+            "local_end_index": local_end_index,
+            "new_k": k[:, roped_offset:roped_offset + write_len],
+            "new_v": v[:, roped_offset:roped_offset + write_len],
+            "current_end": current_end,
+            "pinned_shift": 0,
+        }
+
+    # -------- Relative RoPE layout --------------------------------------
+    num_cache_frames = local_end_index // frame_seqlen
+    sink_size_frames = effective_sink // frame_seqlen
+    R_active = num_cache_frames - sink_size_frames
+    N_Q_rr = int(_CURRENT_GRID_META.get("memory_frames", 0)) if memory_kv is not None else 0
+    current_start_frame = current_start // frame_seqlen
+    num_frame_per_block_attr = getattr(self, "num_frame_per_block_attr", 8)
+    relative_rope_pmax = getattr(self, "relative_rope_pmax", 24)
+
+    rr_pos = _compute_relative_positions(
+        current_start_frame=current_start_frame,
+        B=num_new_frames,
+        R=R_active,
+        N_Q=N_Q_rr,
+        N_S=sink_size_frames,
+        pmax=relative_rope_pmax,
+        num_frame_per_block=num_frame_per_block_attr,
+    )
+
+    _diag = (
+        f"[InfMem-diag] layer={getattr(self, '_layer_id', -1)} "
+        f"cur_start_f={current_start_frame} B={num_new_frames} R={R_active} "
+        f"N_Q={N_Q_rr} N_S={sink_size_frames} pmax={relative_rope_pmax} "
+        f"is_bulk={rr_pos['is_bulk_forward']} use_mem={rr_pos['use_memory']} "
+        f"sink_s={rr_pos['sink_start']} mem_s={rr_pos['mem_start']} "
+        f"mem_e={rr_pos['mem_end']} local_s={rr_pos['local_start']} "
+        f"local_e={rr_pos['local_end']} q_s={rr_pos['q_start']} q_l={rr_pos['q_last']}"
+    )
+    assert rr_pos["q_last"] <= relative_rope_pmax - 1, f"InfMem overflow: q_last > pmax-1 | {_diag}"
+    assert rr_pos["q_start"] >= 0, f"InfMem underflow: q_start < 0 | {_diag}"
+    if rr_pos["use_memory"]:
+        assert rr_pos["mem_start"] >= sink_size_frames, f"InfMem mem overlaps sink | {_diag}"
+        assert rr_pos["mem_end"] + 1 == rr_pos["local_start"], f"InfMem mem-local not contiguous | {_diag}"
+    if R_active > 0 and (not rr_pos["is_bulk_forward"]):
+        assert rr_pos["q_last"] == rr_pos["local_end"], f"InfMem Q-local tail mismatch | {_diag}"
+
+    # ---- Apply RoPE per-segment (sink | memory | local | Q) --------------
+    grid_py = [(num_new_frames, h, w)] * b
+
+    if effective_sink > 0:
+        k_sink_raw = temp_k[:, :effective_sink]
+        v_sink = temp_v[:, :effective_sink]
+        sink_grid = [(sink_size_frames, h, w)] * b
+        k_sink = causal_rope_apply(
+            k_sink_raw, sink_grid, freqs, start_frame=0,
+            t_scale=t_scale, method=method,
+            original_seq_len=original_seq_len,
+        ).type_as(v)
+    else:
+        k_sink = None
+        v_sink = None
+
+    if R_active > 0:
+        k_local_raw = temp_k[:, effective_sink:local_end_index]
+        v_local = temp_v[:, effective_sink:local_end_index]
+        local_grid = [(R_active, h, w)] * b
+        k_local = causal_rope_apply(
+            k_local_raw, local_grid, freqs,
+            start_frame=rr_pos["local_start"],
+            t_scale=t_scale, method=method,
+            original_seq_len=original_seq_len,
+        ).type_as(v)
+    else:
+        k_local = None
+        v_local = None
+
+    roped_query = causal_rope_apply(
+        q, grid_py, freqs,
+        start_frame=rr_pos["q_start"],
+        t_scale=t_scale, method=method,
+        original_seq_len=original_seq_len,
+    ).type_as(v)
+
+    mem_k_roped = None
+    mem_v = None
+    if memory_kv is not None and rr_pos["use_memory"] and (not rr_pos["is_bulk_forward"]):
+        mem_k_raw, mem_v_raw = memory_kv
+        N_Q = max(1, int(_CURRENT_GRID_META.get("memory_frames", 1)))
+        mem_tpf = max(1, mem_k_raw.shape[1] // N_Q)
+        mem_grid = [(N_Q, 1, mem_tpf)] * b
+        mem_k_roped = causal_rope_apply(
+            mem_k_raw, mem_grid, freqs,
+            start_frame=rr_pos["mem_start"],
+            t_scale=t_scale, method=method,
+            original_seq_len=original_seq_len,
+        ).type_as(v)
+        mem_v = mem_v_raw
+
+    parts_k, parts_v = [], []
+    if k_sink is not None:
+        parts_k.append(k_sink); parts_v.append(v_sink)
+    if mem_k_roped is not None:
+        parts_k.append(mem_k_roped); parts_v.append(mem_v)
+    if k_local is not None:
+        parts_k.append(k_local); parts_v.append(v_local)
+    k_cat = torch.cat(parts_k, dim=1)
+    v_cat = torch.cat(parts_v, dim=1)
+
+    # ---- One-shot diagnostic prints (layer 0 only, rank 0 only) ----------
+    _layer_id = getattr(self, "_layer_id", -1)
+    if _layer_id == 0:
+        if (
+            not rr_pos["is_bulk_forward"]
+            and rr_pos["q_last"] == relative_rope_pmax - 1
+            and not _FIRST_LONG_LOGGED["flag"]
+        ):
+            mem_str = (
+                f"mem[{rr_pos['mem_start']}..{rr_pos['mem_end']}]"
+                if rr_pos["use_memory"] else "mem=inactive"
+            )
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(
+                    f"[InfMem] FIRST LONG PHASE @ t={current_start_frame}: "
+                    f"sink[0..{sink_size_frames - 1}] | {mem_str} | "
+                    f"local[{rr_pos['local_start']}..{rr_pos['local_end']}] | "
+                    f"Q[{rr_pos['q_start']}..{rr_pos['q_last']}]",
+                    flush=True,
+                )
+            _FIRST_LONG_LOGGED["flag"] = True
+        if rr_pos["is_bulk_forward"] and not _FIRST_BULK_LOGGED["flag"]:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(
+                    f"[InfMem] FIRST BULK FORWARD @ t={current_start_frame}, "
+                    f"B={num_new_frames}, R={R_active}: "
+                    f"sink[0..{sink_size_frames - 1}] | gap | "
+                    f"local[{rr_pos['local_start']}..{rr_pos['local_end']}] | "
+                    f"Q[{rr_pos['q_start']}..{rr_pos['q_last']}] (memory skipped)",
+                    flush=True,
+                )
+            _FIRST_BULK_LOGGED["flag"] = True
+
+    # ---- Attention + output --------------------------------------------
+    x_out = attention(roped_query, k_cat, v_cat)
+    x_out = x_out.flatten(2)
+    x_out = self.o(x_out)
+
+    return x_out, (current_end, local_end_index, cache_update_info)
+
+
+def _block_infmem_forward(
+    self,
+    x,
+    e,
+    seq_lens,
+    grid_sizes,
+    freqs,
+    context,
+    context_lens,
+    block_mask,
+    kv_cache=None,
+    crossattn_cache=None,
+    current_start=0,
+    cache_start=None,
+    t_scale=1.0,
+    use_relative_rope=False,
+    method="linear",
+    original_seq_len=None,
+    temporal_offset=0.0,
+    # infmem-only kwarg
+    memory_kv=None,
+):
+    """Mirror of :meth:`CausalWanAttentionBlock.forward`, but plumbs
+    ``memory_kv`` down to the (patched) self-attn forward.
+    """
+    num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+    e_mod = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
+    use_triton_adaln = _TRITON_ADALN_ENABLED and not torch.is_grad_enabled()
+
+    if use_triton_adaln:
+        from utils.adaln_triton import adaln_modulate_triton
+        modulated_x = adaln_modulate_triton(
+            x, e_mod[1], e_mod[0], frame_seqlen,
+            eps=self.norm1.eps, add_one_to_scale=True,
+        )
+    else:
+        modulated_x = (
+            self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+            * (1 + e_mod[1]) + e_mod[0]
+        ).flatten(1, 2)
+
+    self_attn_result = self.self_attn(
+        modulated_x, seq_lens, grid_sizes, freqs, block_mask,
+        kv_cache=kv_cache, current_start=current_start, cache_start=cache_start,
+        t_scale=t_scale, use_relative_rope=use_relative_rope,
+        method=method, original_seq_len=original_seq_len,
+        temporal_offset=temporal_offset,
+        memory_kv=memory_kv,
+    )
+
+    if kv_cache is not None:
+        y, cache_update_info = self_attn_result
+    else:
+        y = self_attn_result
+        cache_update_info = None
+
+    x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e_mod[2]).flatten(1, 2)
+
+    # cross-attention + FFN (identical to stock)
+    if _CURRENT_GRID_META and "frame_seqlen" in _CURRENT_GRID_META:
+        seq_len_py = _CURRENT_GRID_META["frame_seqlen"] * _CURRENT_GRID_META["num_new_frames"]
+        is_tf = (x.shape[1] == seq_len_py * 2)
+    else:
+        is_tf = (x.shape[1] == seq_lens[0].item() * 2)
+
+    x = x + self.cross_attn(
+        self.norm3(x), context, context_lens,
+        crossattn_cache=crossattn_cache, is_teacher_forcing=is_tf,
+    )
+    if use_triton_adaln:
+        from utils.adaln_triton import adaln_modulate_triton
+        ffn_in = adaln_modulate_triton(
+            x, e_mod[4], e_mod[3], frame_seqlen,
+            eps=self.norm2.eps, add_one_to_scale=True,
+        )
+    else:
+        ffn_in = (
+            self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+            * (1 + e_mod[4]) + e_mod[3]
+        ).flatten(1, 2)
+    y = self.ffn(ffn_in)
+    x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e_mod[5]).flatten(1, 2)
+
+    if cache_update_info is not None:
+        return x, cache_update_info
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Model-level orchestration
+# ---------------------------------------------------------------------------
+
+def _model_forward_inference_infmem(
+    self,
+    x,
+    t,
+    context,
+    seq_len,
+    clip_fea=None,
+    y=None,
+    kv_cache=None,
+    crossattn_cache=None,
+    current_start=0,
+    cache_start=0,
+    defer_cache_updates=False,
+    update_memory=True,
+):
+    """Replacement for :meth:`CausalWanModel._forward_inference` that:
+      1. Fetches memory KV from the (external) ``query_memory_encoder`` and
+         passes it down to each block.
+      2. AFTER all blocks have run, snapshots the KV slice that just got
+         evicted from the local window and feeds it into
+         ``query_memory_encoder.update(...)`` so that future chunks can
+         attend over it via the memory branch.
+    """
+    from wan_5b.modules.model import sinusoidal_embedding_1d
+
+    if self.model_type == "i2v":
+        assert clip_fea is not None and y is not None
+
+    device = self.patch_embedding.weight.device
+    if self.freqs.device != device:
+        self.freqs = self.freqs.to(device)
+
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+
+    # Publish per-chunk grid metadata identical to the stock forward.
+    first_shape = tuple(x[0].shape[2:])
+    _CURRENT_GRID_META["frame_seqlen"] = int(first_shape[1] * first_shape[2])
+    _CURRENT_GRID_META["num_new_frames"] = int(first_shape[0])
+    _CURRENT_GRID_META["h"] = int(first_shape[1])
+    _CURRENT_GRID_META["w"] = int(first_shape[2])
+
+    grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+    x = [u.flatten(2).transpose(1, 2) for u in x]
+    seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+    x = torch.cat(x)
+
+    # Time embeddings.
+    if t.dim() == 1:
+        raise NotImplementedError(f"t.shape should be [B, F], but got {t.shape}")
+    bt = t.size(0)
+    t_len = t.size(1)
+    t = t.flatten()
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, t_len)).type_as(x)
+    )
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+
+    # Context.
+    context_lens = None
+    context = self.text_embedding(
+        torch.stack([
+            torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+            for u in context
+        ])
+    )
+
+    # ---------- INFMEM: pull memory KV once per chunk ---------------------
+    frame_seqlen = _CURRENT_GRID_META["frame_seqlen"]
+    enc = getattr(self, "query_memory_encoder", None)
+    num_blocks = len(self.blocks)
+    if enc is not None and getattr(enc, "has_history", False):
+        num_query_groups = getattr(enc, "num_query_groups", 1)
+        if num_query_groups > 1:
+            blocks_per_group = num_blocks // num_query_groups
+            group_kvs = [enc.get_kv(group_index=g) for g in range(num_query_groups)]
+            _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
+            _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
+            memory_kv_list = [
+                group_kvs[min(i // blocks_per_group, num_query_groups - 1)]
+                for i in range(num_blocks)
+            ]
+        else:
+            kv = enc.get_kv()
+            _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
+            _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
+            memory_kv_list = [kv] * num_blocks
+    else:
+        memory_kv_list = [None] * num_blocks
+
+    # Build kwargs common to every block.
+    kwargs = dict(
+        e=e0,
+        seq_lens=seq_lens,
+        grid_sizes=grid_sizes,
+        freqs=self.freqs,
+        context=context,
+        context_lens=context_lens,
+        block_mask=self.block_mask,
+        t_scale=self.t_scale,
+        use_relative_rope=self.use_relative_rope,
+        method=self.rope_method,
+        original_seq_len=self.original_seq_len,
+        temporal_offset=self.rope_temporal_offset,
+    )
+
+    def create_custom_forward(module):
+        def custom_forward(*inputs, **_kwargs):
+            return module(*inputs, **_kwargs)
+        return custom_forward
+
+    cache_update_infos = []
+    for block_index, block in enumerate(self.blocks):
+        kwargs["memory_kv"] = memory_kv_list[block_index]
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            kwargs.update({
+                "kv_cache": kv_cache[block_index],
+                "current_start": current_start,
+                "cache_start": cache_start,
+            })
+            result = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block), x, **kwargs, use_reentrant=False,
+            )
+        else:
+            kwargs.update({
+                "kv_cache": kv_cache[block_index],
+                "crossattn_cache": crossattn_cache[block_index],
+                "current_start": current_start,
+                "cache_start": cache_start,
+            })
+            result = block(x, **kwargs)
+        if kv_cache is not None and isinstance(result, tuple):
+            x, block_cache_update_info = result
+            cache_update_infos.append((block_index, block_cache_update_info))
+        else:
+            x = result
+
+    # ---------- INFMEM: capture EVICTED KV → encoder.update() ------------
+    # We do this BEFORE `_apply_cache_updates` so that the eviction snapshot
+    # is taken from the pre-shift KV cache.
+    if (
+        kv_cache is not None
+        and cache_update_infos
+        and enc is not None
+        and update_memory
+    ):
+        try:
+            last_block_idx = cache_update_infos[-1][0]
+            last_update_info = cache_update_infos[-1][1]
+            update_dict = last_update_info[2] if len(last_update_info) > 2 else None
+
+            sink_frames = self.blocks[0].self_attn.sink_size
+            sink_tok = sink_frames * frame_seqlen
+            max_attn = self.blocks[0].self_attn.max_attention_size
+            recent_window_frames = (max_attn - sink_tok) // frame_seqlen
+            current_end_tok = last_update_info[0]
+            num_new_frames = (current_end_tok - current_start) // frame_seqlen
+            current_end_frame = current_start // frame_seqlen + num_new_frames
+
+            oldest_recent_frame = max(sink_frames, current_end_frame - recent_window_frames)
+            prev_oldest = (
+                self._ei_prev_window_start
+                if self._ei_prev_window_start is not None else sink_frames
+            )
+            num_exited_frames = max(0, oldest_recent_frame - prev_oldest)
+            self._ei_prev_window_start = oldest_recent_frame
+
+            if num_exited_frames > 0:
+                num_exited_tokens = num_exited_frames * frame_seqlen
+                if update_dict is not None and update_dict.get("action") == "roll_and_insert":
+                    capture_start = sink_tok
+                else:
+                    capture_start = prev_oldest * frame_seqlen
+
+                cache_blk = kv_cache[last_block_idx]
+                exited_k = cache_blk["k"][:, capture_start:capture_start + num_exited_tokens].clone()
+                exited_v = cache_blk["v"][:, capture_start:capture_start + num_exited_tokens].clone()
+                sink_k = cache_blk["k"][:, :sink_tok].clone() if sink_tok > 0 else None
+                sink_v = cache_blk["v"][:, :sink_tok].clone() if sink_tok > 0 else None
+                enc.update(exited_k, exited_v, sink_k, sink_v)
+        except Exception as exc:
+            # Never let memory-update failures crash the forward pass; log once.
+            if not getattr(self, "_ei_update_error_logged", False):
+                print(f"[InfMem][warn] encoder.update failed: {exc}", flush=True)
+                self._ei_update_error_logged = True
+
+    if kv_cache is not None and cache_update_infos and not defer_cache_updates:
+        self._apply_cache_updates(kv_cache, cache_update_infos)
+
+    x = self.head(x, e.unsqueeze(2))
+    x = self.unpatchify(x, grid_sizes)
+    return torch.stack(x)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def attach_infmem(
+    model,
+    *,
+    relative_rope: bool = True,
+    relative_rope_pmax: int = 24,
+    num_frame_per_block_attr: int = 8,
+):
+    """Attach Echo-Infinity's Relative-RoPE + memory forward paths to a
+    LongLive :class:`CausalWanModel` **in place**.
+
+    Idempotent: re-invoking simply overwrites the bound methods again.
+
+    Parameters
+    ----------
+    model : CausalWanModel
+        Un-wrapped model (call this BEFORE FSDP wrapping).
+    relative_rope : bool
+        Currently must be True. Kept as a knob for future ablations.
+    relative_rope_pmax : int
+        Upper bound of the relative rope window. Must satisfy
+        ``pmax >= sink_frames + N_Q_frames + num_frame_per_block``.
+    num_frame_per_block_attr : int
+        Chunk size in latent frames (Wan2.2-TI2V-5B I2V AR = 8).
+    """
+    # Model-level knobs.
+    model.relative_rope = bool(relative_rope)
+    model.relative_rope_pmax = int(relative_rope_pmax)
+    model.num_frame_per_block_attr = int(num_frame_per_block_attr)
+
+    # Per-block patches.
+    for i, block in enumerate(model.blocks):
+        sa = block.self_attn
+        sa.relative_rope = bool(relative_rope)
+        sa.relative_rope_pmax = int(relative_rope_pmax)
+        sa.num_frame_per_block_attr = int(num_frame_per_block_attr)
+        sa._layer_id = i
+        if not hasattr(sa, "_original_forward"):
+            sa._original_forward = sa.forward
+        sa.forward = types.MethodType(_self_attn_infmem_forward, sa)
+        if not hasattr(block, "_original_forward"):
+            block._original_forward = block.forward
+        block.forward = types.MethodType(_block_infmem_forward, block)
+
+    # Model-level forward override (memory reset/get/update orchestration).
+    if not hasattr(model, "_original_forward_inference"):
+        model._original_forward_inference = model._forward_inference
+    model._forward_inference = types.MethodType(_model_forward_inference_infmem, model)
+
+    # Placeholders. The actual encoder is attached by the wrapper via
+    # object.__setattr__ so FSDP does not flatten it.
+    if not hasattr(model, "query_memory_encoder"):
+        object.__setattr__(model, "query_memory_encoder", None)
+    if not hasattr(model, "_ei_prev_window_start"):
+        model._ei_prev_window_start = None
+
+    _reset_log_flags()
+
+
+def detach_infmem(model):
+    """Restore original forwards. Safe to call even if never attached."""
+    for block in getattr(model, "blocks", []):
+        sa = block.self_attn
+        if hasattr(sa, "_original_forward"):
+            sa.forward = sa._original_forward
+            del sa._original_forward
+        if hasattr(block, "_original_forward"):
+            block.forward = block._original_forward
+            del block._original_forward
+    if hasattr(model, "_original_forward_inference"):
+        model._forward_inference = model._original_forward_inference
+        del model._original_forward_inference

@@ -263,6 +263,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     self.kv_cache_neg[block_index]["pinned_start"].fill_(-1)
                     self.kv_cache_neg[block_index]["pinned_len"].zero_()
 
+        # Echo-Infinity: reset the QueryMemoryEncoder state (if attached) so
+        # each generated video starts with a fresh memory. No-op when the
+        # standard WanDiffusionWrapper is used.
+        try:
+            from utils.infinity_memory_hooks import reset_infmem
+            reset_infmem(
+                self.generator,
+                batch_size=batch_size,
+                device=noise.device,
+                dtype=noise.dtype,
+            )
+        except Exception:
+            # Never let memory-reset failures block base inference; log only.
+            import traceback
+            traceback.print_exc()
+
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
         cache_start_frame = 0

@@ -153,6 +153,19 @@ class Trainer:
         self.model = CausalDiffusion(config, device=self.device)
         self.sp_helper = SequenceParallelHelper(self)
 
+        if self.sequence_parallel_size > 1:
+            try:
+                from utils.infinity_memory_hooks import get_infmem_encoder
+                has_infmem_encoder = get_infmem_encoder(self.model.generator) is not None
+            except Exception:
+                has_infmem_encoder = False
+            if has_infmem_encoder:
+                raise ValueError(
+                    "Echo-Infinity memory training currently requires "
+                    "sequence_parallel_size=1 because the SP attention override "
+                    "replaces the infmem monkey-patched KV-cache forward."
+                )
+
         # 2D mode only: print which GLOBAL block-position slice this rank is
         # responsible for. The LAST SP rank carries the most error-accumulated
         # tail blocks, useful when debugging position-bucketed error recycling.
@@ -279,6 +292,19 @@ class Trainer:
                     print(f"No 'generator'/'model' key found in {checkpoint_path}, treating as raw state_dict")
                 self.model.generator.load_state_dict(checkpoint, strict=True)
 
+            if "query_memory_encoder" in checkpoint:
+                try:
+                    from utils.infinity_memory_hooks import load_infmem_state_dict
+                    loaded_infmem = load_infmem_state_dict(
+                        self.model.generator, checkpoint["query_memory_encoder"], strict=True
+                    )
+                    if self.is_main_process:
+                        print(f"Loaded query_memory_encoder: {loaded_infmem}")
+                    del checkpoint["query_memory_encoder"]
+                except Exception as e:
+                    if self.is_main_process:
+                        print(f"Warning: failed to load query_memory_encoder: {e}")
+
             gc.collect()
 
             raw_state = checkpoint
@@ -309,6 +335,19 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        try:
+            from utils.infinity_memory_hooks import move_infmem_encoder
+            moved_infmem = move_infmem_encoder(
+                self.model.generator,
+                device=torch.device(self.device),
+                dtype=torch.bfloat16 if config.mixed_precision else torch.float32,
+            )
+            if self.is_main_process and moved_infmem:
+                print("[InfMem] query_memory_encoder moved to training device")
+        except Exception as e:
+            if self.is_main_process:
+                print(f"Warning: failed to move query_memory_encoder: {e}")
+
         rename_param = (
             lambda name: name.replace("_fsdp_wrapped_module.", "")
             .replace("_checkpoint_wrapped_module.", "")
@@ -322,13 +361,45 @@ class Trainer:
             renamed_n = rename_param(n)
             self.name_to_trainable_params[renamed_n] = p
 
-        self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay
-        )
+        # ------------------------------------------------------------------
+        # Optimizer with optional Echo-Infinity memory-encoder param group.
+        # The encoder (mounted on generator.model.query_memory_encoder via
+        # object.__setattr__) is *not* covered by FSDP flatten-params, and it
+        # follows its own LR = base_lr * encoder_lr_multiplier.
+        # ------------------------------------------------------------------
+        try:
+            from utils.infinity_memory_hooks import (
+                get_infmem_encoder,
+                infmem_extra_param_groups,
+            )
+            _infmem_encoder = get_infmem_encoder(self.model.generator)
+        except Exception:
+            _infmem_encoder = None
+            infmem_extra_param_groups = None  # type: ignore
+
+        if _infmem_encoder is not None:
+            _encoder_param_ids = {id(p) for p in _infmem_encoder.parameters()}
+            base_params = [
+                param
+                for param in self.model.generator.parameters()
+                if param.requires_grad and id(param) not in _encoder_param_ids
+            ]
+            param_groups = [{"params": base_params, "lr": config.lr, "name": "generator"}]
+            param_groups.extend(infmem_extra_param_groups(self.model.generator, base_lr=config.lr))
+            self.generator_optimizer = torch.optim.AdamW(
+                param_groups,
+                lr=config.lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay,
+            )
+        else:
+            self.generator_optimizer = torch.optim.AdamW(
+                [param for param in self.model.generator.parameters()
+                 if param.requires_grad],
+                lr=config.lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay
+            )
 
         # Step 3: Initialize the dataloader
         frame_raw_height = list(config.image_or_video_shape)[3] * wan_default_config[config.model_kwargs.model_name]["spatial_compression_ratio"]
@@ -660,6 +731,13 @@ class Trainer:
             generator_opim_state_dict = FSDP.optim_state_dict(self.model.generator,
                                             self.generator_optimizer)
 
+        query_memory_encoder_state_dict = None
+        try:
+            from utils.infinity_memory_hooks import infmem_state_dict
+            query_memory_encoder_state_dict = infmem_state_dict(self.model.generator)
+        except Exception as e:
+            print(f"Warning: failed to gather query_memory_encoder state: {e}")
+
         if self.config.ema_start_step < self.step and self.generator_ema is not None:
             state_dict = {
                 "generator": generator_state_dict,
@@ -673,6 +751,8 @@ class Trainer:
                 "generator_optimizer": generator_opim_state_dict,
                 "step": self.step,
             }
+        if query_memory_encoder_state_dict is not None:
+            state_dict["query_memory_encoder"] = query_memory_encoder_state_dict
 
         checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
         if self.is_main_process:

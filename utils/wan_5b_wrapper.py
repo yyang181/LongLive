@@ -347,6 +347,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # `.item()` triggered a graph break. Moving the reads to this eager
         # wrapper keeps the dict lookups in the compiled attention forward
         # free of `.item()` syncs without adding any graph break.
+        apply_deferred_cache_updates = bool(kwargs.pop("apply_deferred_cache_updates", True))
         kv_cache = kwargs.get("kv_cache", None)
         if kv_cache is not None and len(kv_cache) > 0:
             try:
@@ -370,7 +371,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             except (KeyError, AttributeError, ImportError):
                 pass
         defer_kv_updates = (
-            os.environ.get("LLV2_DEFER_KV_UPDATES", "0") == "1"
+            (os.environ.get("LLV2_DEFER_KV_UPDATES", "0") == "1"
+             or bool(kwargs.get("defer_cache_updates", False)))
             and kv_cache is not None
         )
         if defer_kv_updates:
@@ -396,7 +398,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     "(output, cache_update_infos)."
                 )
             output, cache_update_infos = result
-            if cache_update_infos:
+            if cache_update_infos and apply_deferred_cache_updates:
                 self.model._apply_cache_updates(kv_cache, cache_update_infos)
             return output
         return result
@@ -462,6 +464,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
         rope_temporal_offset: Optional[torch.Tensor] = None,
+        defer_cache_updates: bool = False,
+        update_memory: bool = True,
+        apply_cache_updates: bool = True,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -489,7 +494,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                defer_cache_updates=defer_cache_updates,
+                update_memory=update_memory,
+                apply_deferred_cache_updates=apply_cache_updates,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

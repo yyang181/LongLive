@@ -1,0 +1,79 @@
+# ============================================================================
+# Inference config for I2V AR + Echo-Infinity Memory + Relative RoPE
+# ---------------------------------------------------------------------------
+# Baseline: configs/inference.yaml (Wan2.2-TI2V-5B).
+# Same wrapper dispatch as train_i2v_ar_infmem.yaml, so the encoder trained on
+# top of the causal model is loaded end-to-end.
+# ============================================================================
+
+model_kwargs:
+  wrapper_cls: utils.infinity_memory_wrapper.InfMemWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 8
+  # Match Echo-Infinity's inference-side window: 32-frame local + 4 sink.
+  local_attn_size: 32
+  sink_size: 4
+
+  enable_relative_rope: true
+  relative_rope_pmax: 48
+
+  memory_kwargs:
+    dim: 3072
+    num_heads: 24
+    num_layers: 30
+    tokens_per_frame: 880
+    Q_frames: 8
+    M_tokens_per_frame: 32
+    num_query_groups: 1
+    bptt_clips: 2
+    encoder_lr_multiplier: 5.0
+    use_sink_anchor: true
+    use_batch_update: false
+    use_residual_update: true
+    use_post_norm: true
+    use_vib: false
+    vib_kl_weight: 1.0e-4
+    init_scale: 0.02
+
+use_ema: false
+output_folder: videos/longlive2_infmem
+num_samples: 1
+save_latents_only: false
+
+data:
+  data_path: /path/to/longlive2/inference_prompts
+  # Latent tensor shape [B, F, C, H, W]. F drives the number of generated latent
+  # frames. Increase safely -- the memory encoder handles arbitrary length.
+  image_or_video_shape:
+  - 1
+  - 128
+  - 48
+  - 44
+  - 80
+
+inference:
+  sampling_steps: 4
+  sink_size: 4                     # must match model_kwargs.sink_size
+  guidance_scale: 1.0
+  multi_shot_sink: true
+  multi_shot_rope_offset: 8
+  streaming_vae: false
+  async_vae: false
+  vae_type: wan
+  vae_device: "cuda:2"
+
+checkpoints:
+  generator_ckpt: /path/to/longlive2/generator_checkpoint_infmem.pt
+  lora_ckpt: /path/to/longlive2/lora_checkpoint_infmem.pt
+
+# Enable LoRA inference by keeping this block; delete it for full-generator.
+adapter:
+  type: lora
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  verbose: true
+
+logging:
+  seed: 0

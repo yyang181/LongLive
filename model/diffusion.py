@@ -123,8 +123,33 @@ class CausalDiffusion(BaseModel):
         model_name = getattr(args.model_kwargs, "model_name", "Wan2.2-TI2V-5B")
         if "5B" not in model_name:
             raise ValueError(f"Only Wan2.2-TI2V-5B is supported in this release, got {model_name}")
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+
+        # Dispatch on optional model_kwargs.wrapper_cls to allow drop-in
+        # replacements such as InfMemWanDiffusionWrapper (Echo-Infinity memory
+        # + Relative RoPE). When absent, fall back to the default 5B wrapper.
+        model_kwargs = dict(getattr(args, "model_kwargs", {}) or {})
+        wrapper_path = model_kwargs.pop("wrapper_cls", None)
+        if wrapper_path is None:
+            wrapper_cls = WanDiffusionWrapper
+        else:
+            import importlib
+            module_name, _, cls_name = str(wrapper_path).rpartition(".")
+            if not module_name or not cls_name:
+                raise ValueError(
+                    f"model_kwargs.wrapper_cls must be a fully-qualified dotted "
+                    f"path (e.g. utils.infinity_memory_wrapper.InfMemWanDiffusionWrapper), "
+                    f"got {wrapper_path!r}."
+                )
+            wrapper_cls = getattr(importlib.import_module(module_name), cls_name)
+
+        self.generator = wrapper_cls(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
+        # If the wrapper attached an Echo-Infinity memory encoder, make sure
+        # its parameters are trainable too (they live outside FSDP flat-params
+        # thanks to object.__setattr__ in InfMemWanDiffusionWrapper).
+        _encoder = getattr(self.generator.model, "query_memory_encoder", None)
+        if _encoder is not None:
+            _encoder.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -134,6 +159,128 @@ class CausalDiffusion(BaseModel):
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
+
+
+    def _infmem_encoder(self):
+        try:
+            from utils.infinity_memory_hooks import get_infmem_encoder
+            return get_infmem_encoder(self.generator)
+        except Exception:
+            return None
+
+    def _build_streaming_caches(self, batch_size, dtype, device, frame_seq_length):
+        try:
+            from utils.infinity_memory_hooks import resolve_inner_wan_model
+            inner = resolve_inner_wan_model(self.generator)
+        except Exception:
+            inner = getattr(self.generator, "model", None)
+        if inner is None:
+            raise RuntimeError("Cannot resolve inner Wan model for infmem streaming training.")
+
+        num_layers = int(getattr(inner, "num_layers", len(getattr(inner, "blocks", []))))
+        num_heads = int(getattr(inner, "num_heads"))
+        dim = int(getattr(inner, "dim"))
+        head_dim = dim // num_heads
+        local_attn_size = int(getattr(inner, "local_attn_size", -1))
+        if local_attn_size == -1:
+            local_attn_size = 3 * int(self.num_frame_per_block)
+        kv_cache_size = local_attn_size * frame_seq_length
+        kv_cache = []
+        crossattn_cache = []
+        for _ in range(num_layers):
+            kv_cache.append({
+                "k": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
+                "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+            })
+            crossattn_cache.append({
+                "k": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                "is_init": False,
+            })
+        return kv_cache, crossattn_cache
+
+    def _conditional_for_streaming_block(self, conditional_dict, batch_size, block_index):
+        prompt_embeds = conditional_dict.get("prompt_embeds", None)
+        if prompt_embeds is None:
+            return conditional_dict
+        num_segments = prompt_embeds.shape[0] // batch_size
+        if num_segments <= 1:
+            return conditional_dict
+        embeds = prompt_embeds.reshape(batch_size, num_segments, *prompt_embeds.shape[1:])
+        return {"prompt_embeds": embeds[:, min(block_index, num_segments - 1)]}
+
+    def _generator_loss_infmem_streaming(
+        self,
+        noisy_latents,
+        clean_latent_aug,
+        timestep,
+        timestep_clean_aug,
+        conditional_dict,
+    ):
+        """Streaming teacher-forcing path for Echo-Infinity memory training.
+
+        The prediction forward reads the clean context cache and memory but does
+        not mutate either. A second clean-context forward then advances the KV
+        cache and QueryMemoryEncoder state for subsequent chunks.
+        """
+        batch_size, num_frame, _, height, width = noisy_latents.shape
+        frame_seq_length = (height * width) // 4
+        kv_cache, crossattn_cache = self._build_streaming_caches(
+            batch_size, noisy_latents.dtype, noisy_latents.device, frame_seq_length
+        )
+        try:
+            from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
+            reset_infmem(self.generator, batch_size=batch_size, device=noisy_latents.device, dtype=noisy_latents.dtype)
+        except Exception:
+            maybe_detach_infmem = None
+
+        if timestep_clean_aug is None:
+            timestep_clean_aug = torch.zeros_like(timestep)
+
+        flow_chunks = []
+        chunk_count = 0
+        for block_index, start in enumerate(range(0, num_frame, self.num_frame_per_block)):
+            end = min(start + self.num_frame_per_block, num_frame)
+            block_cond = self._conditional_for_streaming_block(conditional_dict, batch_size, block_index)
+            if block_cond is not conditional_dict:
+                for cache in crossattn_cache:
+                    cache["is_init"] = False
+
+            noisy_chunk = noisy_latents[:, start:end]
+            timestep_chunk = timestep[:, start:end]
+            flow_pred, _ = self.generator(
+                noisy_image_or_video=noisy_chunk,
+                conditional_dict=block_cond,
+                timestep=timestep_chunk,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=start * frame_seq_length,
+                defer_cache_updates=True,
+                update_memory=False,
+                apply_cache_updates=False,
+            )
+            flow_chunks.append(flow_pred)
+
+            clean_chunk = clean_latent_aug[:, start:end]
+            clean_timestep_chunk = timestep_clean_aug[:, start:end]
+            self.generator(
+                noisy_image_or_video=clean_chunk,
+                conditional_dict=block_cond,
+                timestep=clean_timestep_chunk,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=start * frame_seq_length,
+                update_memory=True,
+            )
+            chunk_count += 1
+            if maybe_detach_infmem is not None:
+                maybe_detach_infmem(self.generator, chunk_count)
+
+        return torch.cat(flow_chunks, dim=1), None
 
     def generator_loss(
         self,
@@ -297,13 +444,27 @@ class CausalDiffusion(BaseModel):
                 )
 
         # Compute loss
-        flow_pred, x0_pred = self.generator(
-            noisy_image_or_video=noisy_latents,
-            conditional_dict=conditional_dict,
-            timestep=timestep,
-            clean_x=clean_latent_aug if self.teacher_forcing else None,
-            aug_t=timestep_clean_aug if self.teacher_forcing else None,
+        use_infmem_streaming = (
+            self.teacher_forcing
+            and bool(getattr(self.args, "infmem_streaming_training", False))
+            and self._infmem_encoder() is not None
         )
+        if use_infmem_streaming:
+            flow_pred, x0_pred = self._generator_loss_infmem_streaming(
+                noisy_latents=noisy_latents,
+                clean_latent_aug=clean_latent_aug,
+                timestep=timestep,
+                timestep_clean_aug=timestep_clean_aug,
+                conditional_dict=conditional_dict,
+            )
+        else:
+            flow_pred, x0_pred = self.generator(
+                noisy_image_or_video=noisy_latents,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                clean_x=clean_latent_aug if self.teacher_forcing else None,
+                aug_t=timestep_clean_aug if self.teacher_forcing else None,
+            )
         loss = torch.nn.functional.mse_loss(
             flow_pred.float(), training_target.float(), reduction='none'
         ).mean(dim=(2, 3, 4))

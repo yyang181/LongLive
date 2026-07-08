@@ -46,7 +46,14 @@ def load_generator_checkpoint(generator, checkpoint_path: str, *, use_ema: bool 
         state_dict = clean_fsdp_state_dict_keys(state_dict)
     if strict is None:
         strict = not use_ema
-    return generator.load_state_dict(state_dict, strict=strict)
+    result = generator.load_state_dict(state_dict, strict=strict)
+    if isinstance(checkpoint, Mapping) and "query_memory_encoder" in checkpoint:
+        try:
+            from utils.infinity_memory_hooks import load_infmem_state_dict
+            load_infmem_state_dict(generator, checkpoint["query_memory_encoder"], strict=True)
+        except Exception as exc:
+            print(f"Warning: failed to load query_memory_encoder: {exc}")
+    return result
 
 
 def _load_lora_state_dict(lora_ckpt_path: str) -> Mapping[str, torch.Tensor]:
@@ -217,6 +224,12 @@ def setup_nvfp4_pipeline(
     else:
         load_strict = not use_ema
         pipeline.generator.load_state_dict(state_dict, strict=load_strict)
+        if isinstance(checkpoint, Mapping) and "query_memory_encoder" in checkpoint:
+            try:
+                from utils.infinity_memory_hooks import load_infmem_state_dict
+                load_infmem_state_dict(pipeline.generator, checkpoint["query_memory_encoder"], strict=True)
+            except Exception as exc:
+                print(f"Warning: failed to load query_memory_encoder: {exc}")
 
         if has_lora_request:
             # Apply + merge LoRA on the BF16 base before quantization. Move the
@@ -255,6 +268,11 @@ def setup_nvfp4_pipeline(
         materialize_fn(pipeline.generator.model, target_device=device)
 
     pipeline.generator.to(device=device)
+    try:
+        from utils.infinity_memory_hooks import move_infmem_encoder
+        move_infmem_encoder(pipeline.generator, device=device, dtype=torch.bfloat16)
+    except Exception as exc:
+        print(f"Warning: failed to move query_memory_encoder: {exc}")
     pipeline.text_encoder.to(device=device)
     pipeline.vae.to(device=device)
     place_vae_for_streaming(pipeline, config)

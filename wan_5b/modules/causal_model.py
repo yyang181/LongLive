@@ -1495,6 +1495,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         current_start: int = 0,
         cache_start: int = 0,
         defer_cache_updates: bool = False,
+        update_memory: bool = True,
     ):
         r"""
         Run the diffusion model with kv caching.
