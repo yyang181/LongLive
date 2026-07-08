@@ -845,6 +845,7 @@ class CausalWanAttentionBlock(nn.Module):
         method="linear",
         original_seq_len=None,
         temporal_offset=0.0,
+        prope_meta=None,
     ):
         r"""
         Args:
@@ -887,6 +888,18 @@ class CausalWanAttentionBlock(nn.Module):
             y = self_attn_result
             cache_update_info = None
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+
+        # ----- Optional DreamX-style parallel PRoPE self-attn -----
+        # Active iff (a) ``add_dreamx_cam_self_attn`` was called on this model
+        # and (b) the caller supplied viewmats/Ks via ``prope_meta``.
+        if (getattr(self, "cam_self_attn", None) is not None
+                and prope_meta is not None):
+            cam_emb = {
+                "viewmats": prope_meta["viewmats"],
+                "K": prope_meta.get("Ks", None),
+            }
+            y_cam = self.cam_self_attn(modulated_x, cam_emb, seq_lens=seq_lens)
+            x = x + (y_cam.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
         # iter-40: avoid `seq_lens[0].item()` graph break. seq_lens[0] equals
@@ -1496,6 +1509,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_start: int = 0,
         defer_cache_updates: bool = False,
         update_memory: bool = True,
+        viewmats=None,
+        Ks=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1573,6 +1588,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
+        # ---- Build PRoPE meta (if camera info provided) ----
+        prope_meta = None
+        if viewmats is not None:
+            viewmats = viewmats.to(device=device)
+            if Ks is not None:
+                Ks = Ks.to(device=device)
+            f_lat = int(grid_sizes[0, 0].item())
+            h_lat = int(grid_sizes[0, 1].item())
+            w_lat = int(grid_sizes[0, 2].item())
+            prope_meta = {
+                "viewmats": viewmats,
+                "Ks": Ks,
+                "F": f_lat,
+                "H": h_lat,
+                "W": w_lat,
+            }
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -1587,6 +1619,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             method=self.rope_method,
             original_seq_len=self.original_seq_len,
             temporal_offset=self.rope_temporal_offset,
+            prope_meta=prope_meta,
         )
 
         def create_custom_forward(module):
@@ -1664,6 +1697,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        viewmats=None,
+        Ks=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1783,6 +1818,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             e0_clean = self.time_projection(e_clean).unflatten(2, (6, self.dim))
             e0 = torch.cat([e0_clean, e0], dim=1)
 
+        # ---- Build PRoPE meta (if camera info provided) ----
+        prope_meta = None
+        if viewmats is not None:
+            viewmats = viewmats.to(device=device)
+            if Ks is not None:
+                Ks = Ks.to(device=device)
+            f_lat = int(grid_sizes[0, 0].item())
+            h_lat = int(grid_sizes[0, 1].item())
+            w_lat = int(grid_sizes[0, 2].item())
+            prope_meta = {
+                "viewmats": viewmats,
+                "Ks": Ks,
+                "F": f_lat,
+                "H": h_lat,
+                "W": w_lat,
+            }
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -1796,6 +1848,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             method=self.rope_method,
             original_seq_len=self.original_seq_len,
             temporal_offset=self.rope_temporal_offset,
+            prope_meta=prope_meta,
         )
 
         def create_custom_forward(module):

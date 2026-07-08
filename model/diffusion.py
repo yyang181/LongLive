@@ -292,6 +292,8 @@ class CausalDiffusion(BaseModel):
         loss_mask: torch.Tensor = None,
         loss_mask_global_valid_count: torch.Tensor = None,
         global_step: int = None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -464,6 +466,8 @@ class CausalDiffusion(BaseModel):
                 timestep=timestep,
                 clean_x=clean_latent_aug if self.teacher_forcing else None,
                 aug_t=timestep_clean_aug if self.teacher_forcing else None,
+                viewmats=viewmats,
+                Ks=Ks,
             )
         loss = torch.nn.functional.mse_loss(
             flow_pred.float(), training_target.float(), reduction='none'

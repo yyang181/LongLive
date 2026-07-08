@@ -40,8 +40,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         model_name = getattr(args.model_kwargs, "model_name", "Wan2.2-TI2V-5B")
         if "5B" not in model_name:
             raise ValueError(f"Only Wan2.2-TI2V-5B is supported in this release, got {model_name}")
-        self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+        if generator is None:
+            model_kwargs = dict(getattr(args, "model_kwargs", {}) or {})
+            wrapper_path = model_kwargs.pop("wrapper_cls", None)
+            if wrapper_path is None:
+                wrapper_cls = WanDiffusionWrapper
+            else:
+                import importlib
+                module_name, _, cls_name = str(wrapper_path).rpartition(".")
+                if not module_name or not cls_name:
+                    raise ValueError(
+                        f"model_kwargs.wrapper_cls must be a fully-qualified dotted path, got {wrapper_path!r}."
+                    )
+                wrapper_cls = getattr(importlib.import_module(module_name), cls_name)
+            self.generator = wrapper_cls(**model_kwargs, is_causal=True)
+        else:
+            self.generator = generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = build_vae_5b(args) if vae is None else vae
 
@@ -148,6 +162,30 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.use_relative_rope = getattr(args, "use_relative_rope", False)
         self._rope_method_override = getattr(args, "rope_method", None)
         self._original_seq_len_override = getattr(args, "original_seq_len", None)
+        self._viewmats = None
+        self._Ks = None
+
+    def _camera_kwargs(self, start_frame: int, num_frames: int):
+        """Slice viewmats/Ks for the current AR chunk.
+
+        Returns a dict with ``viewmats`` and ``Ks`` keys, or empty dict when
+        no camera params are stored.
+        """
+        vm = self._viewmats
+        ks = self._Ks
+        if vm is None:
+            return {}
+        end = min(start_frame + num_frames, vm.shape[1])
+        return {
+            "viewmats": vm[:, start_frame:end].to(
+                device=next(self.generator.parameters()).device,
+                dtype=next(self.generator.parameters()).dtype,
+            ),
+            "Ks": ks[:, start_frame:end].to(
+                device=next(self.generator.parameters()).device,
+                dtype=next(self.generator.parameters()).dtype,
+            ) if ks is not None else None,
+        }
 
     @property
     def _dit_model(self):
@@ -170,7 +208,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        start_frame_index: Optional[int] = 0
+        start_frame_index: Optional[int] = 0,
+        viewmats: Optional[torch.Tensor] = None,
+        Ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -191,6 +231,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         batch_size, num_frames, num_channels, height, width = noise.shape
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         clamp_i2v_first_chunk = self.independent_first_frame and initial_latent is not None
+
+        # Store camera params for AR inference. Each generator call will
+        # slice the per-frame viewmats/Ks to match the current chunk's frames.
+        self._viewmats = viewmats
+        self._Ks = Ks
         if clamp_i2v_first_chunk and num_input_frames != 1:
             raise ValueError(
                 f"i2v first-chunk clamp expects one conditioning latent frame, got {num_input_frames}."
@@ -405,7 +450,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(current_start_frame, 1)
                 )
                 if use_cfg:
                     self.generator(
@@ -415,7 +461,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         kv_cache=self.kv_cache_neg,
                         crossattn_cache=self.crossattn_cache_neg,
                         current_start=current_start_frame * self.frame_seq_length,
-                        cache_start=cache_start_frame * self.frame_seq_length
+                        cache_start=cache_start_frame * self.frame_seq_length,
+                        **self._camera_kwargs(current_start_frame, 1)
                     )
                 current_start_frame += 1
                 cache_start_frame += 1
@@ -435,7 +482,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(current_start_frame, self.num_frame_per_block)
                 )
                 if use_cfg:
                     self.generator(
@@ -445,7 +493,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         kv_cache=self.kv_cache_neg,
                         crossattn_cache=self.crossattn_cache_neg,
                         current_start=current_start_frame * self.frame_seq_length,
-                        cache_start=cache_start_frame * self.frame_seq_length
+                        cache_start=cache_start_frame * self.frame_seq_length,
+                        **self._camera_kwargs(current_start_frame, self.num_frame_per_block)
                     )
                 current_start_frame += self.num_frame_per_block
                 cache_start_frame += self.num_frame_per_block
@@ -603,7 +652,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_pos,
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(current_start_frame, current_num_frames)
                 )
                 if use_cfg:
                     flow_pred_uncond, _ = self.generator(
@@ -613,7 +663,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         kv_cache=self.kv_cache_neg,
                         crossattn_cache=self.crossattn_cache_neg,
                         current_start=current_start_frame * self.frame_seq_length,
-                        cache_start=cache_start_frame * self.frame_seq_length
+                        cache_start=cache_start_frame * self.frame_seq_length,
+                        **self._camera_kwargs(current_start_frame, current_num_frames)
                     )
                     flow_pred = flow_pred_uncond + self.guidance_scale * (
                         flow_pred_cond - flow_pred_uncond)
@@ -662,7 +713,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache_pos,
                 crossattn_cache=self.crossattn_cache_pos,
                 current_start=current_start_frame * self.frame_seq_length,
-                cache_start=cache_start_frame * self.frame_seq_length
+                cache_start=cache_start_frame * self.frame_seq_length,
+                **self._camera_kwargs(current_start_frame, current_num_frames)
             )
             if use_cfg:
                 self.generator(
@@ -672,7 +724,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     kv_cache=self.kv_cache_neg,
                     crossattn_cache=self.crossattn_cache_neg,
                     current_start=current_start_frame * self.frame_seq_length,
-                    cache_start=cache_start_frame * self.frame_seq_length
+                    cache_start=cache_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(current_start_frame, current_num_frames)
                 )
 
             # Step 3.3b: pin the current chunk for multi-shot sink on scene cut.

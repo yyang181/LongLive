@@ -176,21 +176,19 @@ def add_dreamx_cam_self_attn(
     Returns:
         Number of blocks patched.
     """
-    try:
-        from .model import WanAttentionBlock
-    except ImportError:
-        WanAttentionBlock = None
-    if WanAttentionBlock is None:
-        return 0
-
     n_added = 0
     for block in getattr(model, "blocks", []):
-        if not isinstance(block, WanAttentionBlock):
-            continue
+        # Support both bidirectional WanAttentionBlock and causal
+        # CausalWanAttentionBlock. Both expose ``self_attn.dim`` and
+        # ``self_attn.num_heads``; the causal AR path currently keeps this
+        # module for checkpoint compatibility with DreamX/bidirectional SFT.
         if hasattr(block, "cam_self_attn"):
             continue
-        block_dim = block.self_attn.dim
-        block_heads = block.self_attn.num_heads
+        self_attn = getattr(block, "self_attn", None)
+        if self_attn is None or not hasattr(self_attn, "dim") or not hasattr(self_attn, "num_heads"):
+            continue
+        block_dim = self_attn.dim
+        block_heads = self_attn.num_heads
         a_dim = attn_dim if attn_dim is not None else block_dim
         n_heads = num_heads if num_heads is not None else block_heads
         cam = PropeSelfAttention(

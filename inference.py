@@ -35,6 +35,8 @@ if not hasattr(_tv_io, "read_video"):
 import argparse
 import torch
 from omegaconf import OmegaConf
+import numpy as np
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from torchvision.io import write_video
 from einops import rearrange
@@ -101,9 +103,12 @@ te_quant_group.add_argument(
     help="Override config and disable TransformerEngine quantization",
 )
 parser.set_defaults(use_te_quant=None)
-args = parser.parse_args()
+args, unknown = parser.parse_known_args()
 
-config = normalize_config(OmegaConf.load(args.config_path))
+config = OmegaConf.load(args.config_path)
+if unknown:
+    config = OmegaConf.merge(config, OmegaConf.from_dotlist(unknown))
+config = normalize_config(config)
 if args.use_te_quant is not None:
     config.model_quant_use_transformer_engine = args.use_te_quant
 
@@ -600,6 +605,68 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
+
+    # Camera AR inference: build viewmats/Ks from trajectory if configured.
+    cam_algo = getattr(config, "algorithm", {}) or {}
+    use_camera = bool(cam_algo.get("use_camera", False)) or bool(getattr(config, "use_camera", False))
+    if use_camera:
+        inf_cfg = section_get(config, "inference", None, None) or {}
+        traj_path = getattr(config, "trajectory_path", inf_cfg.get("trajectory_path", None))
+        traj_fmt = str(getattr(config, "trajectory_format", inf_cfg.get("trajectory_format", "worldplaygen"))).lower()
+        H_lat = list(config.image_or_video_shape)[3]
+        W_lat = list(config.image_or_video_shape)[4]
+        F_lat = config.num_output_frames
+        target_h = H_lat * 16
+        target_w = W_lat * 16
+
+        # Read one trajectory line per sample.
+        if traj_path and os.path.isfile(traj_path):
+            with open(traj_path) as f:
+                traj_lines = [ln.strip() for ln in f if ln.strip()]
+        else:
+            traj_lines = []
+
+        viewmats_list = []
+        Ks_list = []
+        for si in range(config.num_samples):
+            traj = traj_lines[si % len(traj_lines)] if traj_lines else "w-10"
+            if traj_fmt == "dreamx_action_dsl":
+                from utils.dreamx_trajectory import action_to_viewmats_Ks, parse_trajectory_string
+                action_seq, speeds = parse_trajectory_string(traj)
+                duration = int(inf_cfg.get("duration_per_segment", 33))
+                target_length = min(1 + 4 * (F_lat - 1), 1 + len(action_seq) * duration)
+                vm, ks = action_to_viewmats_Ks(action_seq, speeds, duration=duration,
+                                                target_length=target_length, h=target_h, w=target_w,
+                                                dtype=torch.float32, device="cpu")
+                if vm.shape[0] < F_lat:
+                    pad = F_lat - vm.shape[0]
+                    vm = torch.cat([vm, vm[-1:].expand(pad, -1, -1).clone()], dim=0)
+                    ks = torch.cat([ks, ks[-1:].expand(pad, -1, -1).clone()], dim=0)
+                elif vm.shape[0] > F_lat:
+                    vm, ks = vm[:F_lat], ks[:F_lat]
+            else:
+                from utils.sana_camera_control import action_string_to_c2w
+                from utils.camera_dataset import build_viewmats_and_Ks
+                c2w = action_string_to_c2w(traj, num_frames=1 + 4 * (F_lat - 1))
+                # Convert c2w to w2c pose7 format then to viewmats/Ks.
+                w2c = np.linalg.inv(c2w)
+                poses = np.zeros((F_lat, 7), dtype=np.float32)
+                for i in range(F_lat):
+                    R = w2c[i, :3, :3]
+                    t = w2c[i, :3, 3]
+                    q = Rotation.from_matrix(R).as_quat()
+                    poses[i] = [t[0], t[1], t[2], q[0], q[1], q[2], q[3]]
+                intrinsics = np.array([0.505, 0.898, 0.5, 0.5], dtype=np.float32)
+                vm_np, ks_np = build_viewmats_and_Ks(intrinsics, poses)
+                vm = torch.tensor(vm_np, dtype=torch.float32)
+                ks = torch.tensor(ks_np, dtype=torch.float32)
+            viewmats_list.append(vm)
+            Ks_list.append(ks)
+        viewmats = torch.stack(viewmats_list, dim=0).to(device=device, dtype=torch.bfloat16)
+        Ks = torch.stack(Ks_list, dim=0).to(device=device, dtype=torch.bfloat16)
+        inference_kwargs["viewmats"] = viewmats
+        inference_kwargs["Ks"] = Ks
+
     with torch.inference_mode():
         generated = pipeline.inference(**inference_kwargs)
 

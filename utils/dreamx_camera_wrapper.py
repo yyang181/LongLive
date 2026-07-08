@@ -30,6 +30,7 @@ from typing import Iterable, List, Optional
 import torch
 
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper
+from utils.wan_5b_wrapper import WanDiffusionWrapper
 
 
 _BACKBONE_FREEZE_PREFIXES_KEEP = ("cam_self_attn",)
@@ -70,11 +71,10 @@ class DreamXCameraWanDiffusionWrapper(CameraWanDiffusionWrapper):
         dreamx_ckpt: Optional[str] = None,
         freeze_backbone_for_train: bool = False,
     ):
-        # Skip the base class' ``add_prope_parameters`` call by passing
-        # ``use_camera=False``; we install the DreamX-style module ourselves
-        # below. We keep ``self.use_camera = True`` so that downstream code
-        # (e.g. inference scripts) treats this as a camera-aware model.
-        super().__init__(
+        # Bidirectional DreamX uses CameraWanDiffusionWrapper with the legacy
+        # PRoPE registration disabled; causal AR must bypass that wrapper
+        # because it intentionally asserts ``is_causal=False``.
+        common_kwargs = dict(
             model_name=model_name,
             timestep_shift=timestep_shift,
             is_causal=is_causal,
@@ -84,10 +84,16 @@ class DreamXCameraWanDiffusionWrapper(CameraWanDiffusionWrapper):
             t_scale=t_scale,
             rope_method=rope_method,
             original_seq_len=original_seq_len,
-            use_camera=False,
         )
+        if is_causal:
+            WanDiffusionWrapper.__init__(self, **common_kwargs)
+        else:
+            # Skip CameraWanDiffusionWrapper's ``add_prope_parameters`` call by
+            # passing ``use_camera=False``; DreamX installs cam_self_attn below.
+            CameraWanDiffusionWrapper.__init__(self, **common_kwargs, use_camera=False)
         self.use_camera = True
         self.dreamx_camera = True
+        self._is_causal = is_causal
 
         # Resolve attn_dim / num_heads from the model itself so that we don't
         # rely on any parameter not present in the LongLive WanModel config.
@@ -120,6 +126,20 @@ class DreamXCameraWanDiffusionWrapper(CameraWanDiffusionWrapper):
 
         if freeze_backbone_for_train:
             self.freeze_backbone()
+
+    # ------------------------------------------------------------------
+    # Forward dispatch
+    # ------------------------------------------------------------------
+    # When is_causal=True (AR path), we must use WanDiffusionWrapper.forward
+    # (which supports teacher forcing / clean_x / kv_cache). The bidirectional
+    # CameraWanDiffusionWrapper.forward asserts clean_x is None and is only
+    # correct for the non-causal path.
+    _is_causal = False
+
+    def forward(self, *args, **kwargs):
+        if self._is_causal:
+            return WanDiffusionWrapper.forward(self, *args, **kwargs)
+        return CameraWanDiffusionWrapper.forward(self, *args, **kwargs)
 
     # ------------------------------------------------------------------
     # Helpers

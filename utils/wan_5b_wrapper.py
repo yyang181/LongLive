@@ -467,6 +467,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         defer_cache_updates: bool = False,
         update_memory: bool = True,
         apply_cache_updates: bool = True,
+        viewmats: Optional[torch.Tensor] = None,
+        Ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -498,6 +500,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 defer_cache_updates=defer_cache_updates,
                 update_memory=update_memory,
                 apply_deferred_cache_updates=apply_cache_updates,
+                viewmats=viewmats,
+                Ks=Ks,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -508,6 +512,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
+                    viewmats=viewmats,
+                    Ks=Ks,
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
@@ -526,7 +532,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred = self._call_model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        viewmats=viewmats,
+                        Ks=Ks,
                     ).permute(0, 2, 1, 3, 4)
 
         if rope_offset_was_set:

@@ -4,6 +4,7 @@
 import gc
 import logging
 import types
+import os
 
 from model import CausalDiffusion
 from wan_5b.distributed.sp_training import SequenceParallelHelper
@@ -15,12 +16,30 @@ from omegaconf import OmegaConf
 import torch
 import wandb
 import time
-import os
 from torchvision.io import write_video
 from utils.distributed import EMA_FSDP, barrier, fsdp_wrap, launch_distributed_job, FSDP
 from torch.distributed.fsdp import (
     StateDictType, FullStateDictConfig, FullOptimStateDictConfig
 )
+
+
+def _camera_latent_collate_fn(batch):
+    """Collate function for CameraLatentLMDBDataset items.
+
+    Each item has keys: prompts (str), clean_latent (T,F,C,H,W),
+    viewmats (T,4,4), Ks (T,3,3).
+    """
+    clean_latents = torch.stack([b["clean_latent"] for b in batch], dim=0)
+    viewmats = torch.stack([b["viewmats"] for b in batch], dim=0)
+    Ks = torch.stack([b["Ks"] for b in batch], dim=0)
+    prompts = [b["prompts"] for b in batch]
+    return {
+        "clean_latent": clean_latents,
+        "viewmats": viewmats,
+        "Ks": Ks,
+        "prompts": prompts,
+    }
+
 
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
     """
@@ -101,6 +120,7 @@ class Trainer:
         self.data_parallel_size = world_size // self.sequence_parallel_size if self.sequence_parallel_size > 1 else world_size
         self.sp_group = None
         self.dp_group = None
+        self.sp_rank = 0
 
         if self.is_main_process and self.gradient_accumulation_steps > 1:
             eff_batch = config.batch_size * self.gradient_accumulation_steps * self.data_parallel_size
@@ -135,6 +155,7 @@ class Trainer:
                 sp_groups.append(dist.new_group(ranks=ranks_g))
             self.sp_group = sp_groups[global_rank // sp_size]
             set_sequence_parallel_group(self.sp_group)
+            self.sp_rank = global_rank % sp_size
 
             # Also create DP groups: ranks with the same SP rank across DP
             # replicas own the same sequence chunk. For sp_rank=k, the DP group
@@ -250,6 +271,12 @@ class Trainer:
         raw_state = None
 
         checkpoint_path = None
+        # Track whether this is a cold-start init from generator_ckpt (vs a
+        # real auto-resume from the same training run). When cold-starting,
+        # we load ONLY model weights — optimizer/EMA/step are discarded
+        # because the source checkpoint may come from a different trainer
+        # (e.g. bidirectional → AR) with a different parameter set.
+        is_cold_start_ckpt = False
 
         if auto_resume and self.output_path:
             latest_checkpoint = self.find_latest_checkpoint(self.output_path)
@@ -269,8 +296,9 @@ class Trainer:
 
         if checkpoint_path is None and getattr(config, "generator_ckpt", False):
             checkpoint_path = config.generator_ckpt
+            is_cold_start_ckpt = True
             if self.is_main_process:
-                print(f"Using explicit checkpoint: {checkpoint_path}")
+                print(f"Using explicit checkpoint (cold start): {checkpoint_path}")
 
         if checkpoint_path:
             if self.is_main_process:
@@ -307,14 +335,24 @@ class Trainer:
 
             gc.collect()
 
-            raw_state = checkpoint
-            if "step" in raw_state:
-                self.step = raw_state["step"]
+            if is_cold_start_ckpt:
+                # Cold start from a different trainer's checkpoint: load model
+                # weights only. Discard optimizer/EMA/step to avoid param-group
+                # size mismatches (e.g. bidirectional freeze → AR full-train).
+                raw_state = None
+                self.step = 0
                 if self.is_main_process:
-                    print(f"Resuming from step {self.step}")
+                    print("Cold start: loaded model weights only, "
+                          "optimizer/EMA/step discarded, starting from step 0.")
             else:
-                if self.is_main_process:
-                    print("Warning: Step not found in checkpoint, starting from step 0.")
+                raw_state = checkpoint
+                if "step" in raw_state:
+                    self.step = raw_state["step"]
+                    if self.is_main_process:
+                        print(f"Resuming from step {self.step}")
+                else:
+                    if self.is_main_process:
+                        print("Warning: Step not found in checkpoint, starting from step 0.")
 
         # ================================= FSDP Wrap =================================
         self.model.generator = fsdp_wrap(
@@ -408,36 +446,54 @@ class Trainer:
         num_frame_per_block = config.num_frame_per_block
         self.fps = wan_default_config[config.model_kwargs.model_name].get("fps", 16)
 
-        allow_padding = getattr(config, "allow_padding", False)
-        min_latent_frames = getattr(config, "min_latent_frames", 0)
-        single_video_only = getattr(config, "uniform_prompt", False)
-        max_chunks_per_shot = getattr(config, "max_chunks_per_shot", 0)
-        dataset_sample_warning_seconds = getattr(config, "dataset_sample_warning_seconds", 60.0)
-        dataset_sample_warning_interval_seconds = getattr(
-            config, "dataset_sample_warning_interval_seconds", 60.0
+        # Detect camera LMDB data (precomputed latents + viewmats + Ks).
+        self.use_camera_lmdb = os.path.isfile(
+            os.path.join(config.data_path, "data.mdb")
+        ) or (
+            os.path.isdir(config.data_path)
+            and any(os.path.isfile(os.path.join(config.data_path, d, "data.mdb"))
+                    for d in os.listdir(config.data_path))
         )
-        dataset = MultiVideoConcatDataset(
-            data_dir=config.data_path,
-            video_size=(frame_raw_height, frame_raw_width),
-            total_frames=total_frames,
-            deterministic=False,
-            num_frame_per_block=num_frame_per_block,
-            temporal_compression_ratio=wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"],
-            target_fps=self.fps,
-            allow_padding=allow_padding,
-            min_latent_frames=min_latent_frames,
-            single_video_only=single_video_only,
-            independent_first_frame=getattr(config, "independent_first_frame", False),
-            return_image=getattr(config, "i2v", False),
-            max_chunks_per_shot=max_chunks_per_shot,
-            sample_warning_seconds=dataset_sample_warning_seconds,
-            sample_warning_interval_seconds=dataset_sample_warning_interval_seconds,
-        )
-        if allow_padding and self.is_main_process:
-            print(f"[Padding] Variable-length training enabled: short videos will be padded with loss masking"
-                  f" (min_latent_frames={min_latent_frames})")
-        if single_video_only and self.is_main_process:
-            print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
+
+        if self.use_camera_lmdb:
+            from utils.camera_dataset import CameraLatentLMDBDataset
+            dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
+            camera_collate_fn = _camera_latent_collate_fn
+            if self.is_main_process:
+                print(f"[DiffusionTrainer] using CameraLatentLMDBDataset, "
+                      f"size={len(dataset)}")
+        else:
+            allow_padding = getattr(config, "allow_padding", False)
+            min_latent_frames = getattr(config, "min_latent_frames", 0)
+            single_video_only = getattr(config, "uniform_prompt", False)
+            max_chunks_per_shot = getattr(config, "max_chunks_per_shot", 0)
+            dataset_sample_warning_seconds = getattr(config, "dataset_sample_warning_seconds", 60.0)
+            dataset_sample_warning_interval_seconds = getattr(
+                config, "dataset_sample_warning_interval_seconds", 60.0
+            )
+            dataset = MultiVideoConcatDataset(
+                data_dir=config.data_path,
+                video_size=(frame_raw_height, frame_raw_width),
+                total_frames=total_frames,
+                deterministic=False,
+                num_frame_per_block=num_frame_per_block,
+                temporal_compression_ratio=wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"],
+                target_fps=self.fps,
+                allow_padding=allow_padding,
+                min_latent_frames=min_latent_frames,
+                single_video_only=single_video_only,
+                independent_first_frame=getattr(config, "independent_first_frame", False),
+                return_image=getattr(config, "i2v", False),
+                max_chunks_per_shot=max_chunks_per_shot,
+                sample_warning_seconds=dataset_sample_warning_seconds,
+                sample_warning_interval_seconds=dataset_sample_warning_interval_seconds,
+            )
+            camera_collate_fn = multi_video_collate_fn
+            if allow_padding and self.is_main_process:
+                print(f"[Padding] Variable-length training enabled: short videos will be padded with loss masking"
+                      f" (min_latent_frames={min_latent_frames})")
+            if single_video_only and self.is_main_process:
+                print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
         # SP ranks in the same SP group need the same batch because they shard
         # the sequence dimension. Use dp_rank for data parallel sampling.
         random_seed = int(time.time()) % (2**31) * dist.get_rank()
@@ -461,53 +517,61 @@ class Trainer:
             prefetch_factor=1,
             pin_memory=False,
             persistent_workers=False,
-            collate_fn=multi_video_collate_fn,
+            collate_fn=camera_collate_fn,
         )
 
         # Eval dataloader: batch size defaults to 1 to keep validation memory predictable.
         eval_data_path = getattr(config, "eval_data_path", config.data_path)
-        inference_num_frames = section_get(config, "evaluation", "num_frames", getattr(config, "inference_num_frames", 0))
-        if isinstance(inference_num_frames, (list, tuple)):
-            inference_num_frames = inference_num_frames[0] if len(inference_num_frames) > 0 else 0
-        eval_total_frames = (
-            (inference_num_frames - 1) * wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"] + 1
-            if inference_num_frames > 0 else total_frames
-        )
-        temporal_compression_ratio = wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"]
-        first_chunk_frames = 1 + (num_frame_per_block - 1) * temporal_compression_ratio
-        subsequent_chunk_frames = num_frame_per_block * temporal_compression_ratio
-        num_blocks = 1 + (eval_total_frames - first_chunk_frames) // subsequent_chunk_frames
-        chunks_per_shot = getattr(config, "chunks_per_shot", 0)
-        scene_cut_prefix = getattr(config, "scene_cut_prefix", "The scene transitions. ")
-        if getattr(config, "i2v", False):
-            eval_dataset = MultiVideoConcatDataset(
-                data_dir=eval_data_path,
-                video_size=(frame_raw_height, frame_raw_width),
-                total_frames=eval_total_frames,
-                deterministic=True,
-                num_frame_per_block=num_frame_per_block,
-                temporal_compression_ratio=temporal_compression_ratio,
-                target_fps=self.fps,
-                allow_padding=allow_padding,
-                min_latent_frames=min_latent_frames,
-                single_video_only=single_video_only,
-                independent_first_frame=getattr(config, "independent_first_frame", False),
-                return_image=True,
-                max_chunks_per_shot=max_chunks_per_shot,
-                scene_cut_prefix=scene_cut_prefix,
-                sample_warning_seconds=dataset_sample_warning_seconds,
-                sample_warning_interval_seconds=dataset_sample_warning_interval_seconds,
-            )
-            eval_collate = multi_video_collate_fn
+
+        if self.use_camera_lmdb:
+            # Reuse the training dataset for eval — LMDB does not allow opening
+            # the same environment twice in one process.
+            eval_dataset = dataset
+            eval_collate = _camera_latent_collate_fn
+            num_blocks = 1
         else:
-            eval_dataset = MultiTextConcatDataset(
-                data_path=eval_data_path,
-                num_blocks=num_blocks,
-                chunks_per_shot=chunks_per_shot,
-                scene_cut_prefix=scene_cut_prefix,
-                deterministic=True,
+            inference_num_frames = section_get(config, "evaluation", "num_frames", getattr(config, "inference_num_frames", 0))
+            if isinstance(inference_num_frames, (list, tuple)):
+                inference_num_frames = inference_num_frames[0] if len(inference_num_frames) > 0 else 0
+            eval_total_frames = (
+                (inference_num_frames - 1) * wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"] + 1
+                if inference_num_frames > 0 else total_frames
             )
-            eval_collate = eval_collate_fn
+            temporal_compression_ratio = wan_default_config[config.model_kwargs.model_name]["temporal_compression_ratio"]
+            first_chunk_frames = 1 + (num_frame_per_block - 1) * temporal_compression_ratio
+            subsequent_chunk_frames = num_frame_per_block * temporal_compression_ratio
+            num_blocks = 1 + (eval_total_frames - first_chunk_frames) // subsequent_chunk_frames
+            chunks_per_shot = getattr(config, "chunks_per_shot", 0)
+            scene_cut_prefix = getattr(config, "scene_cut_prefix", "The scene transitions. ")
+            if getattr(config, "i2v", False):
+                eval_dataset = MultiVideoConcatDataset(
+                    data_dir=eval_data_path,
+                    video_size=(frame_raw_height, frame_raw_width),
+                    total_frames=eval_total_frames,
+                    deterministic=True,
+                    num_frame_per_block=num_frame_per_block,
+                    temporal_compression_ratio=temporal_compression_ratio,
+                    target_fps=self.fps,
+                    allow_padding=allow_padding,
+                    min_latent_frames=min_latent_frames,
+                    single_video_only=single_video_only,
+                    independent_first_frame=getattr(config, "independent_first_frame", False),
+                    return_image=True,
+                    max_chunks_per_shot=max_chunks_per_shot,
+                    scene_cut_prefix=scene_cut_prefix,
+                    sample_warning_seconds=dataset_sample_warning_seconds,
+                    sample_warning_interval_seconds=dataset_sample_warning_interval_seconds,
+                )
+                eval_collate = multi_video_collate_fn
+            else:
+                eval_dataset = MultiTextConcatDataset(
+                    data_path=eval_data_path,
+                    num_blocks=num_blocks,
+                    chunks_per_shot=chunks_per_shot,
+                    scene_cut_prefix=scene_cut_prefix,
+                    deterministic=True,
+                )
+                eval_collate = eval_collate_fn
         if dist.get_rank() == 0:
             print(f"Using {eval_dataset.__class__.__name__} for eval: {eval_data_path}, num_blocks={num_blocks}")
         eval_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -813,6 +877,10 @@ class Trainer:
 
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
+
+        if self.use_camera_lmdb:
+            return self._train_one_step_camera(batch, accumulation_step, accumulation_steps)
+
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         batch_size = len(text_prompts)
@@ -949,7 +1017,105 @@ class Trainer:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
 
-    def _set_sp_attn(self, enabled: bool):
+    def _train_one_step_camera(self, batch, accumulation_step=0, accumulation_steps=1):
+        """Training step for CameraLatentLMDBDataset (precomputed latents + camera)."""
+        self.model.generator.train()
+        text_prompts = batch["prompts"]
+        if isinstance(text_prompts, list) and len(text_prompts) > 0 and isinstance(text_prompts[0], list):
+            text_prompts = [p for sublist in text_prompts for p in sublist]
+
+        clean_latent = batch["clean_latent"].to(device=self.device, dtype=self.dtype)
+        viewmats = batch["viewmats"].to(device=self.device, dtype=self.dtype)
+        Ks = batch["Ks"].to(device=self.device, dtype=self.dtype)
+
+        batch_size = len(text_prompts)
+        image_or_video_shape = list(self.config.image_or_video_shape)
+        image_or_video_shape[0] = batch_size
+
+        # SP: shard frame dimension (latents, viewmats, Ks all shard along dim=1).
+        if self.sequence_parallel_size > 1:
+            sp = self.sequence_parallel_size
+            assert clean_latent.shape[1] % sp == 0, (
+                f"latent frames ({clean_latent.shape[1]}) must be divisible "
+                f"by sequence_parallel_size ({sp})")
+            clean_latent = clean_latent.chunk(sp, dim=1)[self.sp_rank].contiguous()
+            viewmats = viewmats.chunk(sp, dim=1)[self.sp_rank].contiguous()
+            Ks = Ks.chunk(sp, dim=1)[self.sp_rank].contiguous()
+            image_or_video_shape[1] = clean_latent.shape[1]
+
+        with torch.no_grad():
+            conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
+            if not getattr(self, "unconditional_dict", None):
+                unconditional_dict = self.model.text_encoder(
+                    text_prompts=[self.config.negative_prompt] * batch_size)
+                unconditional_dict = {k: v.detach() for k, v in unconditional_dict.items()}
+                self.unconditional_dict = unconditional_dict
+            else:
+                unconditional_dict = self.unconditional_dict
+
+        # I2V: pin first latent frame as context.
+        initial_latent = None
+        if getattr(self.config, "i2v", False):
+            if self.sequence_parallel_size > 1:
+                if self.sp_rank == 0:
+                    initial_latent = clean_latent[:, 0:1]
+            else:
+                initial_latent = clean_latent[:, 0:1]
+
+        gen_kwargs = dict(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            clean_latent=clean_latent,
+            initial_latent=initial_latent,
+            global_step=self.step,
+            viewmats=viewmats,
+            Ks=Ks,
+        )
+        generator_loss, log_dict = self.model.generator_loss(**gen_kwargs)
+
+        if accumulation_step == 0:
+            self.generator_optimizer.zero_grad(set_to_none=True)
+        scaled_loss = generator_loss / accumulation_steps
+        scaled_loss.backward()
+
+        if accumulation_step != accumulation_steps - 1:
+            return None
+
+        generator_grad_norm = self.model.generator.clip_grad_norm_(
+            self.max_grad_norm)
+        self.generator_optimizer.step()
+
+        if (self.step >= self.config.ema_start_step) and \
+                (self.generator_ema is None) and \
+                (getattr(self.config, "ema_weight", None) is not None) and \
+                (self.config.ema_weight > 0):
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+
+        if self.generator_ema is not None and self.step >= self.config.ema_start_step:
+            self.generator_ema.update(self.model.generator)
+
+        self.step += 1
+
+        wandb_loss_dict = {
+            "generator_loss": generator_loss.item(),
+            "generator_grad_norm": generator_grad_norm.item(),
+        }
+        if self.is_main_process:
+            if not self.disable_wandb:
+                wandb.log(wandb_loss_dict, step=self.step)
+            print(
+                f"[step {self.step:07d}] "
+                f"generator_loss={wandb_loss_dict['generator_loss']:.6f}, "
+                f"generator_grad_norm={wandb_loss_dict['generator_grad_norm']:.6f}"
+            )
+
+        if self.step % self.config.gc_interval == 0:
+            if dist.get_rank() == 0:
+                logging.info("DistGarbageCollector: Running GC.")
+            gc.collect()
+
+
         """
         Toggle SP self-attention between training and inference.
         This only applies to 5B runs with SP enabled.
