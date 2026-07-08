@@ -20,7 +20,7 @@ def log(msg: str) -> None:
 
 
 def sync_once(local_path: str, s3_path: str) -> int:
-    cmd = ["aws", "s3", "sync", local_path, s3_path]
+    cmd = ["aws", "s3", "sync", local_path, s3_path, "--region us-west-2"]
     log(f"Running: {' '.join(cmd)}")
     try:
         result = subprocess.run(cmd, check=False)
