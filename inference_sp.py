@@ -4,6 +4,7 @@ import argparse
 import os
 from math import gcd
 
+import utils.tv_io_patch  # noqa: F401 — patch torchvision.io before imports
 import peft
 import torch
 import torch.distributed as dist

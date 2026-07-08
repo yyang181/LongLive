@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import os
+import utils.tv_io_patch  # noqa: F401 — patch torchvision.io before anything imports it
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import wandb
