@@ -19,7 +19,12 @@ except ModuleNotFoundError:
 
 try:
     import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
+    # Some installs ship a stub package with no actual functions. Only count
+    # it as available if flash_attn_varlen_func actually exists.
+    FLASH_ATTN_2_AVAILABLE = hasattr(flash_attn, "flash_attn_varlen_func")
+    if not FLASH_ATTN_2_AVAILABLE and hasattr(flash_attn, "_flash_attn_varlen_func"):
+        flash_attn.flash_attn_varlen_func = flash_attn._flash_attn_varlen_func
+        FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
