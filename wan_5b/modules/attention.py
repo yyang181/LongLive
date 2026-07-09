@@ -9,14 +9,7 @@ try:
     from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
     FLASH_ATTN_4_AVAILABLE = True
 except Exception:
-    try:
-        from flash_attn.cute import flash_attn_func as _fa4_func
-        FLASH_ATTN_4_AVAILABLE = True
-        _fa4_varlen_func = None  # no varlen; will use _fa4_func with reshape
-    except Exception:
-        FLASH_ATTN_4_AVAILABLE = False
-        _fa4_varlen_func = None
-        _fa4_func = None
+    FLASH_ATTN_4_AVAILABLE = False
 
 try:
     import flash_attn_interface
@@ -206,33 +199,19 @@ def flash_attention(
             None if window_size[0] is None or window_size[0] < 0 else window_size[0],
             None if window_size[1] is None or window_size[1] < 0 else window_size[1],
         )
-        if _fa4_varlen_func is not None:
-            out = _fa4_varlen_func(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=ws,
-            )
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            x = out.unflatten(0, (b, lq))
-        else:
-            # FA4 non-varlen: reshape flat tokens back to (B, S, N, D).
-            q_4d = q.unflatten(0, (b, lq))
-            k_4d = k.unflatten(0, (b, lk))
-            v_4d = v.unflatten(0, (b, lk))
-            out = _fa4_func(
-                q=q_4d, k=k_4d, v=v_4d,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            x = out.flatten(0, 1).unflatten(0, (b, lq))
+        out = _fa4_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=ws,
+        )
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        x = out.unflatten(0, (b, lq))
     elif (version == 3 or (version is None and _USE_FA3)) and FLASH_ATTN_3_AVAILABLE:
         # iter-32: FA3 (built from hopper/ source). Returns a single tensor
         # at default `return_attn_probs=False`, NOT a (out, lse) tuple — the
@@ -259,18 +238,20 @@ def flash_attention(
             out = out[0]
         x = out.unflatten(0, (b, lq))
     else:
-        # No flash attention available — fall back to PyTorch SDPA.
-        # q/k/v are flat (total_tokens, N, D); reshape to (B, S, N, D).
-        q_4d = q.unflatten(0, (b, lq))
-        k_4d = k.unflatten(0, (b, lk))
-        v_4d = v.unflatten(0, (b, lk))
-        q_4d = q_4d.transpose(1, 2)  # (B, N, S, D)
-        k_4d = k_4d.transpose(1, 2)
-        v_4d = v_4d.transpose(1, 2)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_4d, k_4d, v_4d, is_causal=causal, dropout_p=dropout_p)
-        x = out.transpose(1, 2).flatten(0, 1)  # back to (total_tokens, N, D)
-        x = x.unflatten(0, (b, lq))
+        assert FLASH_ATTN_2_AVAILABLE
+        x = flash_attn.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=lq,
+            max_seqlen_k=lk,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic).unflatten(0, (b, lq))
 
     # output
     return x.type(out_dtype)
