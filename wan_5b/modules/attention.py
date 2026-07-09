@@ -5,6 +5,21 @@ import torch
 
 # FA4: preferred on Blackwell (sm_100). Imported via `flash_attn.cute`. The
 # inference loop on GB200 runs this path when LLV2_USE_FA4 is unset or "1".
+# --- cutlass-dsl compatibility shim ---------------------------------------
+# flash-attn-4 4.0.0b4 references ``cute.core.ThrMma``, but nvidia-cutlass-dsl
+# 4.6.0 defines ``ThrMma`` in ``cutlass.cute.atom`` (and re-exports it from
+# ``cutlass.cute``) without adding it to ``cutlass.cute.core``.  This shim
+# copies the symbol so the FA4 import succeeds without modifying the
+# installed flash_attn package.
+try:
+    import cutlass.cute.atom as _cute_atom
+    import cutlass.cute.core as _cute_core
+    if not hasattr(_cute_core, "ThrMma") and hasattr(_cute_atom, "ThrMma"):
+        _cute_core.ThrMma = _cute_atom.ThrMma
+except Exception:
+    pass
+# --- end shim -------------------------------------------------------------
+
 try:
     from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
     FLASH_ATTN_4_AVAILABLE = True
@@ -19,7 +34,11 @@ except ModuleNotFoundError:
 
 try:
     import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
+    # flash-attn-4 ships a namespace ``flash_attn`` package that contains
+    # only the ``cute`` subpackage.  ``import flash_attn`` succeeds but the
+    # classic FA2 API (``flash_attn_varlen_func``) is absent.  Verify the
+    # attribute exists before claiming FA2 is available.
+    FLASH_ATTN_2_AVAILABLE = hasattr(flash_attn, "flash_attn_varlen_func")
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
@@ -48,6 +67,7 @@ _USE_TE_ATTN = os.environ.get("LLV2_USE_TE_ATTN", "0") == "1"
 # FA3 with TORCH_CUDA_ARCH_LIST=10.0+PTX then flip this to 1.
 _USE_FA3 = os.environ.get("LLV2_USE_FA3", "0") == "1"
 
+_flash_attention_logged = False
 
 @functools.lru_cache(maxsize=16)
 def _get_te_dpa(
@@ -109,6 +129,8 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    global _flash_attention_logged
+    
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -194,6 +216,10 @@ def flash_attention(
     # FA4 (Blackwell sm_100): preferred when available unless caller pins
     # version=2/3 or env var disables. iter-5.
     elif (version is None or version == 4) and _USE_FA4 and FLASH_ATTN_4_AVAILABLE:
+        if not _flash_attention_logged:
+            print("[flash_attention] Using: Flash Attention 4 (flash_attn.cute)")
+            _flash_attention_logged = True
+
         # FA4 uses None for "no window"; FA2 used (-1, -1).
         ws = (
             None if window_size[0] is None or window_size[0] < 0 else window_size[0],
@@ -219,6 +245,10 @@ def flash_attention(
         # bogus (24, 128) slice. Use the return value directly. window_size
         # supported by FA3 (default (-1, -1)); thread the caller's value
         # through so local-attention windows work.
+        if not _flash_attention_logged:
+            print("[flash_attention] Using: Flash Attention 3 (flash_attn_interface.cute)")
+            _flash_attention_logged = True
+
         out = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -239,6 +269,10 @@ def flash_attention(
         x = out.unflatten(0, (b, lq))
     else:
         assert FLASH_ATTN_2_AVAILABLE
+        if not _flash_attention_logged:
+            print("[flash_attention] Using: Flash Attention 2 (flash_attn_varlen_func)")
+            _flash_attention_logged = True
+            
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
