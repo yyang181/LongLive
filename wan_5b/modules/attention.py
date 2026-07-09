@@ -60,7 +60,7 @@ except Exception:
 # vs threshold 5e-3) and ~6% slower in steady-state. Re-enable with
 # LLV2_USE_FA4=1 once we have a clean qlive_fa4 baseline + working
 # torch.compile interop.
-_USE_FA4 = os.environ.get("LLV2_USE_FA4", "0") == "1"
+_USE_FA4 = True
 _USE_TE_ATTN = os.environ.get("LLV2_USE_TE_ATTN", "0") == "1"
 # iter-32: FA3 default-off. Initial sm_100 build only JIT'd common head_dim
 # templates; less-common shapes throw "no kernel image is available". Rebuild
