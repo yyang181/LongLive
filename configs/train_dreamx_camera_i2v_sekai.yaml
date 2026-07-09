@@ -71,7 +71,7 @@ training:
 data:
   # data_path: data/train/minWM-data/data
   # image_or_video_shape: [1, 20, 48, 44, 80]
-  data_path: data/train/sekai/data_f40_h44_w80_part
+  data_path: data/train/sekai/data_f40_h28_w52_part
   image_or_video_shape: [1, 40, 48, 28, 52]
 
 logging:
