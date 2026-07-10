@@ -530,13 +530,6 @@ def main():
         print(f"  missing caption: {missing_caption}")
         print(f"F_lat={n_latent}  H_lat={h_lat}  W_lat={w_lat}")
 
-    # Shard
-    if world_size > 1:
-        per_gpu = (len(valid) + world_size - 1) // world_size
-        shard = valid[global_rank * per_gpu:(global_rank + 1) * per_gpu]
-    else:
-        shard = valid
-
     # Init Wan2.2 VAE
     from utils.wan_5b_wrapper import WanVAEWrapper
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
@@ -554,6 +547,11 @@ def main():
         if world_size > 1:
             torch.distributed.barrier()
     else:
+        # ---- Pre-merge any leftover .rank_* shards from a previous run ----
+        # After this step, ``final_dir`` is the single source of truth for
+        # "already done" and there are no leftover ``.rank_*`` shards, so all
+        # ranks can compute an identical ``remaining`` list and repartition it
+        # for balanced work distribution.
         if global_rank == 0:
             _flush_pending_shards_into_final(
                 args.output_dir, world_size,
@@ -563,15 +561,37 @@ def main():
         if world_size > 1:
             torch.distributed.barrier()
 
-    os.makedirs(rank_dir, exist_ok=True)
-    rank_map = int(len(shard) * per_sample_bytes * 1.3) + 100_000_000
-    rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
-
-    # ---- Resume ----
+    # ---- Resume: read the merged-done set (identical on every rank) ----
     done_paths = set()
     if not args.no_resume:
         _, merged_paths = _read_paths_from_lmdb(final_dir)
         done_paths |= merged_paths
+
+    # ---- Filter out already-done clips BEFORE sharding, so the remaining
+    # work is (re)balanced across all GPUs on every resume. Without this,
+    # ranks whose slice of ``valid`` happens to be fully done would sit idle
+    # while other ranks carry all the load. ``valid`` order is deterministic
+    # (same on every rank) so every rank sees the same ``remaining``.
+    remaining = [it for it in valid if it["video_path"] not in done_paths]
+    if global_rank == 0:
+        print(f"[resume] {len(done_paths)} clips already in merged data/; "
+              f"{len(remaining)} clips still to process "
+              f"(re-partitioning across {world_size} GPU(s)).")
+
+    # Shard the *remaining* work.
+    if world_size > 1:
+        per_gpu = (len(remaining) + world_size - 1) // world_size
+        shard = remaining[global_rank * per_gpu:(global_rank + 1) * per_gpu]
+    else:
+        shard = remaining
+
+    os.makedirs(rank_dir, exist_ok=True)
+    rank_map = int(max(len(shard), 1) * per_sample_bytes * 1.3) + 100_000_000
+    rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
+
+    # Defensive: if for any reason this rank's freshly-created shard already
+    # has entries (should not happen because pre-merge wipes all shards),
+    # continue appending instead of overwriting.
     count = 0
     with rank_env.begin() as txn:
         cnt_raw = txn.get(b"__count__")
@@ -581,9 +601,6 @@ def main():
                 pt = txn.get(f"paths_{j}_data".encode())
                 if pt is not None:
                     done_paths.add(pt.decode("utf-8"))
-    if global_rank == 0 and done_paths:
-        print(f"[resume] {len(done_paths)} clips already processed "
-              f"(merged + shards); they will be skipped.")
 
     errors = 0
     first_shape = None
