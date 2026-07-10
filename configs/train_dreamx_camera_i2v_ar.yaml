@@ -92,7 +92,7 @@ inference:
 
 # Lightweight validation generation during I2V AR training.
 evaluation:
-  interval: 100
+  interval: 0
   num_frames: 32
   use_ema: true
   val_batch_size: 1
