@@ -35,12 +35,14 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import torch
 import torch.distributed as dist
-from torchvision.io import write_video
-from tqdm import tqdm
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+import utils.tv_io_patch  # noqa: F401 — patch torchvision.io before importing write_video
+from torchvision.io import write_video
+from tqdm import tqdm
 
 
 from utils.lightvae_5b_wrapper import LightVAE5BWrapper

@@ -25,6 +25,7 @@ import glob
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import utils.tv_io_patch  # noqa: F401 — patch torchvision.io before importing write_video
 import torch
 import torch.distributed as dist
 from torchvision.io import write_video

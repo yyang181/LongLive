@@ -41,6 +41,7 @@ from scripts.data_preprocessing.build_camera_lmdb_5b import (  # noqa: E402
     _parse_pose_string,
     poses_from_pose_str,
 )
+import utils.tv_io_patch  # noqa: E402, F401 — patch torchvision.io before anything imports it
 from utils.action_overlay import apply_overlay  # noqa: E402
 from utils.camera_dataset import build_viewmats_and_Ks  # noqa: E402
 from utils.config import normalize_config  # noqa: E402

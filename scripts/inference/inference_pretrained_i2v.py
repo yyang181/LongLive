@@ -45,6 +45,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import utils.tv_io_patch  # noqa: E402, F401 — patch torchvision.io before anything imports it
 from utils.inference_utils import save_video  # noqa: E402
 from utils.scheduler import FlowMatchScheduler  # noqa: E402
 from utils.wan_5b_camera_wrapper import CameraWanDiffusionWrapper  # noqa: E402
