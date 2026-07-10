@@ -22,9 +22,19 @@ use_ema: false
 output_folder: videos/dreamx_camera_i2v_ar
 num_samples: 1
 save_latents_only: false
+save_with_index: true
 
 data:
-  data_path: /path/to/longlive2/inference_video_dataset
+  # AR i2v inference now uses the same *three-file* input contract as the
+  # bidirectional camera config (configs/infer_dreamx_camera_i2v.yaml):
+  #   inference.image_path      – one source-image path per line
+  #   inference.prompt_path     – one prompt per line
+  #   inference.trajectory_path – one sana_dsl trajectory per line
+  # ``inference.py`` detects these two paths under ``inference`` (or at the
+  # top level) and switches from ``MultiVideoConcatDataset`` to the
+  # ``ThreeFileI2VDataset`` branch, so ``data_path`` is no longer required
+  # — we keep it as a harmless placeholder just for logging.
+  data_path: (unused; three-file i2v mode)
   image_or_video_shape:
   - 1
   - 128
@@ -43,9 +53,27 @@ inference:
   async_vae: false
   vae_type: wan
   vae_device: "cuda:2"
-  # Camera trajectory for AR inference.
+
+  # ---- Default: shared sana_dsl three-file set (active) ----
+  # ``inference.py`` reads:
+  #   * ``trajectory_path`` -> rolled out to per-frame c2w by
+  #     ``utils.sana_camera_control.action_string_to_c2w`` for
+  #     ``sana_dsl`` (or DreamX's action DSL for ``dreamx_action_dsl``),
+  #     then converted via ``utils.camera_dataset.build_viewmats_and_Ks``
+  #     into (viewmats, Ks) fed into pipeline.inference so the DreamX
+  #     ``cam_self_attn`` branch sees the trajectory.
+  #   * ``prompt_path``     -> one text prompt per line (paired 1-to-1
+  #     with the trajectory line index).
+  #   * ``image_path``      -> one source-image path per line, VAE-encoded
+  #     into the first latent frame as the AR i2v conditioning.
+  # This is exactly the same plumbing configs/infer_dreamx_camera_i2v.yaml
+  # uses for the bidirectional entry point.
   trajectory_format: sana_dsl
-  trajectory_path: prompts/trajectories.txt
+  prompt_path: prompts/prompts.txt
+  # trajectory_path: prompts/trajectories.txt
+  trajectory_path: prompts/trajectories_complex.txt
+  # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
+  image_path: prompts/images.txt
 
 checkpoints:
   generator_ckpt: logs/train_dreamx_camera_i2v_ar_b300/checkpoint_model_003000/model.pt

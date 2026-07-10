@@ -59,6 +59,88 @@ from utils.nvfp4_checkpoint import (
 
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
 
+try:
+    from PIL import Image as _PIL_Image
+except ImportError:  # pragma: no cover
+    _PIL_Image = None
+
+
+class ThreeFileI2VDataset(torch.utils.data.Dataset):
+    """AR i2v inference dataset that mirrors the bidirectional
+    ``scripts/inference/inference_bidir_camera.py`` three-file input contract:
+
+        inference.image_path      – one source-image path per line
+        inference.prompt_path     – one prompt per line
+        inference.trajectory_path – one camera-trajectory string per line
+                                    (aligned 1-to-1 with the two files above)
+
+    Produces items in the same shape/keys expected by ``inference.py``'s i2v
+    branch: ``batch["image"]`` is a ``[C, H, W]`` float tensor in ``[-1, 1]``
+    (``multi_video_collate_fn``-style layout) and ``batch["prompts"]`` is a
+    single-string ``List[str]`` so the downstream ``batch['prompts'][0]``
+    picks up the text prompt for that clip.  Camera trajectories are still
+    read directly from ``inference.trajectory_path`` by the existing
+    ``use_camera`` block in the inference loop, so nothing extra needs to be
+    threaded through the dataset here.
+    """
+
+    def __init__(self, image_path_file: str, prompt_path_file: str,
+                 video_size, num_output_frames: int):
+        if _PIL_Image is None:
+            raise RuntimeError(
+                "PIL is required for ThreeFileI2VDataset; please `pip install pillow`."
+            )
+        with open(image_path_file) as f:
+            self.image_paths = [ln.strip() for ln in f if ln.strip()]
+        with open(prompt_path_file) as f:
+            self.prompts = [ln.strip() for ln in f if ln.strip()]
+        assert len(self.image_paths) == len(self.prompts), (
+            f"image_paths ({len(self.image_paths)}) and prompts "
+            f"({len(self.prompts)}) must align (one per line)"
+        )
+        self.video_size = tuple(video_size)  # (H, W)
+        self.num_output_frames = int(num_output_frames)
+        self._mode = "ThreeFileI2V"
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def _load_image(self, path: str) -> torch.Tensor:
+        img = _PIL_Image.open(path).convert("RGB")
+        H, W = self.video_size
+        img = img.resize((W, H), _PIL_Image.BICUBIC)
+        arr = torch.from_numpy(np.array(img, dtype=np.float32))  # (H, W, 3)
+        arr = (arr / 127.5) - 1.0
+        return arr.permute(2, 0, 1).contiguous()  # (C, H, W) in [-1, 1]
+
+    def __getitem__(self, idx):
+        image = self._load_image(self.image_paths[idx])
+        prompt = self.prompts[idx]
+        return {
+            "idx": idx,
+            "image": image,                     # (C, H, W) float32 in [-1, 1]
+            "prompts": [prompt],                # List[str]; length aligns with
+                                                # ``block_prompts`` downstream
+            "image_path": self.image_paths[idx],
+        }
+
+
+def three_file_i2v_collate_fn(batch):
+    """Collate function for :class:`ThreeFileI2VDataset` (batch_size=1).
+
+    Matches the layout emitted by ``multi_video_collate_fn`` for the fields
+    consumed downstream: stacks ``image`` -> ``[B, C, H, W]`` and keeps
+    ``prompts`` as a length-B list of ``List[str]``.
+    """
+    assert len(batch) == 1, "ThreeFileI2VDataset only supports batch_size=1"
+    b = batch[0]
+    return {
+        "idx": torch.tensor(b["idx"], dtype=torch.long),
+        "image": b["image"].unsqueeze(0),      # (1, C, H, W)
+        "prompts": [b["prompts"]],             # [ ["…"] ]
+        "image_path": [b["image_path"]],
+    }
+
 
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
     """Save per-block prompts alongside the video.
@@ -491,23 +573,47 @@ if getattr(config, "i2v", False):
     frame_raw_width = list(config.image_or_video_shape)[4] * wan_default_config[model_name]["spatial_compression_ratio"]
     temporal_compression_ratio = wan_default_config[model_name]["temporal_compression_ratio"]
     total_frames = (config.num_output_frames - 1) * temporal_compression_ratio + 1
-    dataset = MultiVideoConcatDataset(
-        data_dir=data_path,
-        video_size=(frame_raw_height, frame_raw_width),
-        total_frames=total_frames,
-        deterministic=True,
-        num_frame_per_block=nfpb,
-        temporal_compression_ratio=temporal_compression_ratio,
-        target_fps=24 if "5B" in model_name else 16,
-        allow_padding=getattr(config, "allow_padding", False),
-        min_latent_frames=getattr(config, "min_latent_frames", 0),
-        single_video_only=getattr(config, "uniform_prompt", False),
-        independent_first_frame=getattr(config, "independent_first_frame", False),
-        return_image=True,
-        max_chunks_per_shot=getattr(config, "max_chunks_per_shot", 0),
-        scene_cut_prefix=scene_cut_prefix,
-    )
-    collate_fn = multi_video_collate_fn
+
+    # ---------- Three-file i2v mode --------------------------------------
+    # Mirror ``scripts/inference/inference_bidir_camera.py``: when the
+    # config exposes ``inference.image_path`` + ``inference.prompt_path``
+    # we bypass ``MultiVideoConcatDataset`` (which needs a full video/
+    # caption directory tree) and instead read three line-aligned txt
+    # files (image_path / prompt_path / trajectory_path). This is the
+    # natural mode for AR + camera i2v inference on hand-authored prompts,
+    # exactly like the bidirectional camera config does.
+    inf_cfg_for_data = section_get(config, "inference", None, None) or {}
+    image_path_file = getattr(config, "image_path", inf_cfg_for_data.get("image_path", None))
+    prompt_path_file = getattr(config, "prompt_path", inf_cfg_for_data.get("prompt_path", None))
+    if image_path_file and prompt_path_file:
+        if local_rank == 0:
+            print(f"[data] three-file i2v mode: image_path={image_path_file}, "
+                  f"prompt_path={prompt_path_file}")
+        dataset = ThreeFileI2VDataset(
+            image_path_file=image_path_file,
+            prompt_path_file=prompt_path_file,
+            video_size=(frame_raw_height, frame_raw_width),
+            num_output_frames=config.num_output_frames,
+        )
+        collate_fn = three_file_i2v_collate_fn
+    else:
+        dataset = MultiVideoConcatDataset(
+            data_dir=data_path,
+            video_size=(frame_raw_height, frame_raw_width),
+            total_frames=total_frames,
+            deterministic=True,
+            num_frame_per_block=nfpb,
+            temporal_compression_ratio=temporal_compression_ratio,
+            target_fps=24 if "5B" in model_name else 16,
+            allow_padding=getattr(config, "allow_padding", False),
+            min_latent_frames=getattr(config, "min_latent_frames", 0),
+            single_video_only=getattr(config, "uniform_prompt", False),
+            independent_first_frame=getattr(config, "independent_first_frame", False),
+            return_image=True,
+            max_chunks_per_shot=getattr(config, "max_chunks_per_shot", 0),
+            scene_cut_prefix=scene_cut_prefix,
+        )
+        collate_fn = multi_video_collate_fn
     num_blocks = config.num_output_frames // nfpb
 else:
     num_blocks = config.num_output_frames // nfpb
@@ -566,6 +672,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # MultiTextConcatDataset + eval_collate_fn: prompts[0] is List[str].
     block_prompts = list(batch['prompts'][0])
+    # The AR pipeline expects one prompt per chunk in ``conditional_dict_list``
+    # (built from ``text_prompts[0]``), where the number of chunks is
+    # ``num_blocks`` (+1 when independent_first_frame is on and there is no
+    # ``initial_latent`` — not our i2v case). Single-prompt inputs (e.g. the
+    # three-file i2v mode) therefore need to be repeat-padded to ``num_blocks``
+    # so ``conditional_dict_list[chunk_index]`` never IndexErrors. Mirror the
+    # exact policy used by ``inference_sp.py``.
+    if len(block_prompts) < num_blocks:
+        block_prompts += [block_prompts[-1]] * (num_blocks - len(block_prompts))
+    elif len(block_prompts) > num_blocks:
+        block_prompts = block_prompts[:num_blocks]
     prompt = block_prompts[0]  # for filename
     prompts = [block_prompts] * config.num_samples
 
@@ -645,19 +762,24 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 elif vm.shape[0] > F_lat:
                     vm, ks = vm[:F_lat], ks[:F_lat]
             else:
-                from utils.sana_camera_control import action_string_to_c2w
+                # sana_dsl: reuse the exact same helpers as the bidirectional
+                # camera inference script (scripts/inference/inference_bidir_camera.py)
+                # so the resulting (viewmats, Ks) tensors are bit-for-bit
+                # identical for the same trajectory + F_lat.
+                #   * poses_from_action_string rolls out the DSL to
+                #     ``(F_lat, 7)`` w2c pose7 (t + quat), sub-sampling the
+                #     per-raw-frame c2w rollout on the Wan2.2 latent stride.
+                #   * build_viewmats_and_Ks turns those + normalized intrinsics
+                #     into ``(F_lat, 4, 4)`` viewmats and ``(F_lat, 3, 3)`` Ks.
+                # Sana DSL doesn't carry intrinsics, so we fall back to the
+                # WorldPlayGen defaults (as bidir does via a dummy "w-1" pose
+                # string) via ``poses_from_pose_str``.
+                from utils.sana_camera_control import poses_from_action_string
                 from utils.camera_dataset import build_viewmats_and_Ks
-                c2w = action_string_to_c2w(traj, num_frames=1 + 4 * (F_lat - 1))
-                # Convert c2w to w2c pose7 format then to viewmats/Ks.
-                w2c = np.linalg.inv(c2w)
-                poses = np.zeros((F_lat, 7), dtype=np.float32)
-                for i in range(F_lat):
-                    R = w2c[i, :3, :3]
-                    t = w2c[i, :3, 3]
-                    q = Rotation.from_matrix(R).as_quat()
-                    poses[i] = [t[0], t[1], t[2], q[0], q[1], q[2], q[3]]
-                intrinsics = np.array([0.505, 0.898, 0.5, 0.5], dtype=np.float32)
-                vm_np, ks_np = build_viewmats_and_Ks(intrinsics, poses)
+                from scripts.data_preprocessing.build_camera_lmdb_5b import poses_from_pose_str
+                poses = poses_from_action_string(traj, F_lat)
+                intrinsics_norm, _ = poses_from_pose_str("w-1", F_lat, target_h, target_w)
+                vm_np, ks_np = build_viewmats_and_Ks(intrinsics_norm, poses)
                 vm = torch.tensor(vm_np, dtype=torch.float32)
                 ks = torch.tensor(ks_np, dtype=torch.float32)
             viewmats_list.append(vm)
