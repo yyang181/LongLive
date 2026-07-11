@@ -44,7 +44,13 @@ from .attention import attention
 from .prope import prope_qkv
 
 try:
-    from torch.nn.attention.flex_attention import flex_attention
+    from torch.nn.attention.flex_attention import flex_attention as _raw_flex_attention
+    # MUST use the same compiled instance as causal_model.py — the raw import
+    # falls back to sdpa_dense (materialising the full Q×K score matrix) and
+    # OOMs on the 35 k-token teacher-forcing sequence. The compiled version
+    # generates the Triton block-sparse kernel that respects block_mask.
+    flex_attention = torch.compile(
+        _raw_flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 except ModuleNotFoundError:  # pragma: no cover - depends on torch build
     flex_attention = None
 
