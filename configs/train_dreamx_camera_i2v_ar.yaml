@@ -18,7 +18,7 @@ model_kwargs:
   wrapper_cls: utils.dreamx_camera_wrapper.DreamXCameraWanDiffusionWrapper
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
-  num_frame_per_block: 8 # 8
+  num_frame_per_block: 4 # 20 frames / 4 = 5 blocks (must divide num_frame=20)
   local_attn_size: -1
   # DreamX-specific camera branch layout. Keep these aligned with the
   # bidirectional DreamX Camera I2V checkpoint you initialize from.
