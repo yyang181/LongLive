@@ -43,6 +43,11 @@ import torch.nn as nn
 from .attention import attention
 from .prope import prope_qkv
 
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+except ModuleNotFoundError:  # pragma: no cover - depends on torch build
+    flex_attention = None
+
 
 # Local alias so we don't import from model.py (would create a cycle if any
 # helper here is imported during model construction).
@@ -115,6 +120,7 @@ class PropeSelfAttention(nn.Module):
         x: torch.Tensor,                      # (B, S, D)
         cam_emb: Dict[str, torch.Tensor],     # {"viewmats": (B,T,4,4), "K"/"Ks": (B,T,3,3)}
         seq_lens: Optional[torch.Tensor] = None,
+        block_mask=None,
     ) -> torch.Tensor:
         b, s, _ = x.shape
         n, d = self.num_heads, self.head_dim
@@ -123,31 +129,90 @@ class PropeSelfAttention(nn.Module):
         k = self.norm_k(self.k_proj(x)).view(b, s, n, d)
         v = self.v_proj(x).view(b, s, n, d)
 
-        # `prope_qkv` expects (B, N, S, D); back to (B, S, N, D) for `attention`.
-        qp = q.transpose(1, 2)
-        kp = k.transpose(1, 2)
-        vp = v.transpose(1, 2)
-
         viewmats = cam_emb["viewmats"]
         # DreamX uses key "K"; LongLive's prope_meta uses "Ks". Accept both.
         Ks = cam_emb.get("K", cam_emb.get("Ks", None))
+        num_cams = int(viewmats.shape[1])
+        if num_cams <= 0:
+            raise ValueError("cam_self_attn received an empty camera sequence")
+        if seq_lens is not None:
+            base_seq_len = int(seq_lens[0].item())
+        else:
+            if s % num_cams != 0:
+                raise ValueError(
+                    f"cam_self_attn sequence length {s} is not divisible by "
+                    f"camera frames {num_cams}"
+                )
+            base_seq_len = s
+        is_tf = (s == base_seq_len * 2)
 
-        qp, kp, vp, apply_fn_o = prope_qkv(
-            qp, kp, vp,
-            viewmats=viewmats.to(dtype=qp.dtype),
-            Ks=(Ks.to(dtype=qp.dtype) if Ks is not None else None),
-        )
+        def _apply_prope(q_in, k_in, v_in):
+            # `prope_qkv` expects (B, N, S, D); attention uses (B, S, N, D).
+            qp = q_in.transpose(1, 2).contiguous()
+            kp = k_in.transpose(1, 2).contiguous()
+            vp = v_in.transpose(1, 2).contiguous()
+            if qp.shape[2] % num_cams != 0:
+                raise ValueError(
+                    f"cam_self_attn tokens {qp.shape[2]} are not divisible by "
+                    f"camera frames {num_cams}; check clean/noisy camera layout"
+                )
+            qp, kp, vp, apply_fn_o = prope_qkv(
+                qp, kp, vp,
+                viewmats=viewmats.to(dtype=qp.dtype),
+                Ks=(Ks.to(dtype=qp.dtype) if Ks is not None else None),
+            )
+            return (
+                qp.transpose(1, 2).contiguous(),
+                kp.transpose(1, 2).contiguous(),
+                vp.transpose(1, 2).contiguous(),
+                apply_fn_o,
+            )
 
-        # attention() expects (B, S, N, D) layout (flash-attn varlen wrapper).
-        out = attention(
-            qp.transpose(1, 2),
-            kp.transpose(1, 2),
-            v=vp.transpose(1, 2),
-            k_lens=seq_lens,
-        )
+        apply_fn_o = None
+        if is_tf:
+            q_clean, q_noisy = q.split(base_seq_len, dim=1)
+            k_clean, k_noisy = k.split(base_seq_len, dim=1)
+            v_clean, v_noisy = v.split(base_seq_len, dim=1)
+            qp_clean, kp_clean, vp_clean, apply_fn_o = _apply_prope(q_clean, k_clean, v_clean)
+            qp_noisy, kp_noisy, vp_noisy, _ = _apply_prope(q_noisy, k_noisy, v_noisy)
+            qp = torch.cat([qp_clean, qp_noisy], dim=1)
+            kp = torch.cat([kp_clean, kp_noisy], dim=1)
+            vp = torch.cat([vp_clean, vp_noisy], dim=1)
+        else:
+            qp, kp, vp, apply_fn_o = _apply_prope(q, k, v)
+
+        if block_mask is None:
+            out = attention(qp, kp, v=vp, k_lens=seq_lens)
+        else:
+            if flex_attention is None:
+                raise ModuleNotFoundError(
+                    "torch.nn.attention.flex_attention is required for causal "
+                    "DreamX camera attention"
+                )
+            padded_length = ((qp.shape[1] + 127) // 128) * 128 - qp.shape[1]
+            if padded_length > 0:
+                pad_shape = (b, padded_length, n, d)
+                qp = torch.cat([qp, torch.zeros(pad_shape, device=qp.device, dtype=vp.dtype)], dim=1)
+                kp = torch.cat([kp, torch.zeros(pad_shape, device=kp.device, dtype=vp.dtype)], dim=1)
+                vp = torch.cat([vp, torch.zeros(pad_shape, device=vp.device, dtype=vp.dtype)], dim=1)
+            out = flex_attention(
+                query=qp.transpose(2, 1),
+                key=kp.transpose(2, 1),
+                value=vp.transpose(2, 1),
+                block_mask=block_mask,
+            )
+            if padded_length > 0:
+                out = out[:, :, :-padded_length]
+            out = out.transpose(2, 1)
 
         # Inverse PRoPE projection on (B, N, S, D), then back to (B, S, N, D).
-        out = apply_fn_o(out.transpose(1, 2)).transpose(1, 2)
+        if is_tf:
+            out_clean, out_noisy = out.split(base_seq_len, dim=1)
+            out_clean = apply_fn_o(out_clean.transpose(1, 2)).transpose(1, 2)
+            out_noisy = apply_fn_o(out_noisy.transpose(1, 2)).transpose(1, 2)
+            out = torch.cat([out_clean, out_noisy], dim=1)
+        else:
+            out = apply_fn_o(out.transpose(1, 2)).transpose(1, 2)
         out = out.flatten(2)         # (B, S, attn_dim)
         out = self.out_proj(out)     # (B, S, dim)
         return out

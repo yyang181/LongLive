@@ -898,7 +898,9 @@ class CausalWanAttentionBlock(nn.Module):
                 "viewmats": prope_meta["viewmats"],
                 "K": prope_meta.get("Ks", None),
             }
-            y_cam = self.cam_self_attn(modulated_x, cam_emb, seq_lens=seq_lens)
+            y_cam = self.cam_self_attn(
+                modulated_x, cam_emb, seq_lens=seq_lens, block_mask=block_mask
+            )
             x = x + (y_cam.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
@@ -1597,6 +1599,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             f_lat = int(grid_sizes[0, 0].item())
             h_lat = int(grid_sizes[0, 1].item())
             w_lat = int(grid_sizes[0, 2].item())
+            assert viewmats.shape[1] == f_lat, (
+                f"viewmats has {viewmats.shape[1]} camera frames but latent grid has "
+                f"{f_lat} frames; camera and VAE latent time axes must match."
+            )
+            if Ks is not None:
+                assert Ks.shape[1] == f_lat, (
+                    f"Ks has {Ks.shape[1]} camera frames but latent grid has {f_lat}."
+                )
             prope_meta = {
                 "viewmats": viewmats,
                 "Ks": Ks,
@@ -1827,6 +1837,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             f_lat = int(grid_sizes[0, 0].item())
             h_lat = int(grid_sizes[0, 1].item())
             w_lat = int(grid_sizes[0, 2].item())
+            assert viewmats.shape[1] == f_lat, (
+                f"viewmats has {viewmats.shape[1]} camera frames but latent grid has "
+                f"{f_lat} frames; camera and VAE latent time axes must match."
+            )
+            if Ks is not None:
+                assert Ks.shape[1] == f_lat, (
+                    f"Ks has {Ks.shape[1]} camera frames but latent grid has {f_lat}."
+                )
             prope_meta = {
                 "viewmats": viewmats,
                 "Ks": Ks,

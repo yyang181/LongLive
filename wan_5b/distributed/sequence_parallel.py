@@ -213,6 +213,8 @@ def sp_dit_causal_forward_train(
     aug_t=None,
     clip_fea=None,
     y=None,
+    viewmats=None,
+    Ks=None,
 ):
     r"""
     Forward pass through the diffusion model
@@ -241,6 +243,12 @@ def sp_dit_causal_forward_train(
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
+    if viewmats is not None:
+        raise NotImplementedError(
+            "DreamX camera EPRoPE causal training under sequence_parallel_size>1 "
+            "needs a distributed cam_self_attn path; use sequence_parallel_size=1 "
+            "until SP camera attention is implemented and validated."
+        )
 
     # Construct the blockwise causal attention mask. Frames are sharded across
     # SP ranks, so total frames = local frames per rank * sp_size.
