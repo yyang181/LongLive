@@ -36,7 +36,7 @@ model_kwargs:
   # --- Base WanDiffusionWrapper args (identical to train_i2v_ar.yaml) ---
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
-  num_frame_per_block: 8
+  num_frame_per_block: 4 # 8
   local_attn_size: 32
   # Echo-Infinity ships with sink_size=4 for I2V AR. Keep it in sync with
   # `inference.sink_size` below so training and inference match.
@@ -88,9 +88,9 @@ training:
   gradient_accumulation_steps: 1
   ema_weight: 0.99
   ema_start_step: 100
-  log_iters: 1
-  max_checkpoints: 20
-  max_iters: 600
+  log_iters: 10
+  max_checkpoints: 3
+  max_iters: 9999999999999999999999
   infmem_streaming_training: true
   gc_interval: 100
   # Consumed by trainer/diffusion.py::_build_optimizer to size the encoder
@@ -112,17 +112,8 @@ training:
     replacement_strategy: random
 
 data:
-  data_path: /path/to/longlive2/train_video_dataset
-  eval_data_path: /path/to/longlive2/eval_video_dataset
-  # [B, F_latent, C, H, W]. With F_latent=96 the encoder sees 12 chunks of 8
-  # latent frames each, comfortably exceeding bptt_clips=2 so BPTT truncation
-  # fires ~6 times per training video.
-  image_or_video_shape:
-  - 1
-  - 96
-  - 48
-  - 44
-  - 80
+  data_path: data/train/minWM-data/data
+  image_or_video_shape: [1, 20, 48, 44, 80]
   load_raw_video: true
 
 # Generation settings used by training-time evaluation.
@@ -139,7 +130,7 @@ inference:
 
 # Lightweight validation generation during I2V AR training.
 evaluation:
-  interval: 1
+  interval: 0
   num_frames: 32
   use_ema: true
   val_batch_size: 1

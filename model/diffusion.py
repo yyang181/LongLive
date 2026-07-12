@@ -232,11 +232,11 @@ class CausalDiffusion(BaseModel):
         kv_cache, crossattn_cache = self._build_streaming_caches(
             batch_size, noisy_latents.dtype, noisy_latents.device, frame_seq_length
         )
+        from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
         try:
-            from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
             reset_infmem(self.generator, batch_size=batch_size, device=noisy_latents.device, dtype=noisy_latents.dtype)
-        except Exception:
-            maybe_detach_infmem = None
+        except Exception as e:
+            print(f"[InfMem][warn] reset_infmem failed (BPTT detach still active): {e}", flush=True)
 
         if timestep_clean_aug is None:
             timestep_clean_aug = torch.zeros_like(timestep)

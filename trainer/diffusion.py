@@ -1115,10 +1115,12 @@ class Trainer:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
 
+    def _set_sp_attn(self, enabled):
+        """Toggle SP self-attention between training and inference.
 
-        """
-        Toggle SP self-attention between training and inference.
-        This only applies to 5B runs with SP enabled.
+        This only applies to 5B runs with SP enabled. When ``enabled`` is
+        True, each block's ``self_attn.forward`` is replaced with the SP
+        variant; when False, the original forward is restored.
         """
         if not hasattr(self, "_sp_attn_blocks"):
             return
