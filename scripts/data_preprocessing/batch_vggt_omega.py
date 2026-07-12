@@ -90,13 +90,19 @@ def find_videos(input_dir: Path):
                 yield video_path, rel_parent
 
 
-def discover_sources(input_path: Path) -> List[VideoSource]:
+def discover_sources(input_path: Path,
+                     use_parent_as_stem: bool = False) -> List[VideoSource]:
     """Build the list of VideoSource objects from either a directory or a
     parquet file produced by parquet_util.py.
 
     For a directory: mirrors the directory layout exactly as before.
     For a parquet file: each row becomes one VideoSource, with
     ``rel_parent`` taken from the ``relpath`` column inside the parquet.
+
+    When *use_parent_as_stem* is True, the output stem is the immediate
+    parent directory name instead of the video filename (useful for
+    minWM-data where every video is ``gen.mp4`` inside a uniquely-named
+    subdirectory).
     """
     sources: List[VideoSource] = []
 
@@ -132,9 +138,21 @@ def discover_sources(input_path: Path) -> List[VideoSource]:
         )
 
     for video_path, rel_parent in find_videos(input_path):
+        if use_parent_as_stem:
+            # Use the immediate parent directory name as the output stem,
+            # and set rel_parent to the grandparent relative to input_path.
+            # e.g. input_dir/000000_right8a11/gen.mp4 -> stem="000000_right8a11"
+            parent_dir = video_path.parent
+            stem = parent_dir.name
+            try:
+                rel_parent = parent_dir.parent.relative_to(input_path)
+            except ValueError:
+                rel_parent = Path("")
+        else:
+            stem = video_path.stem
         sources.append(VideoSource(
             rel_parent=rel_parent,
-            stem=video_path.stem,
+            stem=stem,
             suffix=video_path.suffix,
             file_path=video_path,
         ))
@@ -425,6 +443,31 @@ def parse_visible_devices():
     return [x.strip() for x in val.split(",") if x.strip() != ""]
 
 
+def auto_detect_gpu_ids() -> Optional[List[str]]:
+    """Detect all GPU device IDs on the system using nvidia-smi.
+
+    Returns a list of GPU index strings (e.g. ['0', '1', ..., '7']) or
+    None if detection fails.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            ids = [line.strip() for line in result.stdout.strip().split("\n")
+                   if line.strip()]
+            if ids:
+                return ids
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -482,6 +525,14 @@ def main():
              "tensor; drop depth/depth_conf/pose_enc/camera_tokens/registers "
              "to save disk space.",
     )
+    parser.add_argument(
+        "--use_parent_as_stem", action="store_true",
+        help="Use the immediate parent directory name as the output stem "
+             "instead of the video filename. Useful for datasets like "
+             "minWM-data where every video is named gen.mp4 inside a "
+             "uniquely-named subdirectory (e.g. videos/000000_right8a11/"
+             "gen.mp4 -> output_dir/000000_right8a11.npz).",
+    )
     args = parser.parse_args()
 
     # Accept either a directory or a .parquet file as the input source.
@@ -500,7 +551,11 @@ def main():
         print(f"[SCAN] Reading video list from parquet: {args.input_dir}")
     else:
         print(f"[SCAN] Scanning videos under: {args.input_dir}")
-    all_sources = discover_sources(args.input_dir)
+    if args.use_parent_as_stem:
+        print(f"[SCAN] Using parent directory name as output stem "
+              f"(--use_parent_as_stem)")
+    all_sources = discover_sources(args.input_dir,
+                                   use_parent_as_stem=args.use_parent_as_stem)
     print(f"[SCAN] Found {len(all_sources)} video(s) total.")
 
     tasks: List[Tuple[VideoSource, Path]] = []
@@ -530,14 +585,29 @@ def main():
         print(f"[GPU] Running sequentially on default GPU "
               f"(CUDA_VISIBLE_DEVICES={visible if visible else 'unset'}).")
     else:
+        # If CUDA_VISIBLE_DEVICES is not set or has fewer GPUs than
+        # requested, auto-detect all GPUs on the system via nvidia-smi.
+        if visible is None or len(visible) < args.num_gpus:
+            auto_ids = auto_detect_gpu_ids()
+            if auto_ids is not None and len(auto_ids) > 0:
+                if visible is None:
+                    print(f"[GPU] CUDA_VISIBLE_DEVICES not set; auto-detected "
+                          f"{len(auto_ids)} GPU(s): {auto_ids}")
+                else:
+                    print(f"[GPU] CUDA_VISIBLE_DEVICES has {len(visible)} "
+                          f"GPU(s) but --num_gpus={args.num_gpus}; "
+                          f"auto-detected {len(auto_ids)} GPU(s): {auto_ids}")
+                visible = auto_ids
         if visible is None:
-            print("Error: --num_gpus > 1 requires CUDA_VISIBLE_DEVICES to be "
-                  "set (e.g. CUDA_VISIBLE_DEVICES=0,3).", file=sys.stderr)
+            print("Error: --num_gpus > 1 but no GPUs detected. Set "
+                  "CUDA_VISIBLE_DEVICES or ensure nvidia-smi is available.",
+                  file=sys.stderr)
             sys.exit(1)
         if args.num_gpus > len(visible):
-            print(f"Error: --num_gpus={args.num_gpus} but only "
-                  f"{len(visible)} GPU(s) visible: {visible}", file=sys.stderr)
-            sys.exit(1)
+            print(f"[GPU] Warning: --num_gpus={args.num_gpus} but only "
+                  f"{len(visible)} GPU(s) available; using all "
+                  f"{len(visible)}.", file=sys.stderr)
+            args.num_gpus = len(visible)
         gpu_layout = visible[: args.num_gpus]
         print(f"[GPU] Using {len(gpu_layout)} GPU(s): {gpu_layout}")
 

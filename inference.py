@@ -1,6 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 import os
+import re
 import sys
 
 # torchrun no longer consistently prepends the script directory to sys.path,
@@ -202,6 +203,16 @@ if not hasattr(config, "guidance_scale") or config.guidance_scale is None:
 
 config.use_ema = section_get(config, "inference", "use_ema", getattr(config, "use_ema", False))
 config.output_folder = section_get(config, "inference", "output_folder", getattr(config, "output_folder", "videos/longlive2"))
+
+# If the ckpt path encodes a training step (e.g. ``checkpoint_model_000200``),
+# append that suffix to the output_folder so different checkpoints don't
+# clobber each other (mirrors scripts/inference/inference_bidir_camera.py).
+_ckpt_for_suffix = getattr(config, "generator_ckpt", None) or ""
+if _ckpt_for_suffix:
+    _m = re.search(r"checkpoint_model_(\d+)", _ckpt_for_suffix)
+    if _m:
+        config.output_folder = os.path.join(config.output_folder, _m.group(1))
+
 config.num_samples = section_get(config, "inference", "num_samples", getattr(config, "num_samples", 1))
 config.num_output_frames = getattr(config, "num_output_frames", config.image_or_video_shape[1])
 config.save_with_index = getattr(config, "save_with_index", False)
@@ -645,6 +656,27 @@ if dist.is_initialized():
     dist.barrier()
 
 
+# ---------- action overlay (optional) ----------------------------------
+# Mirror scripts/inference/inference_bidir_camera.py: render a Genie-3-style
+# WASD-cluster + rotation joystick on top of every output frame, driven by
+# the per-frame relative pose extracted from the *raw* (pre-VAE-stride) c2w
+# trajectory. The overlay key/joystick mapping follows the sana-WM convention
+# (W/S = forward/back, A/D = strafe, joystick = yaw/pitch), regardless of
+# which DSL produced the trajectory.
+_inf_cfg_overlay = section_get(config, "inference", None, None) or {}
+action_overlay = bool(_inf_cfg_overlay.get("action_overlay", False))
+overlay_corner = str(_inf_cfg_overlay.get("overlay_corner", "bottom-left")).lower()
+if action_overlay and overlay_corner not in {
+    "bottom-left", "bottom-right", "top-left", "top-right",
+}:
+    raise ValueError(
+        f"inference.overlay_corner must be one of "
+        f"bottom-left/bottom-right/top-left/top-right, got {overlay_corner!r}"
+    )
+if action_overlay and local_rank == 0:
+    print(f"[inference] action_overlay = True (corner={overlay_corner})")
+
+
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
     device, dtype = videos[0].device, videos[0].dtype
     scale = [self.mean.to(device=device, dtype=dtype),
@@ -667,6 +699,37 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         batch = batch_data
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
+
+    # Skip already-completed videos (mirrors inference_bidir_camera.py):
+    # check whether the expected output file exists and is non-empty, so
+    # re-running a partially-finished inference job only processes the
+    # remaining clips instead of redoing everything.
+    if idx < num_prompts:
+        if hasattr(pipeline, 'is_lora_enabled') and pipeline.is_lora_enabled:
+            _skip_model_type = "lora"
+        elif getattr(config, 'use_ema', False):
+            _skip_model_type = "ema"
+        else:
+            _skip_model_type = "regular"
+        if dist.is_initialized():
+            _skip_rank = dist.get_rank()
+        else:
+            _skip_rank = 0
+        if config.save_with_index:
+            _skip_base = f'rank{_skip_rank}-{idx}-0_{_skip_model_type}'
+        else:
+            # prompt is not known yet here, so we can only skip in index mode
+            _skip_base = None
+        if _skip_base is not None:
+            _skip_ext = '.pt' if section_get(
+                config, "inference", "save_latents_only",
+                getattr(config, "save_latents_only", getattr(config, "save_latent_only", False)),
+                aliases=("save_latent_only", "return_latents"),
+            ) else '.mp4'
+            _skip_path = os.path.join(config.output_folder, f'{_skip_base}{_skip_ext}')
+            if os.path.exists(_skip_path) and os.path.getsize(_skip_path) > 0:
+                print(f"[skip] rank{_skip_rank}-{idx} already exists -> {_skip_path}")
+                continue
 
     all_video = []
 
@@ -724,6 +787,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         inference_kwargs["initial_latent"] = initial_latent
 
     # Camera AR inference: build viewmats/Ks from trajectory if configured.
+    raw_c2w_per_sample = None
     cam_algo = getattr(config, "algorithm", {}) or {}
     use_camera = bool(cam_algo.get("use_camera", False)) or bool(getattr(config, "use_camera", False))
     if use_camera:
@@ -745,6 +809,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
         viewmats_list = []
         Ks_list = []
+        raw_c2w_list = []
         for si in range(config.num_samples):
             traj = traj_lines[si % len(traj_lines)] if traj_lines else "w-10"
             if traj_fmt == "dreamx_action_dsl":
@@ -761,6 +826,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     ks = torch.cat([ks, ks[-1:].expand(pad, -1, -1).clone()], dim=0)
                 elif vm.shape[0] > F_lat:
                     vm, ks = vm[:F_lat], ks[:F_lat]
+                if action_overlay:
+                    from utils.dreamx_trajectory import action_to_raw_c2w
+                    raw_c2w_full = action_to_raw_c2w(
+                        action_seq, speeds,
+                        duration=duration, target_length=target_length,
+                    )
             else:
                 # sana_dsl: reuse the exact same helpers as the bidirectional
                 # camera inference script (scripts/inference/inference_bidir_camera.py)
@@ -782,12 +853,27 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 vm_np, ks_np = build_viewmats_and_Ks(intrinsics_norm, poses)
                 vm = torch.tensor(vm_np, dtype=torch.float32)
                 ks = torch.tensor(ks_np, dtype=torch.float32)
+                if action_overlay:
+                    if traj_fmt == "worldplaygen":
+                        from scripts.data_preprocessing.build_camera_lmdb_5b import (
+                            _generate_camera_trajectory_local,
+                            _parse_pose_string,
+                        )
+                        _raw_c2w_list = _generate_camera_trajectory_local(
+                            _parse_pose_string(traj))
+                        raw_c2w_full = np.stack(_raw_c2w_list, axis=0).astype(np.float32)
+                    else:  # sana_dsl
+                        from utils.sana_camera_control import action_string_to_c2w
+                        raw_c2w_full = action_string_to_c2w(traj).astype(np.float32)
             viewmats_list.append(vm)
             Ks_list.append(ks)
+            raw_c2w_list.append(raw_c2w_full if action_overlay else None)
         viewmats = torch.stack(viewmats_list, dim=0).to(device=device, dtype=torch.bfloat16)
         Ks = torch.stack(Ks_list, dim=0).to(device=device, dtype=torch.bfloat16)
         inference_kwargs["viewmats"] = viewmats
         inference_kwargs["Ks"] = Ks
+        if action_overlay:
+            raw_c2w_per_sample = raw_c2w_list
 
     with torch.inference_mode():
         generated = pipeline.inference(**inference_kwargs)
@@ -831,6 +917,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             else:
                 output_path = os.path.join(config.output_folder, f'{base_name}.mp4')
                 fps = 24 if '5B' in config.model_kwargs.model_name else 16
+                # Optional: composite WASD + joystick action overlay onto
+                # each frame (mirrors scripts/inference/inference_bidir_camera.py).
+                if action_overlay and raw_c2w_per_sample is not None:
+                    from utils.action_overlay import apply_overlay
+                    _vid = video[seed_idx]  # (T, H, W, C) float [0, 255]
+                    _vid_thwc = _vid.clamp(0, 255).to(torch.uint8).cpu().numpy()
+                    _vid_thwc = apply_overlay(
+                        _vid_thwc, raw_c2w_per_sample[seed_idx],
+                        corner=overlay_corner,
+                    )
+                    video[seed_idx] = torch.from_numpy(_vid_thwc).to(_vid.device).float()
                 write_video(output_path, video[seed_idx], fps=fps)
 
             prompt_txt_path = os.path.join(config.output_folder, f'{base_name}_prompts.txt')

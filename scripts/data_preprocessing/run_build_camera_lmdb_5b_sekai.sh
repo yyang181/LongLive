@@ -9,7 +9,10 @@
 #     pose maps 1-to-1 to a Wan2.2 latent frame. The build script uses
 #     vae_time_stride=1 internally (no additional subsampling).
 #   - Captions come from CSV files ($CAPTION_CSV) with 'videoFile' and
-#     'caption' columns, not JSON.
+#     'caption' columns, or JSON files (.json) with a list of
+#     {video_path, caption} objects (minWM-data clips.json format).
+#     When JSON is detected, --use_parent_as_clip_id is auto-enabled so
+#     that <clip_id>/gen.mp4 subdirectories are handled correctly.
 #
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
@@ -46,6 +49,22 @@ for f in "${CAPTION_CSV_LIST[@]}"; do
         echo "ERROR: caption CSV not found: ${f}" >&2; exit 1
     fi
 done
+
+# Auto-detect minWM-data format: if any caption file is JSON, use parent
+# directory name as clip_id (minWM-data stores videos as <clip_id>/gen.mp4).
+# Set USE_PARENT_AS_CLIP_ID=0 to force-disable, =1 to force-enable.
+if [[ -z "${USE_PARENT_AS_CLIP_ID:-}" ]]; then
+    USE_PARENT_AS_CLIP_ID=0
+    for f in "${CAPTION_CSV_LIST[@]}"; do
+        if [[ "${f}" == *.json ]]; then
+            USE_PARENT_AS_CLIP_ID=1
+            break
+        fi
+    done
+fi
+if [[ "${USE_PARENT_AS_CLIP_ID}" == "1" ]]; then
+    EXTRA_ARGS+=(--use_parent_as_clip_id)
+fi
 
 torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b_sekai.py \

@@ -6,7 +6,7 @@ model_kwargs:
   wrapper_cls: utils.dreamx_camera_wrapper.DreamXCameraWanDiffusionWrapper
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
-  num_frame_per_block: 8
+  num_frame_per_block: 4 # 8
   local_attn_size: 32
   sink_size: 4
   attn_compress: 1
@@ -74,6 +74,10 @@ inference:
   trajectory_path: prompts/trajectories_complex.txt
   # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
   image_path: prompts/images.txt
+
+  ### action overlay
+  action_overlay: true
+  overlay_corner: bottom-left  # 可选，默认 bottom-left
 
 checkpoints:
   generator_ckpt: logs/train_dreamx_camera_i2v_ar_b300/checkpoint_model_003000/model.pt

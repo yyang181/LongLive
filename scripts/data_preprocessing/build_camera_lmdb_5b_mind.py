@@ -1,59 +1,67 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Build a camera-aware LMDB dataset for Wan2.2-TI2V-5B PRoPE Bidirectional SFT
-from the *Sekai* (Leegen/Sekai) dataset using VGGT-Omega camera estimates.
+from the **MIND** dataset (CSU-JPG/MIND) action.json release.
 
-Differences from ``build_camera_lmdb_5b_sekai_game.py``:
-  * Camera parameters come from VGGT-Omega (``batch_vggt_omega.py``) instead of
-    the Sekai-Game sharded NPZ.  Each video has its own ``<clip_id>.npz`` in
-    ``--camera_dir`` with keys:
-      - ``extrinsics``  : (1, T, 3, 4)  float32, c2w (camera-to-world)
-      - ``intrinsics``  : (1, T, 3, 3)  float32, pinhole [fx 0 cx; 0 fy cy; 0 0 1]
-      - ``num_frames``  : int64 = T
-      - ``height``      : int64  (VGGT processing resolution)
-      - ``width``       : int64
-  * **Cameras are already 4×-strided**: VGGT-Omega was run with
-    ``--frame_stride 4``, so T poses correspond to original video frames
-    ``[0, 4, 8, ..., 4*(T-1)]``.  This means each camera pose already aligns
-    1-to-1 with a Wan2.2 latent frame (4× temporal VAE).  We therefore use
-    ``vae_time_stride=1`` when subsampling the trajectory — there is no
-    additional 4× subsampling to do.
-  * Captions are read from CSV files (``--caption_csv``) with a ``videoFile``
-    column (e.g. ``clip_id.mp4``) and a ``caption`` column, instead of JSON.
-  * Intrinsics are normalized by the VGGT processing resolution
-    (``height`` / ``width`` from the NPZ), not the original capture resolution.
+MIND stores per-clip metadata in ``action.json`` (one per ``data-<id>/``
+directory) with the following schema (3rd-person mode):
+
+    {
+        "total_time":  [int]   total frames of the ground-truth video
+        "mark_time":   [int]   divider between memory context and prediction
+        "data": [
+            {
+                "time":       [int]   frame index
+                "ws/ad/ud/lr":[int]   action flags
+                "actor_pos":  {x, y, z}        character world position
+                "actor_rpy":  {x, y, z}        character Euler angles (deg)
+                "camera_pos": {x, y, z}        camera world position  (3rd-person)
+                "camera_rpy": {x, y, z}        camera Euler angles (deg)  (3rd-person)
+            },
+            ...
+        ]
+    }
+
+Key differences vs. ``build_camera_lmdb_5b_sekai_original.py``:
+  * **No NPZ camera files.** Camera extrinsics are derived from the per-frame
+    ``camera_pos`` / ``camera_rpy`` fields in action.json (3rd-person) or
+    ``actor_pos`` / ``actor_rpy`` (1st-person fallback).
+  * **No intrinsics provided.** MIND is captured in Unreal Engine 5 at
+    1920x1080; we synthesize normalized intrinsics from a configurable
+    horizontal FOV (default 90 deg, UE5's standard).
+  * **No caption field.** The action.json schema lists ``caption`` in the
+    README but the released files do not contain one.  A high-quality default
+    prompt is used instead (configurable via ``--default_caption``).
+  * **UE5 units (cm).** Positions are in centimetres; ``--pose_scale``
+    (default 0.01) converts to metres so the translation magnitude is
+    comparable to other datasets.
 
 For each clip, this script:
   1. Loads <MAX_FRAMES> RGB frames at <target_h x target_w>.
-  2. Encodes them with the Wan2.2 VAE (4× temporal, 16× spatial, 48 channels)
+  2. Encodes them with the Wan2.2 VAE (4x temporal, 16x spatial, 48 channels)
      into a (F_lat, 48, H/16, W/16) fp16 latent.
-  3. Selects F_lat camera poses from the VGGT trajectory using
-     ``vae_time_stride=1`` (indices ``[0, 1, ..., F_lat-1]``).  Each VGGT pose
-     i corresponds to original frame 4*i, which is the *last* frame of the
-     i-th 4-frame VAE chunk — matching the ``cam_sample_strategy='last'``
-     convention from SANA / Sekai-Game.
-  4. Stores normalized intrinsics [fx/W_vggt, fy/H_vggt, cx/W_vggt, cy/H_vggt]
-     (4,) float32.
+  3. Subsamples the per-frame c2w trajectory to F_lat poses using
+     ``cam_sample_strategy='last'`` (raw indices [0, 4, ..., (F_lat-1)*4]),
+     inverts to w2c, and packs as (F_lat, 7) [tx, ty, tz, qx, qy, qz, qw].
+  4. Stores normalized intrinsics (4,) float32 [fx/W, fy/H, cx/W, cy/H].
   5. Streams each rank to its own LMDB shard, then rank-0 merges into
      ``<output_dir>/data/``.
 
-Wan2.2 VAE has ratio (4× temporal, 16× spatial), so for ``F_lat = 40``:
+Wan2.2 VAE has ratio (4x temporal, 16x spatial), so for ``F_lat = 40``:
     raw_frames  = (F_lat - 1) * 4 + 1 = 157
     latent_h    = target_h / 16
     latent_w    = target_w / 16
 
 Usage:
-    torchrun --nproc_per_node=2 \
-        scripts/data_preprocessing/build_camera_lmdb_5b_sekai.py \
-        --video_dir    /path/to/Sekai/video \
-        --camera_dir   /path/to/Sekai/vggt_omega_results \
-        --caption_csv  /path/to/Sekai-Game.csv /path/to/Sekai-Real-HQ.csv \
-        --output_dir   ./data/train/sekai/ \
-        --target_h 704 --target_w 1280 --max_frames 157
+    torchrun --nproc_per_node=4 \
+        scripts/data_preprocessing/build_camera_lmdb_5b_mind.py \
+        --video_dir       /path/to/MIND/3rd_data/train \
+        --camera_dir      /path/to/MIND/3rd_data/train \
+        --output_dir      ./data/train/MIND/ \
+        --target_h 448 --target_w 832 --max_frames 157
 """
 
 import argparse
-import csv
 import glob
 import json
 import os
@@ -83,146 +91,170 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
-# VGGT-Omega per-video NPZ loading
+# MIND action.json loading
 # --------------------------------------------------------------------------
-def load_vggt_camera_dir(camera_dir):
-    """Scan *camera_dir* for ``<clip_id>.npz`` files produced by
-    ``batch_vggt_omega.py --cameras_only``.
+def load_mind_camera_dir(camera_dir, pose_scale=0.01):
+    """Scan *camera_dir* (recursively) for per-clip ``data-<id>/action.json``
+    files in the MIND layout.
 
-    Each NPZ has:
-        extrinsics  : (1, T, 3, 4) float32, c2w
-        intrinsics  : (1, T, 3, 3) float32
-        num_frames  : int64 = T
-        height      : int64  (VGGT processing resolution)
-        width       : int64
+    Each action.json has a ``data`` array of per-frame dicts with:
+        camera_pos : {x, y, z}  (3rd-person; absent in 1st-person)
+        camera_rpy : {x, y, z}  Euler angles in degrees (3rd-person)
+        actor_pos  : {x, y, z}  (always present)
+        actor_rpy  : {x, y, z}  (always present)
 
-    Returns a dict ``clip_id -> {pose: (T, 4, 4) c2w, intrinsics: (T, 3, 3),
-                                height, width}``.
+    For 3rd-person clips we use ``camera_pos`` / ``camera_rpy``; for
+    1st-person clips (no camera_* fields) we fall back to ``actor_pos`` /
+    ``actor_rpy``.
+
+    Returns a dict ``clip_id -> {pose: (T, 4, 4) c2w float32,
+                                 total_time: int,
+                                 has_camera: bool}``.
     """
     out = {}
     skipped = 0
-    for path in sorted(glob.glob(os.path.join(camera_dir, "*.npz"))):
-        stem = os.path.splitext(os.path.basename(path))[0]
+    pattern = os.path.join(camera_dir, "**", "action.json")
+    for path in sorted(glob.glob(pattern, recursive=True)):
+        clip_id = os.path.basename(os.path.dirname(path))
         try:
-            z = np.load(path, allow_pickle=True)
-            # Only read the small arrays we actually need; never touch
-            # 'depth' (large, and can be corrupted in old-format NPZs).
-            ext = z["extrinsics"]          # (1, T, 3, 4)
-            intr = z["intrinsics"]         # (1, T, 3, 3)
+            with open(path, "r") as f:
+                meta = json.load(f)
+            frames = meta.get("data", [])
+            total_time = int(meta.get("total_time", len(frames)))
+            if not frames:
+                skipped += 1
+                continue
+
+            # Detect whether this clip has 3rd-person camera fields.
+            has_camera = ("camera_pos" in frames[0]
+                          and "camera_rpy" in frames[0])
+
+            T = len(frames)
+            c2w_seq = np.zeros((T, 4, 4), dtype=np.float32)
+            for i, fr in enumerate(frames):
+                if has_camera:
+                    pos = fr["camera_pos"]
+                    rpy = fr["camera_rpy"]
+                else:
+                    pos = fr["actor_pos"]
+                    rpy = fr["actor_rpy"]
+
+                tx = float(pos["x"]) * pose_scale
+                ty = float(pos["y"]) * pose_scale
+                tz = float(pos["z"]) * pose_scale
+
+                roll  = float(rpy["x"])
+                pitch = float(rpy["y"])
+                yaw   = float(rpy["z"])
+
+                # UE5 intrinsic rotation order: Yaw(Z) -> Pitch(Y) -> Roll(X),
+                # which is equivalent to extrinsic 'xyz' with [roll, pitch, yaw].
+                R = Rotation.from_euler(
+                    "xyz", [roll, pitch, yaw], degrees=True
+                ).as_matrix().astype(np.float32)
+
+                c2w_seq[i, :3, :3] = R
+                c2w_seq[i, :3, 3] = [tx, ty, tz]
+                c2w_seq[i, 3, 3] = 1.0
+
+            out[clip_id] = {
+                "pose": c2w_seq,
+                "total_time": total_time,
+                "has_camera": has_camera,
+            }
         except Exception as e:
-            print(f"[WARN] skipping corrupted NPZ {stem}: {e}", flush=True)
+            print(f"[WARN] skipping action.json {clip_id}: {e}", flush=True)
             skipped += 1
             continue
-        # Squeeze batch dim
-        ext = np.asarray(ext[0], dtype=np.float32)    # (T, 3, 4)
-        intr = np.asarray(intr[0], dtype=np.float32)  # (T, 3, 3)
-        T = ext.shape[0]
-        # Pad (T, 3, 4) -> (T, 4, 4) c2w by appending [0, 0, 0, 1]
-        c2w = np.tile(np.eye(4, dtype=np.float32), (T, 1, 1))
-        c2w[:, :3, :] = ext
-        # Resolution: prefer explicit height/width keys; otherwise derive
-        # from the intrinsics principal point (cx = W/2, cy = H/2).
-        keys = set(z.files)
-        if "height" in keys and "width" in keys:
-            h = int(z["height"])
-            w = int(z["width"])
-        else:
-            cx = float(intr[0, 0, 2])
-            cy = float(intr[0, 1, 2])
-            w = int(round(cx * 2))
-            h = int(round(cy * 2))
-            if w <= 0 or h <= 0:
-                w, h = 688, 384  # safe fallback
-        out[stem] = {
-            "pose": c2w,
-            "intrinsics": intr,
-            "height": h,
-            "width": w,
-        }
+
     if skipped:
-        print(f"[WARN] {skipped} corrupted NPZ file(s) skipped.", flush=True)
+        print(f"[WARN] {skipped} action.json file(s) skipped.", flush=True)
     return out
 
 
-def load_caption_csvs(csv_paths, use_parent_as_clip_id=False):
-    """Merge caption data from one or more CSV or JSON files.
+def load_caption_csvs(csv_paths):
+    """Merge one or more CSV files with ``videoFile`` and ``caption`` columns.
 
-    **CSV files** must have ``videoFile`` and ``caption`` columns.
-    clip_id = stem of videoFile (e.g. ``clip_001.mp4`` -> ``clip_001``).
-
-    **JSON files** (``.json``) can be either:
-      - A list of objects with ``video_path`` and ``caption`` keys (minWM-data
-        ``clips.json`` format).  clip_id is derived from ``video_path``:
-        parent directory name if *use_parent_as_clip_id*, else filename stem.
-      - A dict mapping ``clip_id -> caption`` (or ``clip_id -> {caption: ...}``).
-
-    Returns a dict ``clip_id -> caption``.
+    Returns a dict ``clip_id -> caption`` (clip_id = videoFile without
+    extension).
     """
+    import csv as csv_mod
     out = {}
     for path in csv_paths:
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".json":
-            with open(path, "r") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                for entry in data:
-                    vp = entry.get("video_path", "")
-                    if use_parent_as_clip_id:
-                        clip_id = os.path.basename(os.path.dirname(vp))
-                    else:
-                        clip_id = os.path.splitext(os.path.basename(vp))[0]
-                    cap = entry.get("caption", "").strip()
-                    if clip_id and cap:
-                        out[clip_id] = cap
-            elif isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, dict):
-                        cap = v.get("caption", "").strip()
-                    else:
-                        cap = str(v).strip()
-                    if k and cap:
-                        out[k] = cap
-        else:
-            with open(path, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    vf = row.get("videoFile", "").strip()
-                    if not vf:
-                        continue
-                    clip_id = os.path.splitext(vf)[0]
-                    cap = row.get("caption", "").strip()
-                    if not cap:
-                        continue
-                    out[clip_id] = cap
+        with open(path, newline="") as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                vf = row.get("videoFile", "").strip()
+                if not vf:
+                    continue
+                clip_id = os.path.splitext(vf)[0]
+                cap = row.get("caption", "").strip()
+                if not cap:
+                    continue
+                out[clip_id] = cap
     return out
 
 
 # --------------------------------------------------------------------------
-# Camera subsampling (vae_time_stride=1 because VGGT already strided by 4)
+# Default intrinsics from FOV
 # --------------------------------------------------------------------------
-def poses_from_vggt_c2w(c2w_seq, n_latent, intrinsics_row,
-                         orig_w, orig_h):
-    """Subsample a VGGT-Omega c2w trajectory to ``n_latent`` w2c poses.
+def default_intrinsics_from_fov(fov_deg, orig_w=1920, orig_h=1080):
+    """Compute normalized intrinsics [fx/W, fy/H, cx/W, cy/H] from a
+    horizontal FOV (degrees) assuming square pixels and a centered principal
+    point.
 
-    VGGT-Omega was run with ``--frame_stride 4``, so the trajectory already
-    has one pose per 4-frame VAE chunk.  We therefore take poses
-    ``[0, 1, ..., n_latent-1]`` directly (``vae_time_stride=1``).
+    For fov_h = 90 deg at 1920x1080:
+        fx_norm = 1 / (2 * tan(45)) = 0.5
+        fy_norm = fx_norm * (W/H)   = 0.5 * 1920/1080 = 0.889
+        cx_norm = 0.5
+        cy_norm = 0.5
+    """
+    fx_norm = 1.0 / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
+    fy_norm = fx_norm * (float(orig_w) / float(orig_h))
+    cx_norm = 0.5
+    cy_norm = 0.5
+    return np.array([fx_norm, fy_norm, cx_norm, cy_norm], dtype=np.float32)
+
+
+# --------------------------------------------------------------------------
+# Camera subsampling (vae_time_stride=4, per-raw-frame c2w from action.json)
+# --------------------------------------------------------------------------
+def _build_time_indices(n_latent, vae_time_stride, strategy):
+    """Mirror SANA's ``SanaWMZipLatentDataset.cam_sample_strategy`` on the
+    Wan2.2 4x temporal grid."""
+    if strategy == "last":
+        idxs = [i * vae_time_stride for i in range(n_latent)]
+    elif strategy == "first":
+        idxs = [0] + [i * vae_time_stride - vae_time_stride + 1
+                      for i in range(1, n_latent)]
+    else:
+        raise ValueError(f"Invalid cam_sample_strategy: {strategy!r} "
+                         f"(expected 'first' or 'last').")
+    return idxs
+
+
+def poses_from_c2w_array(c2w_seq, n_latent, intrinsics,
+                         vae_time_stride=4, cam_sample_strategy="last"):
+    """Subsample a (L, 4, 4) c2w trajectory to ``n_latent`` w2c poses and
+    return the already-normalized intrinsics as a (4,) vector.
 
     Args:
-        c2w_seq:        (T, 4, 4) float32, per-strided-frame c2w.
-        n_latent:       number of latent frames (= number of camera poses to
-                        select).
-        intrinsics_row: (3, 3) float32 pinhole matrix at the VGGT resolution.
-        orig_w/orig_h:  VGGT processing resolution (used to normalize fx, cx /
-                        fy, cy).
+        c2w_seq:              (L, 4, 4) float32, per-raw-frame c2w.
+        n_latent:             number of latent frames after the 4x temporal VAE.
+        intrinsics:           (4,) float32, already-normalized
+                              [fx/W, fy/H, cx/W, cy/H].
+        vae_time_stride:      temporal compression factor of the VAE (4).
+        cam_sample_strategy:  'last' (default) or 'first'.
 
     Returns:
-        intrinsics: (4,) float32, normalized [fx/W, fy/H, cx/W, cy/H].
-        poses:     (n_latent, 7) float32, w2c [tx, ty, tz, qx, qy, qz, qw].
+        intrinsics: (4,) float32, [fx/W, fy/H, cx/W, cy/H].
+        poses:      (n_latent, 7) float32, w2c [tx, ty, tz, qx, qy, qz, qw].
     """
     L = int(c2w_seq.shape[0])
-    # With vae_time_stride=1, indices are simply [0, 1, ..., n_latent-1].
-    idxs = [min(i, L - 1) for i in range(n_latent)]
+    idxs = _build_time_indices(n_latent, int(vae_time_stride),
+                               cam_sample_strategy)
+    # Clamp every index into the available trajectory length.
+    idxs = [max(0, min(int(fi), L - 1)) for fi in idxs]
 
     poses = np.zeros((n_latent, 7), dtype=np.float32)
     for i, fi in enumerate(idxs):
@@ -231,14 +263,6 @@ def poses_from_vggt_c2w(c2w_seq, n_latent, intrinsics_row,
         poses[i, :3] = w2c[:3, 3]
         poses[i, 3:] = Rotation.from_matrix(w2c[:3, :3]).as_quat()
 
-    fx = float(intrinsics_row[0, 0])
-    fy = float(intrinsics_row[1, 1])
-    cx = float(intrinsics_row[0, 2])
-    cy = float(intrinsics_row[1, 2])
-    intrinsics = np.array(
-        [fx / orig_w, fy / orig_h, cx / orig_w, cy / orig_h],
-        dtype=np.float32,
-    )
     return intrinsics, poses
 
 
@@ -281,32 +305,43 @@ def load_video_frames(video_path, max_frames, target_h, target_w):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--video_dir", required=True,
-                   help="Directory containing <clip_id>.mp4 files")
+                   help="Root directory containing data-<id>/ sub-folders "
+                        "with video.mp4 files (searched recursively).")
     p.add_argument("--camera_dir", required=True,
-                   help="Directory of VGGT-Omega <clip_id>.npz files "
-                        "(produced by batch_vggt_omega.py --cameras_only)")
-    p.add_argument("--caption_csv", required=True, nargs="+",
-                   help="One or more caption files. CSV files must have "
-                        "'videoFile' and 'caption' columns. JSON files "
-                        "(.json) can be a list of {video_path, caption} "
-                        "objects (minWM-data clips.json format) or a dict "
-                        "mapping clip_id -> caption.")
+                   help="Root directory containing data-<id>/ sub-folders "
+                        "with action.json files (searched recursively). "
+                        "Usually the same as --video_dir.")
+    p.add_argument("--caption_csv", nargs="*", default=None,
+                   help="Optional CSV file(s) with 'videoFile' and 'caption' "
+                        "columns. When omitted or a clip is missing, "
+                        "--default_caption is used.")
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--target_h", type=int, default=704)
-    p.add_argument("--target_w", type=int, default=1280)
+    p.add_argument("--target_h", type=int, default=448)
+    p.add_argument("--target_w", type=int, default=832)
     p.add_argument("--max_frames", type=int, default=157,
                    help="raw frame count (must give integer F_lat under 4x temporal)")
+    p.add_argument("--cam_sample_strategy", choices=("first", "last"),
+                   default="last",
+                   help="Per-latent-frame anchor selection strategy. "
+                        "'last' (default) matches sekai_game/sekai_original.")
+    p.add_argument("--default_caption", type=str,
+                   default=("A high-quality third-person gameplay video "
+                            "with detailed 3D environments, smooth character "
+                            "animation, and dynamic camera movement."),
+                   help="Caption used when no CSV caption is available.")
+    p.add_argument("--camera_fov", type=float, default=90.0,
+                   help="Horizontal field of view in degrees (UE5 default 90). "
+                        "Used to synthesize normalized intrinsics.")
+    p.add_argument("--orig_w", type=int, default=1920,
+                   help="Original capture width for intrinsic normalization.")
+    p.add_argument("--orig_h", type=int, default=1080,
+                   help="Original capture height for intrinsic normalization.")
+    p.add_argument("--pose_scale", type=float, default=0.01,
+                   help="Scale factor applied to camera positions (UE5 cm -> m).")
     p.add_argument("--keep_shards", action="store_true",
-                   help="Keep the transient per-rank shard dirs after merge "
-                        "(debugging only).")
+                   help="Keep the transient per-rank shard dirs after merge.")
     p.add_argument("--no_resume", action="store_true",
-                   help="Wipe any existing output ('data/' + shards) and "
-                        "reprocess everything from scratch.")
-    p.add_argument("--use_parent_as_clip_id", action="store_true",
-                   help="Use the immediate parent directory name as the "
-                        "clip_id instead of the video filename. Enables "
-                        "recursive video search. Useful for minWM-data "
-                        "where videos are stored as <clip_id>/gen.mp4.")
+                   help="Wipe any existing output and reprocess from scratch.")
     return p.parse_args()
 
 
@@ -462,58 +497,67 @@ def main():
         global_rank = 0
     device = torch.device(f"cuda:{local_rank}")
 
-    # ---- Load camera + caption metadata ----
+    # ---- Load camera metadata from action.json files ----
     if global_rank == 0:
-        print(f"Loading VGGT-Omega cameras from: {args.camera_dir}")
-    cam_table = load_vggt_camera_dir(args.camera_dir)
+        print(f"Loading MIND action.json cameras from: {args.camera_dir}")
+        print(f"  pose_scale={args.pose_scale} (UE5 cm -> m)")
+    cam_table = load_mind_camera_dir(args.camera_dir, pose_scale=args.pose_scale)
     if global_rank == 0:
-        print(f"Loaded {len(cam_table)} VGGT camera NPZ files.")
+        n_3rd = sum(1 for v in cam_table.values() if v["has_camera"])
+        n_1st = len(cam_table) - n_3rd
+        print(f"Loaded {len(cam_table)} action.json files "
+              f"({n_3rd} 3rd-person, {n_1st} 1st-person fallback).")
 
-    cap_table = load_caption_csvs(
-        args.caption_csv, use_parent_as_clip_id=args.use_parent_as_clip_id)
+    # ---- Load optional captions ----
+    cap_table = {}
+    if args.caption_csv:
+        cap_table = load_caption_csvs(args.caption_csv)
+        if global_rank == 0:
+            print(f"Loaded {len(cap_table)} captions from "
+                  f"{len(args.caption_csv)} CSV file(s).")
     if global_rank == 0:
-        print(f"Loaded {len(cap_table)} captions from "
-              f"{len(args.caption_csv)} file(s).")
+        if not cap_table:
+            print(f"No caption CSV provided; using default caption: "
+                  f"\"{args.default_caption[:80]}...\"")
 
-    # ---- Build the valid clip list (video ∩ camera ∩ caption) ----
+    # ---- Compute default normalized intrinsics ----
+    intrinsics_default = default_intrinsics_from_fov(
+        args.camera_fov, args.orig_w, args.orig_h)
+    if global_rank == 0:
+        print(f"Default normalized intrinsics (fov={args.camera_fov}deg, "
+              f"orig={args.orig_w}x{args.orig_h}): {intrinsics_default}")
+
+    # ---- Build the valid clip list (video ∩ camera) ----
+    raw_frames_needed = args.max_frames
     valid = []
-    missing_video = missing_camera = missing_caption = 0
-    # Iterate over video files that exist on disk
-    if args.use_parent_as_clip_id:
-        video_files = sorted(glob.glob(
-            os.path.join(args.video_dir, "**", "*.mp4"), recursive=True))
-    else:
-        video_files = sorted(glob.glob(os.path.join(args.video_dir, "*.mp4")))
+    missing_camera = 0
+    too_short = 0
+    video_files = sorted(glob.glob(os.path.join(args.video_dir, "**", "*.mp4"),
+                                   recursive=True))
     for vp in video_files:
-        if args.use_parent_as_clip_id:
-            clip_id = os.path.basename(os.path.dirname(vp))
-        else:
-            clip_id = os.path.splitext(os.path.basename(vp))[0]
+        clip_id = os.path.basename(os.path.dirname(vp))
         if clip_id not in cam_table:
             missing_camera += 1
             continue
-        if clip_id not in cap_table:
-            missing_caption += 1
-            continue
         cam = cam_table[clip_id]
-        # Need at least n_latent camera poses
-        if cam["pose"].shape[0] < n_latent:
-            missing_camera += 1
+        # Need at least raw_frames_needed poses so cam_sample_strategy='last'
+        # index (F_lat-1)*4 = max_frames - 1 is in range.
+        if cam["pose"].shape[0] < raw_frames_needed:
+            too_short += 1
             continue
+        # Determine caption: CSV if available, else default.
+        caption = cap_table.get(clip_id, args.default_caption)
         valid.append({
             "clip_id":    clip_id,
             "video_path": vp,
-            "caption":    cap_table[clip_id],
+            "caption":    caption,
             "c2w":        cam["pose"],
-            "intr_mat":   cam["intrinsics"][0],   # (3, 3) first frame
-            "vggt_h":     cam["height"],
-            "vggt_w":     cam["width"],
         })
 
     if global_rank == 0:
-        print(f"Valid clips (video ∩ camera ∩ caption): {len(valid)}")
-        print(f"  missing camera (or too short): {missing_camera}")
-        print(f"  missing caption: {missing_caption}")
+        print(f"Valid clips (video ∩ camera): {len(valid)}")
+        print(f"  missing camera: {missing_camera}")
+        print(f"  too short (< {raw_frames_needed} frames): {too_short}")
         print(f"F_lat={n_latent}  H_lat={h_lat}  W_lat={w_lat}")
 
     # Init Wan2.2 VAE
@@ -534,10 +578,6 @@ def main():
             torch.distributed.barrier()
     else:
         # ---- Pre-merge any leftover .rank_* shards from a previous run ----
-        # After this step, ``final_dir`` is the single source of truth for
-        # "already done" and there are no leftover ``.rank_*`` shards, so all
-        # ranks can compute an identical ``remaining`` list and repartition it
-        # for balanced work distribution.
         if global_rank == 0:
             _flush_pending_shards_into_final(
                 args.output_dir, world_size,
@@ -553,11 +593,7 @@ def main():
         _, merged_paths = _read_paths_from_lmdb(final_dir)
         done_paths |= merged_paths
 
-    # ---- Filter out already-done clips BEFORE sharding, so the remaining
-    # work is (re)balanced across all GPUs on every resume. Without this,
-    # ranks whose slice of ``valid`` happens to be fully done would sit idle
-    # while other ranks carry all the load. ``valid`` order is deterministic
-    # (same on every rank) so every rank sees the same ``remaining``.
+    # ---- Filter out already-done clips BEFORE sharding ----
     remaining = [it for it in valid if it["video_path"] not in done_paths]
     if global_rank == 0:
         print(f"[resume] {len(done_paths)} clips already in merged data/; "
@@ -575,9 +611,7 @@ def main():
     rank_map = int(max(len(shard), 1) * per_sample_bytes * 1.3) + 100_000_000
     rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
 
-    # Defensive: if for any reason this rank's freshly-created shard already
-    # has entries (should not happen because pre-merge wipes all shards),
-    # continue appending instead of overwriting.
+    # Defensive: continue appending if shard already has entries.
     count = 0
     with rank_env.begin() as txn:
         cnt_raw = txn.get(b"__count__")
@@ -607,11 +641,10 @@ def main():
             with torch.no_grad():
                 latent = vae.encode_to_latent(pixel)  # (1, F_lat, 48, h, w)
             latent_np = latent[0].float().cpu().numpy().astype(np.float16)
-            # vae_time_stride=1: VGGT cameras are already 4×-strided, so each
-            # camera pose i corresponds to latent frame i directly.
-            intrinsics, poses = poses_from_vggt_c2w(
-                item["c2w"], n_latent, item["intr_mat"],
-                orig_w=item["vggt_w"], orig_h=item["vggt_h"])
+            intrinsics, poses = poses_from_c2w_array(
+                item["c2w"], n_latent, intrinsics_default,
+                vae_time_stride=4,
+                cam_sample_strategy=args.cam_sample_strategy)
         except Exception as e:
             print(f"[GPU{local_rank}] failed {item.get('video_path')}: {e}")
             errors += 1; continue
