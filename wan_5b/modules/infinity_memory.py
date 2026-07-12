@@ -769,7 +769,10 @@ def _model_forward_inference_infmem(
 
     x = self.head(x, e.unsqueeze(2))
     x = self.unpatchify(x, grid_sizes)
-    return torch.stack(x)
+    output = torch.stack(x)
+    if kv_cache is not None and defer_cache_updates:
+        return output, cache_update_infos
+    return output
 
 
 # ---------------------------------------------------------------------------

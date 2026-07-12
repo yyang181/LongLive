@@ -1,22 +1,39 @@
-# Inference config for DreamX Camera I2V AR + Echo-Infinity Memory — Wan2.2-TI2V-5B.
-# Set checkpoints.generator_ckpt to the AR+InfMem checkpoint produced by
+# ============================================================================
+# Inference config for DreamX Camera (E-PRoPE) I2V AR + Echo-Infinity Memory
+# + Relative RoPE
+# ---------------------------------------------------------------------------
+# Baseline: configs/infer_dreamx_camera_i2v_ar.yaml (E-PRoPE I2V AR inference).
+# Same wrapper dispatch as train_dreamx_camera_i2v_ar_infmem.yaml, so the
+# encoder + cam_self_attn trained on top of the E-PRoPE causal model is loaded
+# end-to-end.
+#
+# Uses the same three-file input contract as the E-PRoPE AR inference:
+#   inference.image_path      – one source-image path per line
+#   inference.prompt_path     – one prompt per line
+#   inference.trajectory_path – one sana_dsl trajectory per line
+# Set checkpoints.generator_ckpt to the AR checkpoint produced by
 # configs/train_dreamx_camera_i2v_ar_infmem.yaml.
+# ============================================================================
 
 model_kwargs:
   wrapper_cls: utils.dreamx_infmem_wrapper.DreamXInfMemWanDiffusionWrapper
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
-  num_frame_per_block: 4
+  num_frame_per_block: 4 # 8
+  # Match Echo-Infinity's inference-side window: 32-frame local + 4 sink.
   local_attn_size: 32
   sink_size: 4
+
+  # --- DreamX camera branch (E-PRoPE) ---
   attn_compress: 1
   qk_norm: true
 
-  # --- Relative-RoPE (must match training config) ---
+  # --- Relative-RoPE (Echo-Infinity E-PRoPE for AR) ---
   enable_relative_rope: true
+  # sink(4) + local(32) + memory(8) + block(4) = 48
   relative_rope_pmax: 48
 
-  # --- Query-Memory Encoder (must match training config) ---
+  # --- Query-Memory Encoder hyperparameters ---
   memory_kwargs:
     dim: 3072
     num_heads: 24
@@ -48,6 +65,15 @@ save_latents_only: false
 save_with_index: true
 
 data:
+  # AR i2v inference uses the same *three-file* input contract as the
+  # bidirectional camera config (configs/infer_dreamx_camera_i2v.yaml):
+  #   inference.image_path      – one source-image path per line
+  #   inference.prompt_path     – one prompt per line
+  #   inference.trajectory_path – one sana_dsl trajectory per line
+  # ``inference.py`` detects these two paths under ``inference`` (or at the
+  # top level) and switches from ``MultiVideoConcatDataset`` to the
+  # ``ThreeFileI2VDataset`` branch, so ``data_path`` is no longer required
+  # — we keep it as a harmless placeholder just for logging.
   data_path: (unused; three-file i2v mode)
   image_or_video_shape:
   - 1
@@ -58,7 +84,7 @@ data:
 
 inference:
   sampling_steps: 50
-  sink_size: 4
+  sink_size: 4                     # must match model_kwargs.sink_size
   guidance_scale: 3.0
   multi_shot_sink: true
   multi_shot_rope_offset: 8
@@ -69,17 +95,30 @@ inference:
   vae_device: "cuda:2"
 
   # ---- Default: shared sana_dsl three-file set (active) ----
+  # ``inference.py`` reads:
+  #   * ``trajectory_path`` -> rolled out to per-frame c2w by
+  #     ``utils.sana_camera_control.action_string_to_c2w`` for
+  #     ``sana_dsl`` (or DreamX's action DSL for ``dreamx_action_dsl``),
+  #     then converted via ``utils.camera_dataset.build_viewmats_and_Ks``
+  #     into (viewmats, Ks) fed into pipeline.inference so the DreamX
+  #     ``cam_self_attn`` branch sees the trajectory.
+  #   * ``prompt_path``     -> one text prompt per line (paired 1-to-1
+  #     with the trajectory line index).
+  #   * ``image_path``      -> one source-image path per line, VAE-encoded
+  #     into the first latent frame as the AR i2v conditioning.
   trajectory_format: sana_dsl
   prompt_path: prompts/prompts.txt
+  # trajectory_path: prompts/trajectories.txt
   trajectory_path: prompts/trajectories_complex.txt
+  # I2V: one source-image path per line, aligned 1-to-1 with prompts/trajectories.
   image_path: prompts/images.txt
 
   ### action overlay
   action_overlay: true
-  overlay_corner: bottom-left
+  overlay_corner: bottom-left  # 可选，默认 bottom-left
 
 checkpoints:
-  generator_ckpt: logs/train_dreamx_camera_i2v_ar_infmem_b300/checkpoint_model_003000/model.pt
+  generator_ckpt: logs/train_dreamx_camera_i2v_ar_infmem_b300/checkpoint_model_000600/model.pt
   lora_ckpt: null
 
 logging:
