@@ -455,9 +455,13 @@ def _block_infmem_forward(
     temporal_offset=0.0,
     # infmem-only kwarg
     memory_kv=None,
+    # DreamX camera kwarg
+    prope_meta=None,
 ):
     """Mirror of :meth:`CausalWanAttentionBlock.forward`, but plumbs
-    ``memory_kv`` down to the (patched) self-attn forward.
+    ``memory_kv`` down to the (patched) self-attn forward AND executes the
+    DreamX ``cam_self_attn`` parallel camera branch when ``prope_meta`` is
+    provided.
     """
     num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
     e_mod = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -491,6 +495,22 @@ def _block_infmem_forward(
         cache_update_info = None
 
     x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e_mod[2]).flatten(1, 2)
+
+    # ----- Optional DreamX-style parallel PRoPE self-attn -----
+    # Active iff (a) ``add_dreamx_cam_self_attn`` was called on this model
+    # and (b) the caller supplied viewmats/Ks via ``prope_meta``.
+    # Uses the SAME modulated_x and the SAME AdaLN gate e_mod[2] as the
+    # native CausalWanAttentionBlock — no new untrained gates introduced.
+    if (getattr(self, "cam_self_attn", None) is not None
+            and prope_meta is not None):
+        cam_emb = {
+            "viewmats": prope_meta["viewmats"],
+            "K": prope_meta.get("Ks", None),
+        }
+        y_cam = self.cam_self_attn(
+            modulated_x, cam_emb, seq_lens=seq_lens, block_mask=block_mask
+        )
+        x = x + (y_cam.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e_mod[2]).flatten(1, 2)
 
     # cross-attention + FFN (identical to stock)
     if _CURRENT_GRID_META and "frame_seqlen" in _CURRENT_GRID_META:
@@ -540,6 +560,8 @@ def _model_forward_inference_infmem(
     cache_start=0,
     defer_cache_updates=False,
     update_memory=True,
+    viewmats=None,
+    Ks=None,
 ):
     """Replacement for :meth:`CausalWanModel._forward_inference` that:
       1. Fetches memory KV from the (external) ``query_memory_encoder`` and
@@ -595,6 +617,33 @@ def _model_forward_inference_infmem(
         ])
     )
 
+    # ---- Build PRoPE meta (if camera info provided) ----
+    # Mirrors CausalWanModel._forward_inference exactly so DreamX cam_self_attn
+    # receives the same prope_meta dict structure it expects.
+    prope_meta = None
+    if viewmats is not None:
+        viewmats = viewmats.to(device=device)
+        if Ks is not None:
+            Ks = Ks.to(device=device)
+        f_lat = int(grid_sizes[0, 0].item())
+        h_lat = int(grid_sizes[0, 1].item())
+        w_lat = int(grid_sizes[0, 2].item())
+        assert viewmats.shape[1] == f_lat, (
+            f"viewmats has {viewmats.shape[1]} camera frames but latent grid has "
+            f"{f_lat} frames; camera and VAE latent time axes must match."
+        )
+        if Ks is not None:
+            assert Ks.shape[1] == f_lat, (
+                f"Ks has {Ks.shape[1]} camera frames but latent grid has {f_lat}."
+            )
+        prope_meta = {
+            "viewmats": viewmats,
+            "Ks": Ks,
+            "F": f_lat,
+            "H": h_lat,
+            "W": w_lat,
+        }
+
     # ---------- INFMEM: pull memory KV once per chunk ---------------------
     frame_seqlen = _CURRENT_GRID_META["frame_seqlen"]
     enc = getattr(self, "query_memory_encoder", None)
@@ -632,6 +681,7 @@ def _model_forward_inference_infmem(
         method=self.rope_method,
         original_seq_len=self.original_seq_len,
         temporal_offset=self.rope_temporal_offset,
+        prope_meta=prope_meta,
     )
 
     def create_custom_forward(module):

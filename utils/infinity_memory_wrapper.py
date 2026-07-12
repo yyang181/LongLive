@@ -93,6 +93,58 @@ def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
     return _EncoderConfig(**defaults)
 
 
+def _attach_infmem_to_wrapper(
+    wrapper: Any,
+    *,
+    enable_relative_rope: bool = False,
+    relative_rope_pmax: int = 24,
+    memory_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Attach InfMem monkey-patches + QueryMemoryEncoder to *wrapper*.
+
+    This is the shared init logic used by both:
+      * :class:`InfMemWanDiffusionWrapper` (plain Wan I2V AR)
+      * :class:`DreamXInfMemWanDiffusionWrapper` (DreamX Camera I2V AR)
+
+    It must be called AFTER the base wrapper has created ``wrapper.model``
+    (including any ``cam_self_attn`` submodules), so the monkey-patch is
+    applied on top of the final model structure.
+
+    The function is idempotent and safe to call on models that already have
+    ``cam_self_attn`` (DreamX) — the InfMem patch only replaces
+    ``block.forward`` / ``self_attn.forward`` / ``model._forward_inference``,
+    and the patched block forward checks ``getattr(self, "cam_self_attn", None)``
+    at runtime.
+    """
+    # Idempotent monkey-patch: block/self-attn/model.forward_inference
+    # gain a memory_kv-aware branch. When enable_relative_rope=False and
+    # query_memory_encoder is None, the patched forward falls back to the
+    # original code path.
+    attach_infmem(
+        wrapper.model,
+        relative_rope=enable_relative_rope,
+        relative_rope_pmax=int(relative_rope_pmax),
+        num_frame_per_block_attr=int(getattr(wrapper.model, "num_frame_per_block", 8)),
+    )
+
+    # Encoder: mounted via object.__setattr__ so FSDP does not pull the
+    # encoder parameters into the wrapped model's flat_param buffer. The
+    # trainer must recognise this attribute and build a separate
+    # optimizer param group; see ``model.diffusion._initialize_models``.
+    if memory_kwargs is not None:
+        enc_cfg = _make_encoder_config(memory_kwargs)
+        encoder = QueryMemoryEncoder(enc_cfg)
+        object.__setattr__(wrapper.model, "query_memory_encoder", encoder)
+        object.__setattr__(wrapper, "query_memory_encoder", encoder)
+    else:
+        object.__setattr__(wrapper.model, "query_memory_encoder", None)
+        object.__setattr__(wrapper, "query_memory_encoder", None)
+
+    # Reset the per-window bookkeeping used by the Relative-RoPE
+    # heuristic in ``_self_attn_infmem_forward``.
+    object.__setattr__(wrapper.model, "_ei_prev_window_start", None)
+
+
 class InfMemWanDiffusionWrapper(WanDiffusionWrapper):
     """Wan2.2-TI2V-5B wrapper with Echo-Infinity memory + Relative RoPE.
 
@@ -124,37 +176,12 @@ class InfMemWanDiffusionWrapper(WanDiffusionWrapper):
     ) -> None:
         super().__init__(*args, **kwargs)
 
-        # Idempotent monkey-patch: block/self-attn/model.forward_inference
-        # gain a memory_kv-aware branch. When enable_relative_rope=False and
-        # query_memory_encoder is None, the patched forward falls back to the
-        # original code path.
-        attach_infmem(
-            self.model,
-            relative_rope=enable_relative_rope,
-            relative_rope_pmax=int(relative_rope_pmax),
-            num_frame_per_block_attr=int(getattr(self.model, "num_frame_per_block", 8)),
+        _attach_infmem_to_wrapper(
+            self,
+            enable_relative_rope=enable_relative_rope,
+            relative_rope_pmax=relative_rope_pmax,
+            memory_kwargs=memory_kwargs,
         )
-
-        # Encoder: mounted via object.__setattr__ so FSDP does not pull the
-        # encoder parameters into the wrapped model's flat_param buffer. The
-        # trainer must recognise this attribute and build a separate
-        # optimizer param group; see ``model.diffusion._initialize_models``.
-        if memory_kwargs is not None:
-            enc_cfg = _make_encoder_config(memory_kwargs)
-            encoder = QueryMemoryEncoder(enc_cfg)
-            # Match the dtype/device of the main model at build time. FSDP
-            # will not shard this module (it's not a real submodule), so the
-            # trainer must move it to the correct device/dtype itself if it
-            # relocates the wrapper afterwards.
-            object.__setattr__(self.model, "query_memory_encoder", encoder)
-            object.__setattr__(self, "query_memory_encoder", encoder)
-        else:
-            object.__setattr__(self.model, "query_memory_encoder", None)
-            object.__setattr__(self, "query_memory_encoder", None)
-
-        # Reset the per-window bookkeeping used by the Relative-RoPE
-        # heuristic in ``_self_attn_infmem_forward``.
-        object.__setattr__(self.model, "_ei_prev_window_start", None)
 
     # ------------------------------------------------------------------
     # Convenience accessors

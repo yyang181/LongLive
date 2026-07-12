@@ -1,0 +1,86 @@
+# Inference config for DreamX Camera I2V AR + Echo-Infinity Memory — Wan2.2-TI2V-5B.
+# Set checkpoints.generator_ckpt to the AR+InfMem checkpoint produced by
+# configs/train_dreamx_camera_i2v_ar_infmem.yaml.
+
+model_kwargs:
+  wrapper_cls: utils.dreamx_infmem_wrapper.DreamXInfMemWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+  local_attn_size: 32
+  sink_size: 4
+  attn_compress: 1
+  qk_norm: true
+
+  # --- Relative-RoPE (must match training config) ---
+  enable_relative_rope: true
+  relative_rope_pmax: 48
+
+  # --- Query-Memory Encoder (must match training config) ---
+  memory_kwargs:
+    dim: 3072
+    num_heads: 24
+    num_layers: 30
+    tokens_per_frame: 880
+    Q_frames: 8
+    M_tokens_per_frame: 32
+    num_query_groups: 1
+    bptt_clips: 2
+    encoder_lr_multiplier: 5.0
+    use_sink_anchor: true
+    use_batch_update: false
+    use_residual_update: true
+    use_post_norm: true
+    use_vib: false
+    vib_kl_weight: 1.0e-4
+    init_scale: 0.02
+
+algorithm:
+  causal: true
+  i2v: true
+  independent_first_frame: true
+  use_camera: true
+
+use_ema: false
+output_folder: videos/dreamx_camera_i2v_ar_infmem
+num_samples: 1
+save_latents_only: false
+save_with_index: true
+
+data:
+  data_path: (unused; three-file i2v mode)
+  image_or_video_shape:
+  - 1
+  - 128
+  - 48
+  - 44
+  - 80
+
+inference:
+  sampling_steps: 50
+  sink_size: 4
+  guidance_scale: 3.0
+  multi_shot_sink: true
+  multi_shot_rope_offset: 8
+  independent_first_frame: true
+  streaming_vae: false
+  async_vae: false
+  vae_type: wan
+  vae_device: "cuda:2"
+
+  # ---- Default: shared sana_dsl three-file set (active) ----
+  trajectory_format: sana_dsl
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories_complex.txt
+  image_path: prompts/images.txt
+
+  ### action overlay
+  action_overlay: true
+  overlay_corner: bottom-left
+
+checkpoints:
+  generator_ckpt: logs/train_dreamx_camera_i2v_ar_infmem_b300/checkpoint_model_003000/model.pt
+  lora_ckpt: null
+
+logging:
+  seed: 0

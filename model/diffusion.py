@@ -220,12 +220,17 @@ class CausalDiffusion(BaseModel):
         timestep,
         timestep_clean_aug,
         conditional_dict,
+        viewmats=None,
+        Ks=None,
     ):
         """Streaming teacher-forcing path for Echo-Infinity memory training.
 
         The prediction forward reads the clean context cache and memory but does
         not mutate either. A second clean-context forward then advances the KV
         cache and QueryMemoryEncoder state for subsequent chunks.
+
+        Camera tensors (viewmats/Ks) are sliced per-chunk to match the latent
+        chunk's frame dimension and passed to every generator forward.
         """
         batch_size, num_frame, _, height, width = noisy_latents.shape
         frame_seq_length = (height * width) // 4
@@ -242,6 +247,7 @@ class CausalDiffusion(BaseModel):
             timestep_clean_aug = torch.zeros_like(timestep)
 
         flow_chunks = []
+        x0_pred_chunks = []
         chunk_count = 0
         for block_index, start in enumerate(range(0, num_frame, self.num_frame_per_block)):
             end = min(start + self.num_frame_per_block, num_frame)
@@ -252,7 +258,16 @@ class CausalDiffusion(BaseModel):
 
             noisy_chunk = noisy_latents[:, start:end]
             timestep_chunk = timestep[:, start:end]
-            flow_pred, _ = self.generator(
+
+            # Slice camera tensors to match this chunk's frame range.
+            chunk_viewmats = (
+                viewmats[:, start:end] if viewmats is not None else None
+            )
+            chunk_Ks = (
+                Ks[:, start:end] if Ks is not None else None
+            )
+
+            flow_pred, x0_pred = self.generator(
                 noisy_image_or_video=noisy_chunk,
                 conditional_dict=block_cond,
                 timestep=timestep_chunk,
@@ -262,8 +277,11 @@ class CausalDiffusion(BaseModel):
                 defer_cache_updates=True,
                 update_memory=False,
                 apply_cache_updates=False,
+                viewmats=chunk_viewmats,
+                Ks=chunk_Ks,
             )
             flow_chunks.append(flow_pred)
+            x0_pred_chunks.append(x0_pred)
 
             clean_chunk = clean_latent_aug[:, start:end]
             clean_timestep_chunk = timestep_clean_aug[:, start:end]
@@ -275,12 +293,14 @@ class CausalDiffusion(BaseModel):
                 crossattn_cache=crossattn_cache,
                 current_start=start * frame_seq_length,
                 update_memory=True,
+                viewmats=chunk_viewmats,
+                Ks=chunk_Ks,
             )
             chunk_count += 1
             if maybe_detach_infmem is not None:
                 maybe_detach_infmem(self.generator, chunk_count)
 
-        return torch.cat(flow_chunks, dim=1), None
+        return torch.cat(flow_chunks, dim=1), torch.cat(x0_pred_chunks, dim=1)
 
     def generator_loss(
         self,
@@ -458,6 +478,8 @@ class CausalDiffusion(BaseModel):
                 timestep=timestep,
                 timestep_clean_aug=timestep_clean_aug,
                 conditional_dict=conditional_dict,
+                viewmats=viewmats,
+                Ks=Ks,
             )
         else:
             flow_pred, x0_pred = self.generator(

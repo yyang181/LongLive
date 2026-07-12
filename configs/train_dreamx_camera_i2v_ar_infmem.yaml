@@ -1,0 +1,134 @@
+# DreamX Camera I2V AR + Echo-Infinity Memory + Relative RoPE
+# ---------------------------------------------------------------------------
+# Baseline: configs/train_dreamx_camera_i2v_ar.yaml (NOT train_i2v_ar_infmem.yaml)
+#
+# This config preserves the full DreamX Camera AR setup (camera dataset,
+# cam_self_attn, E-PRoPE, causal AR, I2V first-frame conditioning) and adds:
+#   1. Echo-Infinity QueryMemoryEncoder (memory KV distilled from evicted KV)
+#   2. Relative RoPE for content self-attention (sink|memory|local|Q layout)
+#   3. Streaming teacher-forcing training (infmem_streaming_training)
+#
+# The wrapper_cls dispatches to DreamXInfMemWanDiffusionWrapper which:
+#   - Inherits from DreamXCameraWanDiffusionWrapper (causal model + cam_self_attn)
+#   - Attaches InfMem monkey-patches on top of the camera-aware blocks
+#   - Creates QueryMemoryEncoder mounted via object.__setattr__ (FSDP-safe)
+#
+# Initialization: from a trained Bidirectional DreamX Camera I2V checkpoint.
+
+infra:
+  sequence_parallel_size: 1  # InfMem streaming requires SP=1
+  sharding_strategy: hybrid_full
+  mixed_precision: true
+  gradient_checkpointing: true
+  vae_halo_latents: 28
+  generator_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+
+# Passed directly to DreamXInfMemWanDiffusionWrapper(**model_kwargs, is_causal=True).
+model_kwargs:
+  wrapper_cls: utils.dreamx_infmem_wrapper.DreamXInfMemWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+  local_attn_size: 32
+  sink_size: 4
+
+  # --- DreamX camera branch (must match bidirectional checkpoint) ---
+  attn_compress: 1
+  qk_norm: true
+
+  # --- Relative-RoPE (Echo-Infinity for content self-attention) ---
+  enable_relative_rope: true
+  # pmax must cover sink + active local + memory + query frames.
+  # sink=4, local_attn_size=32, Q_frames=8, block=4 → 48 is safe.
+  relative_rope_pmax: 48
+
+  # --- Query-Memory Encoder (Echo-Infinity 5B recipe) ---
+  memory_kwargs:
+    dim: 3072
+    num_heads: 24
+    num_layers: 30
+    tokens_per_frame: 880          # 22 * 40 grid for 1280x704 latent
+    Q_frames: 8
+    M_tokens_per_frame: 32
+    num_query_groups: 1
+    bptt_clips: 2
+    encoder_lr_multiplier: 5.0
+    use_sink_anchor: true
+    use_batch_update: false
+    use_residual_update: true
+    use_post_norm: true
+    use_vib: false
+    vib_kl_weight: 1.0e-4
+    init_scale: 0.02
+
+# I2V AR diffusion objective.
+algorithm:
+  trainer: diffusion
+  i2v: true
+  causal: true
+  teacher_forcing: true
+  independent_first_frame: true
+  num_train_timestep: 1000
+  denoising_loss_type: flow
+
+training:
+  lr: 1.0e-05
+  weight_decay: 0.0
+  beta1: 0.0
+  beta2: 0.999
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  ema_weight: 0.99
+  ema_start_step: 100
+  log_iters: 10
+  max_checkpoints: 3
+  max_iters: 9999999999990000
+  gc_interval: 100
+  infmem_streaming_training: true
+  encoder_lr_multiplier: 5.0
+  error_recycling:
+    enabled: true
+    num_buckets: 50
+    buffer_size_per_bucket: 500
+    buffer_warmup_iter: 50
+    context_inject_prob: 0.9
+    latent_inject_prob: 0.9
+    noise_inject_prob: 0.01
+    clean_prob: 0.2
+    clean_buffer_update_prob: 0.1
+    modulate_factor: 0.3
+    start_step: 0
+    replacement_strategy: random
+
+# Initialization: set to a trained Bidirectional DreamX Camera I2V checkpoint.
+checkpoints:
+  generator_ckpt: null
+
+data:
+  data_path: data/train/minWM-data/data
+  image_or_video_shape: [1, 20, 48, 44, 80]
+  load_raw_video: true
+
+# Generation settings used by training-time evaluation.
+inference:
+  sampling_steps: 50
+  sink_size: 4
+  multi_shot_sink: true
+  multi_shot_rope_offset: 8
+  guidance_scale: 3.0
+  independent_first_frame: true
+  negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+evaluation:
+  interval: 0
+  num_frames: 32
+  use_ema: true
+  val_batch_size: 1
+  save_latents_only: true
+
+logging:
+  seed: 0
+  wandb_key: null
+  wandb_entity: null
+  wandb_project: LongLive-DreamXCamera-I2V-AR-InfMem
