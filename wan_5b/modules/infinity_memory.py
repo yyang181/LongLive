@@ -724,45 +724,58 @@ def _model_forward_inference_infmem(
         and enc is not None
         and update_memory
     ):
-        try:
-            last_block_idx = cache_update_infos[-1][0]
-            last_update_info = cache_update_infos[-1][1]
-            update_dict = last_update_info[2] if len(last_update_info) > 2 else None
+        last_block_idx = cache_update_infos[-1][0]
+        last_update_info = cache_update_infos[-1][1]
+        update_dict = last_update_info[2] if len(last_update_info) > 2 else None
 
-            sink_frames = self.blocks[0].self_attn.sink_size
-            sink_tok = sink_frames * frame_seqlen
-            max_attn = self.blocks[0].self_attn.max_attention_size
-            recent_window_frames = (max_attn - sink_tok) // frame_seqlen
-            current_end_tok = last_update_info[0]
-            num_new_frames = (current_end_tok - current_start) // frame_seqlen
-            current_end_frame = current_start // frame_seqlen + num_new_frames
+        sink_frames = self.blocks[0].self_attn.sink_size
+        sink_tok = sink_frames * frame_seqlen
+        max_attn = self.blocks[0].self_attn.max_attention_size
+        recent_window_frames = (max_attn - sink_tok) // frame_seqlen
+        current_end_tok = last_update_info[0]
+        num_new_frames = (current_end_tok - current_start) // frame_seqlen
+        current_end_frame = current_start // frame_seqlen + num_new_frames
 
-            oldest_recent_frame = max(sink_frames, current_end_frame - recent_window_frames)
-            prev_oldest = (
-                self._ei_prev_window_start
-                if self._ei_prev_window_start is not None else sink_frames
-            )
-            num_exited_frames = max(0, oldest_recent_frame - prev_oldest)
-            self._ei_prev_window_start = oldest_recent_frame
+        oldest_recent_frame = max(sink_frames, current_end_frame - recent_window_frames)
+        prev_oldest = (
+            self._ei_prev_window_start
+            if self._ei_prev_window_start is not None else sink_frames
+        )
+        num_exited_frames = max(0, oldest_recent_frame - prev_oldest)
+        self._ei_prev_window_start = oldest_recent_frame
 
-            if num_exited_frames > 0:
-                num_exited_tokens = num_exited_frames * frame_seqlen
-                if update_dict is not None and update_dict.get("action") == "roll_and_insert":
-                    capture_start = sink_tok
-                else:
-                    capture_start = prev_oldest * frame_seqlen
+        # Track total evicted frames for post-training validation.
+        prev_total = getattr(self, "_ei_total_evicted_frames", 0)
+        object.__setattr__(self, "_ei_total_evicted_frames", prev_total + num_exited_frames)
 
-                cache_blk = kv_cache[last_block_idx]
-                exited_k = cache_blk["k"][:, capture_start:capture_start + num_exited_tokens].clone()
-                exited_v = cache_blk["v"][:, capture_start:capture_start + num_exited_tokens].clone()
-                sink_k = cache_blk["k"][:, :sink_tok].clone() if sink_tok > 0 else None
-                sink_v = cache_blk["v"][:, :sink_tok].clone() if sink_tok > 0 else None
-                enc.update(exited_k, exited_v, sink_k, sink_v)
-        except Exception as exc:
-            # Never let memory-update failures crash the forward pass; log once.
-            if not getattr(self, "_ei_update_error_logged", False):
-                print(f"[InfMem][warn] encoder.update failed: {exc}", flush=True)
-                self._ei_update_error_logged = True
+        if num_exited_frames > 0:
+            num_exited_tokens = num_exited_frames * frame_seqlen
+            if update_dict is not None and update_dict.get("action") == "roll_and_insert":
+                capture_start = sink_tok
+            else:
+                capture_start = prev_oldest * frame_seqlen
+
+            cache_blk = kv_cache[last_block_idx]
+            exited_k = cache_blk["k"][:, capture_start:capture_start + num_exited_tokens].clone()
+            exited_v = cache_blk["v"][:, capture_start:capture_start + num_exited_tokens].clone()
+            sink_k = cache_blk["k"][:, :sink_tok].clone() if sink_tok > 0 else None
+            sink_v = cache_blk["v"][:, :sink_tok].clone() if sink_tok > 0 else None
+
+            # Use CUDA BF16 autocast for encoder update — encoder stays FP32
+            # but the update computation runs in bf16 for speed.
+            strict_update = getattr(self, "_ei_strict_update", True)
+            try:
+                with torch.autocast(device_type=exited_k.device.type, dtype=torch.bfloat16):
+                    enc.update(exited_k, exited_v, sink_k, sink_v)
+            except Exception as exc:
+                if strict_update:
+                    raise RuntimeError(
+                        f"[InfMem] encoder.update() failed (strict_update=True): {exc}"
+                    ) from exc
+                # Non-strict: log once and continue.
+                if not getattr(self, "_ei_update_error_logged", False):
+                    print(f"[InfMem][warn] encoder.update failed: {exc}", flush=True)
+                    self._ei_update_error_logged = True
 
     if kv_cache is not None and cache_update_infos and not defer_cache_updates:
         self._apply_cache_updates(kv_cache, cache_update_infos)
@@ -833,6 +846,9 @@ def attach_infmem(
         object.__setattr__(model, "query_memory_encoder", None)
     if not hasattr(model, "_ei_prev_window_start"):
         model._ei_prev_window_start = None
+    if not hasattr(model, "_ei_total_evicted_frames"):
+        model._ei_total_evicted_frames = 0
+    model._ei_strict_update = True
 
     _reset_log_flags()
 

@@ -522,6 +522,49 @@ if has_lora_adapter:
 elif merge_lora and local_rank == 0:
     print("merge_lora=True requested but no adapter config was found; continuing without LoRA merge")
 
+# Load query_memory_encoder before deleting checkpoint (InfMem combined path).
+_infmem_enc_loaded = False
+if isinstance(generator_checkpoint, dict) and "query_memory_encoder" in generator_checkpoint:
+    from utils.infinity_memory_hooks import get_infmem_encoder
+    _enc = get_infmem_encoder(pipeline.generator)
+    if _enc is not None:
+        enc_state = generator_checkpoint["query_memory_encoder"]
+        _enc.load_state_dict(enc_state, strict=True)
+        # Move to inference device but keep FP32.
+        _enc.to(device=device)
+        _enc.eval()
+        _enc.requires_grad_(False)
+        # Print loading summary.
+        n_loaded = len(enc_state)
+        n_params = sum(p.numel() for p in _enc.parameters())
+        enc_dtype = next(_enc.parameters()).dtype
+        enc_device = next(_enc.parameters()).device
+        # Checksum for verification.
+        checksum = sum(v.float().sum().item() for v in enc_state.values())
+        if local_rank == 0:
+            print(
+                f"[InfMem] Loaded query_memory_encoder for inference: "
+                f"tensors={n_loaded}, params={n_params:,}, "
+                f"dtype={enc_dtype}, device={enc_device}, "
+                f"checksum={checksum:.4f}",
+                flush=True,
+            )
+        _infmem_enc_loaded = True
+    else:
+        if local_rank == 0:
+            print("[InfMem][WARN] query_memory_encoder in checkpoint but no encoder "
+                  "attached to pipeline — ignoring.")
+elif isinstance(generator_checkpoint, dict):
+    # Check if the wrapper has an encoder but the checkpoint doesn't.
+    from utils.infinity_memory_hooks import get_infmem_encoder
+    _enc = get_infmem_encoder(pipeline.generator)
+    if _enc is not None and "query_memory_encoder" not in generator_checkpoint:
+        raise RuntimeError(
+            "Pipeline has a QueryMemoryEncoder but the checkpoint does not "
+            "contain 'query_memory_encoder' weights. Refusing to use a "
+            "randomly-initialized encoder for inference."
+        )
+
 del generator_checkpoint
 
 

@@ -146,10 +146,14 @@ class CausalDiffusion(BaseModel):
         self.generator.model.requires_grad_(True)
         # If the wrapper attached an Echo-Infinity memory encoder, make sure
         # its parameters are trainable too (they live outside FSDP flat-params
-        # thanks to object.__setattr__ in InfMemWanDiffusionWrapper).
+        # thanks to object.__setattr__). Encoder stays FP32 — do NOT cast.
         _encoder = getattr(self.generator.model, "query_memory_encoder", None)
         if _encoder is not None:
             _encoder.requires_grad_(True)
+            # Enforce FP32 for encoder parameters.
+            _encoder = _encoder.float()
+            object.__setattr__(self.generator.model, "query_memory_encoder", _encoder)
+            object.__setattr__(self.generator, "query_memory_encoder", _encoder)
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -298,7 +302,10 @@ class CausalDiffusion(BaseModel):
             )
             chunk_count += 1
             if maybe_detach_infmem is not None:
-                maybe_detach_infmem(self.generator, chunk_count)
+                maybe_detach_infmem(
+                    self.generator, chunk_count,
+                    kv_cache=kv_cache, crossattn_cache=crossattn_cache,
+                )
 
         return torch.cat(flow_chunks, dim=1), torch.cat(x0_pred_chunks, dim=1)
 

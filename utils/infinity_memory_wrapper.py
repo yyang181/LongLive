@@ -57,7 +57,7 @@ def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
         # --- structural (must match Wan2.2-TI2V-5B) ---
         "hidden_dim": 3072,
         "num_heads": 24,
-        "n_encoder_layers": 30,
+        "n_encoder_layers": 2,
         "head_dim": 128,
         "tokens_per_frame": 880,          # 22 * 40 for 1280x704 latent
         # --- memory sizing ---
@@ -132,8 +132,41 @@ def _attach_infmem_to_wrapper(
     # trainer must recognise this attribute and build a separate
     # optimizer param group; see ``model.diffusion._initialize_models``.
     if memory_kwargs is not None:
+        mk = dict(memory_kwargs)
+        # Conflict check: if both ``num_layers`` and ``n_encoder_layers`` are
+        # present with different values, the user may have a stale config.
+        if "num_layers" in mk and "n_encoder_layers" in mk:
+            if int(mk["num_layers"]) != int(mk["n_encoder_layers"]):
+                raise ValueError(
+                    f"memory_kwargs contains both 'num_layers'={mk['num_layers']} "
+                    f"and 'n_encoder_layers'={mk['n_encoder_layers']} with "
+                    f"different values. Remove the deprecated 'num_layers' key."
+                )
         enc_cfg = _make_encoder_config(memory_kwargs)
         encoder = QueryMemoryEncoder(enc_cfg)
+
+        # Print layer count and parameter count.
+        n_enc_layers = int(getattr(encoder, "layers", None) and len(encoder.layers) or getattr(enc_cfg, "n_encoder_layers", 0))
+        n_params = sum(p.numel() for p in encoder.parameters())
+        _MAX_ENCODER_PARAMS = 300_000_000
+        print(
+            f"[InfMem] QueryMemoryEncoder created: "
+            f"n_encoder_layers={n_enc_layers}, "
+            f"params={n_params:,} ({n_params / 1e6:.2f}M)",
+            flush=True,
+        )
+        if n_params > _MAX_ENCODER_PARAMS:
+            raise ValueError(
+                f"QueryMemoryEncoder parameter count ({n_params:,}) exceeds "
+                f"the maximum allowed ({_MAX_ENCODER_PARAMS:,}). Reduce "
+                f"n_encoder_layers or hidden_dim in memory_kwargs."
+            )
+
+        # Enforce FP32 for encoder parameters. The encoder lives outside FSDP
+        # and must NOT be cast to bf16 permanently — autocast handles mixed
+        # precision at compute time.
+        encoder = encoder.float()
+
         object.__setattr__(wrapper.model, "query_memory_encoder", encoder)
         object.__setattr__(wrapper, "query_memory_encoder", encoder)
     else:
