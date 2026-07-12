@@ -76,6 +76,19 @@ class Trainer:
         self.config = config
         self.step = 0
 
+        # ------------------------------------------------------------------
+        # InfMem combined-training state. Declared HERE, before any checkpoint
+        # logic, so checkpoint loading never touches an undeclared
+        # ``self.infmem_optimizer``. The optimizer is created later (after FSDP
+        # wrap); combined-resume optimizer state is stashed in the pending
+        # slots and restored only after the optimizer object exists.
+        # ------------------------------------------------------------------
+        self.infmem_optimizer = None
+        self._pending_infmem_optimizer_state = None
+        self._pending_infmem_optimizer_meta = None
+        self._is_infmem_combined = False
+        self.infmem_ema = None
+
         # Step 1: Initialize the distributed training environment (rank, seed, dtype, logging etc.)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -88,6 +101,15 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+
+        # Detect the combined DreamX+InfMem wrapper based on the real wrapper
+        # class string so cold-start vs combined-resume can be distinguished.
+        _wrapper_cls = str(getattr(getattr(config, "model_kwargs", None), "wrapper_cls", ""))
+        self._is_infmem_combined = (
+            _wrapper_cls
+            == "utils.dreamx_infmem_wrapper."
+               "DreamXInfMemWanDiffusionWrapper"
+        )
 
         # use a random seed for the training
         if config.seed == 0:
@@ -300,10 +322,31 @@ class Trainer:
             if self.is_main_process:
                 print(f"Using explicit checkpoint (cold start): {checkpoint_path}")
 
+        # Cold-start safety: the combined DreamX+InfMem wrapper REQUIRES a
+        # trained camera checkpoint. Refuse to start from random camera
+        # weights.
+        if (
+            self._is_infmem_combined
+            and checkpoint_path is None
+            and not (auto_resume and self.output_path)
+        ):
+            raise RuntimeError(
+                "DreamX Camera I2V AR + InfMem cold start requires a trained "
+                "Bidirectional DreamX Camera I2V or DreamX Camera AR checkpoint. "
+                "Set checkpoints.generator_ckpt or provide it through the launch "
+                "override."
+            )
+
         if checkpoint_path:
             if self.is_main_process:
                 print(f"Loading checkpoint from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+            # ---- Save the raw generator state BEFORE loading so we can verify
+            # ---- the checkpoint actually contains cam_self_attn tensors.
+            raw_generator_state = checkpoint.get("generator", checkpoint.get("model", None))
+            if raw_generator_state is None and not ("generator" in checkpoint or "model" in checkpoint):
+                raw_generator_state = checkpoint
 
             if "generator" in checkpoint:
                 if self.is_main_process:
@@ -320,104 +363,154 @@ class Trainer:
                     print(f"No 'generator'/'model' key found in {checkpoint_path}, treating as raw state_dict")
                 self.model.generator.load_state_dict(checkpoint, strict=True)
 
-            if "query_memory_encoder" in checkpoint:
-                try:
-                    from utils.infinity_memory_hooks import load_infmem_state_dict
+            # ---- QueryMemoryEncoder loading: branch cold-start vs combined-resume.
+            allow_partial = bool(getattr(config, "allow_partial_infmem_resume", False))
+            from utils.infinity_memory_hooks import load_infmem_state_dict
+
+            if is_cold_start_ckpt:
+                # Cold start: a combined InfMem checkpoint may legitimately
+                # contain the encoder (loading from a previous combined run).
+                # A non-combined source (bidirectional/AR) will NOT have it,
+                # which is fine — the encoder is freshly initialized.
+                if "query_memory_encoder" in checkpoint:
                     loaded_infmem = load_infmem_state_dict(
                         self.model.generator, checkpoint["query_memory_encoder"], strict=True
                     )
-                    if self.is_main_process:
-                        print(f"Loaded query_memory_encoder: {loaded_infmem}")
-                    del checkpoint["query_memory_encoder"]
-                except Exception as e:
-                    if self.is_main_process:
-                        print(f"Warning: failed to load query_memory_encoder: {e}")
-
-            # Load encoder optimizer (resume only — not for cold start).
-            if not is_cold_start_ckpt and "query_memory_encoder_optimizer" in checkpoint:
-                if self.infmem_optimizer is not None:
-                    try:
-                        self.infmem_optimizer.load_state_dict(
-                            checkpoint["query_memory_encoder_optimizer"]
+                    if not loaded_infmem:
+                        raise RuntimeError(
+                            "Cold-start checkpoint contains 'query_memory_encoder' "
+                            "but no encoder is attached to the wrapper."
                         )
-                        if self.is_main_process:
-                            print("Resuming query_memory_encoder optimizer...")
-                        del checkpoint["query_memory_encoder_optimizer"]
-                    except Exception as e:
-                        allow_partial = getattr(config, "allow_partial_infmem_resume", False)
-                        if allow_partial:
-                            if self.is_main_process:
-                                print(f"Warning: failed to load encoder optimizer (allowed by "
-                                      f"allow_partial_infmem_resume): {e}")
-                        else:
-                            raise RuntimeError(
-                                f"Failed to restore query_memory_encoder optimizer and "
-                                f"allow_partial_infmem_resume is not set: {e}"
-                            ) from e
+                    if self.is_main_process:
+                        print("[InfMem] Cold start: loaded query_memory_encoder from checkpoint.")
+                    del checkpoint["query_memory_encoder"]
                 else:
                     if self.is_main_process:
-                        print("Warning: encoder optimizer in checkpoint but no encoder attached.")
-            elif not is_cold_start_ckpt and self.infmem_optimizer is not None:
-                allow_partial = getattr(config, "allow_partial_infmem_resume", False)
-                if not allow_partial:
-                    raise RuntimeError(
-                        "query_memory_encoder_optimizer not found in checkpoint but "
-                        "encoder is attached. Set allow_partial_infmem_resume=true "
-                        "to allow re-initializing the encoder optimizer."
+                        print("[InfMem] Cold start: no query_memory_encoder in checkpoint "
+                              "(encoder will be freshly initialized).")
+            else:
+                # Combined resume: the encoder MUST be present unless
+                # allow_partial_infmem_resume is set.
+                if "query_memory_encoder" not in checkpoint:
+                    if not allow_partial:
+                        raise RuntimeError(
+                            "Combined InfMem resume checkpoint is missing "
+                            "'query_memory_encoder'. Set allow_partial_infmem_resume=true "
+                            "to allow re-initializing the encoder."
+                        )
+                    if self.is_main_process:
+                        print("[InfMem][WARN] Combined resume: query_memory_encoder missing, "
+                              "re-initializing (allow_partial_infmem_resume=true).")
+                else:
+                    loaded_infmem = load_infmem_state_dict(
+                        self.model.generator, checkpoint["query_memory_encoder"], strict=True
                     )
-                if self.is_main_process:
-                    print("Warning: encoder optimizer not found, re-initializing "
-                          "(allow_partial_infmem_resume=true).")
+                    if not loaded_infmem:
+                        raise RuntimeError(
+                            "Failed to load QueryMemoryEncoder during combined resume."
+                        )
+                    if self.is_main_process:
+                        print("[InfMem] Combined resume: loaded query_memory_encoder.")
+                    del checkpoint["query_memory_encoder"]
+
+            # ---- Encoder optimizer: stash into pending slots (do NOT load now
+            # ---- because self.infmem_optimizer does not exist yet).
+            if not is_cold_start_ckpt:
+                if "query_memory_encoder_optimizer" in checkpoint:
+                    self._pending_infmem_optimizer_state = checkpoint.pop(
+                        "query_memory_encoder_optimizer",
+                        None,
+                    )
+                    self._pending_infmem_optimizer_meta = checkpoint.pop(
+                        "query_memory_encoder_meta",
+                        None,
+                    )
+                    if self.is_main_process:
+                        print("[InfMem] Stashed query_memory_encoder_optimizer state for "
+                              "deferred restore (after optimizer creation).")
+                else:
+                    if not allow_partial:
+                        raise RuntimeError(
+                            "Combined InfMem resume checkpoint is missing "
+                            "'query_memory_encoder_optimizer'. Set "
+                            "allow_partial_infmem_resume=true to allow re-initializing."
+                        )
+                    if self.is_main_process:
+                        print("[InfMem][WARN] Combined resume: query_memory_encoder_optimizer "
+                              "missing, re-initializing (allow_partial_infmem_resume=true).")
 
             gc.collect()
 
             if is_cold_start_ckpt:
                 # Cold start from a different trainer's checkpoint: load model
                 # weights only. Discard optimizer/EMA/step to avoid param-group
-                # size mismatches (e.g. bidirectional freeze → AR full-train).
+                # size mismatches (e.g. bidirectional freeze -> AR full-train).
                 raw_state = None
                 self.step = 0
                 if self.is_main_process:
                     print("Cold start: loaded model weights only, "
                           "optimizer/EMA/step discarded, starting from step 0.")
 
-                # Validate cam_self_attn was loaded for DreamX combined wrapper.
-                try:
-                    from utils.infinity_memory_hooks import resolve_inner_wan_model
-                    inner = resolve_inner_wan_model(self.model.generator)
-                    if inner is not None:
-                        cam_keys_loaded = [
-                            k for k in (checkpoint if isinstance(checkpoint, dict) else {}).get(
-                                "generator", checkpoint if isinstance(checkpoint, dict) else {}
-                            ) if isinstance(k, str) and "cam_self_attn" in k
-                        ] if isinstance(checkpoint, dict) else []
-                        # Re-check from actual model state dict.
-                        model_sd = inner.state_dict()
-                        expected_cam_keys = [k for k in model_sd if "cam_self_attn" in k]
-                        loaded_cam_keys = [k for k in expected_cam_keys if k in model_sd]
-                        if expected_cam_keys and len(loaded_cam_keys) == 0:
-                            raise RuntimeError(
-                                "Cold start checkpoint contains NO cam_self_attn tensors "
-                                f"(expected {len(expected_cam_keys)} keys like "
-                                f"blocks.0.cam_self_attn.*). Cannot start combined "
-                                f"DreamX+InfMem training without bidirectional camera weights."
-                            )
-                        if self.is_main_process and expected_cam_keys:
-                            missing_cam = [
-                                k for k in expected_cam_keys
-                                if inner.state_dict()[k].abs().sum().item() == 0
-                            ]
-                            print(
-                                f"[DreamX] cam_self_attn: "
-                                f"loaded={len(loaded_cam_keys)}/{len(expected_cam_keys)}, "
-                                f"potentially_uninitialized={len(missing_cam)}",
-                                flush=True,
-                            )
-                except RuntimeError:
-                    raise
-                except Exception as e:
+                # ---- Validate cam_self_attn was ACTUALLY loaded from the
+                # ---- checkpoint (using the checkpoint's OWN keys, not the
+                # ---- model's keys). The old logic checked ``k in model_sd``
+                # ---- which is always true for any model-defined key and could
+                # ---- not distinguish a real camera checkpoint from random init.
+                from utils.nvfp4_checkpoint import clean_fsdp_state_dict_keys
+                from utils.infinity_memory_hooks import resolve_inner_wan_model
+                inner = resolve_inner_wan_model(self.model.generator)
+                if inner is not None and raw_generator_state is not None:
+                    normalized_generator_state = clean_fsdp_state_dict_keys(
+                        raw_generator_state
+                    )
+                    # Also strip the "model." wrapper prefix so checkpoint
+                    # keys (model.blocks.0...) align with inner-model keys
+                    # (blocks.0...). This is the canonical normalization used
+                    # for comparing camera tensors.
+                    def _canon_key(k):
+                        k = str(k)
+                        for _pfx in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
+                            k = k.replace(_pfx, "")
+                        # Strip a leading "model." so wrapper-level keys match
+                        # the inner CausalWanModel state_dict keys.
+                        if k.startswith("model."):
+                            k = k[len("model."):]
+                        return k
+
+                    checkpoint_generator_keys = set(
+                        _canon_key(k) for k in normalized_generator_state.keys()
+                    )
+                    checkpoint_cam_keys = {
+                        k for k in checkpoint_generator_keys
+                        if ".cam_self_attn." in k or "cam_self_attn" in k
+                    }
+                    model_cam_keys = {
+                        k for k in inner.state_dict().keys()
+                        if "cam_self_attn" in k
+                    }
+                    missing_cam_keys = model_cam_keys - checkpoint_cam_keys
+                    unexpected_cam_keys = checkpoint_cam_keys - model_cam_keys
+
+                    if self._is_infmem_combined and not checkpoint_cam_keys:
+                        raise RuntimeError(
+                            "Cold-start checkpoint contains no cam_self_attn weights. "
+                            "DreamX Camera I2V AR + InfMem requires a trained camera checkpoint."
+                        )
+                    if missing_cam_keys:
+                        raise RuntimeError(
+                            f"Camera checkpoint incomplete: "
+                            f"missing={len(missing_cam_keys)}, "
+                            f"unexpected={len(unexpected_cam_keys)}"
+                        )
                     if self.is_main_process:
-                        print(f"[DreamX] cam_self_attn validation skipped: {e}")
+                        print(
+                            f"[DreamX] cam_self_attn checkpoint validation: "
+                            f"checkpoint_keys={len(checkpoint_cam_keys)}, "
+                            f"model_expected={len(model_cam_keys)}, "
+                            f"missing={len(missing_cam_keys)}, "
+                            f"unexpected={len(unexpected_cam_keys)}",
+                            flush=True,
+                        )
             else:
                 raw_state = checkpoint
                 if "step" in raw_state:
@@ -448,7 +541,9 @@ class Trainer:
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
         try:
-            from utils.infinity_memory_hooks import move_infmem_encoder
+            from utils.infinity_memory_hooks import (
+                move_infmem_encoder, get_infmem_encoder, broadcast_infmem_params,
+            )
             # Encoder stays FP32 — only move to device, do NOT cast dtype.
             moved_infmem = move_infmem_encoder(
                 self.model.generator,
@@ -456,11 +551,44 @@ class Trainer:
                 dtype=None,
                 force_cast=False,
             )
-            if self.is_main_process and moved_infmem:
-                print("[InfMem] query_memory_encoder moved to training device (FP32 preserved)")
+            if moved_infmem:
+                _enc_check = get_infmem_encoder(self.model.generator)
+                if _enc_check is not None:
+                    # Runtime assertion: encoder parameters MUST stay FP32.
+                    assert all(
+                        p.dtype == torch.float32 for p in _enc_check.parameters()
+                    ), (
+                        "QueryMemoryEncoder parameters must be FP32 but found "
+                        f"{[p.dtype for p in _enc_check.parameters()]}"
+                    )
+                    if self.is_main_process:
+                        n_enc_params = sum(p.numel() for p in _enc_check.parameters())
+                        n_enc_layers = len(getattr(_enc_check, "layers", []))
+                        enc_device = next(_enc_check.parameters()).device
+                        enc_dtype = next(_enc_check.parameters()).dtype
+                        print(
+                            f"[InfMem] query_memory_encoder on device={enc_device}, "
+                            f"dtype={enc_dtype}, layers={n_enc_layers}, "
+                            f"params={n_enc_params:,}"
+                        )
+                    # Broadcast encoder init from rank 0 so all ranks start
+                    # identically (set_seed uses rank-offset seeds, so cold
+                    # start encoders differ across ranks without this).
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        _dp_group = self.dp_group if self.dp_group is not None else None
+                        broadcast_infmem_params(
+                            self.model.generator,
+                            src=0,
+                            group=_dp_group,
+                            verify=True,
+                        )
+                        dist.barrier(group=_dp_group)
+                        if self.is_main_process:
+                            print("[InfMem] encoder parameters broadcast + verified across ranks.")
         except Exception as e:
-            if self.is_main_process:
-                print(f"Warning: failed to move query_memory_encoder: {e}")
+            raise RuntimeError(
+                f"Failed to move/broadcast query_memory_encoder: {e}"
+            ) from e
 
         rename_param = (
             lambda name: name.replace("_fsdp_wrapped_module.", "")
@@ -519,6 +647,72 @@ class Trainer:
                     f"lr={enc_lr:.2e} (base={config.lr:.2e} × {enc_lr_mult}), "
                     f"params={sum(p.numel() for p in _infmem_encoder.parameters() if p.requires_grad):,}"
                 )
+
+            # ---- Deferred encoder-optimizer restore (combined resume only). ----
+            # The optimizer did not exist when the checkpoint was read, so the
+            # state was stashed in ``_pending_infmem_optimizer_state``. Restore
+            # it now that ``self.infmem_optimizer`` is live.
+            if self._pending_infmem_optimizer_state is not None:
+                allow_partial = bool(getattr(config, "allow_partial_infmem_resume", False))
+                try:
+                    self.infmem_optimizer.load_state_dict(
+                        self._pending_infmem_optimizer_state
+                    )
+                    if self.is_main_process:
+                        print("[InfMem] Restored query_memory_encoder optimizer state.")
+                except Exception as exc:
+                    if not allow_partial:
+                        raise RuntimeError(
+                            "Failed to restore QueryMemoryEncoder optimizer."
+                        ) from exc
+                    if self.is_main_process:
+                        print(
+                            "[InfMem][WARN] Reinitializing encoder optimizer because "
+                            "allow_partial_infmem_resume=true."
+                        )
+                # Validate optimizer state.
+                if self.infmem_optimizer is not None:
+                    assert len(self.infmem_optimizer.param_groups) == 1, (
+                        "InfMem optimizer must have exactly 1 param group, "
+                        f"got {len(self.infmem_optimizer.param_groups)}"
+                    )
+                    _n_opt_params = sum(
+                        len(pg["params"]) for pg in self.infmem_optimizer.param_groups
+                    )
+                    _n_enc_trainable = sum(
+                        1 for p in _infmem_encoder.parameters() if p.requires_grad
+                    )
+                    assert _n_opt_params == _n_enc_trainable, (
+                        f"InfMem optimizer param count ({_n_opt_params}) != encoder "
+                        f"trainable param count ({_n_enc_trainable})"
+                    )
+                # Validate checkpoint metadata (architecture consistency).
+                if self._pending_infmem_optimizer_meta is not None and self.is_main_process:
+                    meta = self._pending_infmem_optimizer_meta
+                    saved_n_params = meta.get("n_params")
+                    saved_n_layers = meta.get("n_encoder_layers")
+                    saved_dtype = meta.get("dtype")
+                    cur_n_params = sum(p.numel() for p in _infmem_encoder.parameters())
+                    cur_n_layers = len(getattr(_infmem_encoder, "layers", []))
+                    if saved_n_params is not None and int(saved_n_params) != cur_n_params:
+                        raise RuntimeError(
+                            f"Encoder param count mismatch: checkpoint={saved_n_params}, "
+                            f"current={cur_n_params}"
+                        )
+                    if saved_n_layers is not None and int(saved_n_layers) != cur_n_layers:
+                        raise RuntimeError(
+                            f"Encoder layer count mismatch: checkpoint={saved_n_layers}, "
+                            f"current={cur_n_layers}"
+                        )
+                    if saved_dtype is not None:
+                        if "float32" not in str(saved_dtype):
+                            raise RuntimeError(
+                                f"Encoder dtype mismatch: checkpoint={saved_dtype}, "
+                                f"expected torch.float32"
+                            )
+                # Clear pending state.
+                self._pending_infmem_optimizer_state = None
+                self._pending_infmem_optimizer_meta = None
         else:
             self.generator_optimizer = torch.optim.AdamW(
                 [param for param in self.model.generator.parameters()
@@ -687,6 +881,27 @@ class Trainer:
         # 6. Set up EMA parameter containers
         ema_weight = config.ema_weight
         self.generator_ema = None
+        # EMA safety: generator EMA must not be used with an attached encoder
+        # unless an encoder EMA is also maintained, otherwise the model
+        # silently mixes EMA generator + non-EMA encoder. Until an encoder
+        # EMA is implemented, refuse rather than silently producing a mixed
+        # model. This can be explicitly bypassed with
+        # ``allow_ema_without_encoder_ema``.
+        _has_enc_for_ema = (
+            self.infmem_optimizer is not None
+            or self._pending_infmem_optimizer_state is not None
+        )
+        if (
+            (ema_weight is not None) and (ema_weight > 0.0)
+            and _has_enc_for_ema
+            and not bool(getattr(config, "allow_ema_without_encoder_ema", False))
+        ):
+            raise RuntimeError(
+                "Generator EMA cannot be used with InfMem until "
+                "QueryMemoryEncoder EMA is implemented. Set "
+                "allow_ema_without_encoder_ema=true to explicitly accept a "
+                "mixed EMA/non-EMA model."
+            )
         if (ema_weight is not None) and (ema_weight > 0.0) and (self.step >= config.ema_start_step):
             if self.is_main_process:
                 print(f"Setting up EMA with weight {ema_weight}")
@@ -889,7 +1104,9 @@ class Trainer:
             from utils.infinity_memory_hooks import infmem_state_dict
             query_memory_encoder_state_dict = infmem_state_dict(self.model.generator)
         except Exception as e:
-            print(f"Warning: failed to gather query_memory_encoder state: {e}")
+            raise RuntimeError(
+                f"Failed to gather query_memory_encoder state for checkpoint: {e}"
+            ) from e
 
         if self.config.ema_start_step < self.step and self.generator_ema is not None:
             state_dict = {
@@ -907,24 +1124,55 @@ class Trainer:
         if query_memory_encoder_state_dict is not None:
             state_dict["query_memory_encoder"] = query_memory_encoder_state_dict
 
-        # Save encoder optimizer separately.
+        # Save encoder optimizer separately — strictly CPU-ized + metadata.
         if self.infmem_optimizer is not None:
             try:
-                state_dict["query_memory_encoder_optimizer"] = {
-                    k: v for k, v in self.infmem_optimizer.state_dict().items()
-                }
-                # Metadata for validation on resume.
+                from utils.infinity_memory_hooks import (
+                    recursive_to_cpu, get_infmem_encoder,
+                )
+                state_dict["query_memory_encoder_optimizer"] = recursive_to_cpu(
+                    self.infmem_optimizer.state_dict()
+                )
+                # Metadata for architecture validation on resume.
                 enc = get_infmem_encoder(self.model.generator)
                 if enc is not None:
                     state_dict["query_memory_encoder_meta"] = {
-                        "n_params": sum(p.numel() for p in enc.parameters()),
+                        "num_params": sum(p.numel() for p in enc.parameters()),
+                        "num_trainable_params": sum(
+                            p.numel() for p in enc.parameters() if p.requires_grad
+                        ),
                         "n_encoder_layers": len(getattr(enc, "layers", [])),
-                        "dtype": str(next(enc.parameters()).dtype),
-                        "device": str(next(enc.parameters()).device),
+                        "parameter_dtype": "torch.float32",
+                        "local_attn_size": getattr(
+                            getattr(enc, "blocks", [None])[0] if hasattr(enc, "blocks") else enc,
+                            "local_attn_size", None,
+                        ) if False else getattr(
+                            self.model.generator.model.blocks[0].self_attn
+                            if hasattr(self.model.generator, "model")
+                            else None, "local_attn_size", None
+                        ),
+                        "sink_size": getattr(
+                            self.model.generator.model.blocks[0].self_attn
+                            if hasattr(self.model.generator, "model")
+                            else None, "sink_size", None
+                        ),
+                        "relative_rope_pmax": getattr(
+                            self.model.generator.model, "relative_rope_pmax", None
+                        ) if hasattr(self.model.generator, "model") else None,
+                        "num_frame_per_block": getattr(
+                            self.model.generator.model, "num_frame_per_block_attr", None
+                        ) if hasattr(self.model.generator, "model") else None,
+                        "q_frames": getattr(enc, "Q_frames", None),
+                        "memory_tokens_per_frame": getattr(enc, "M_tokens_per_frame", None),
                     }
             except Exception as e:
-                print(f"Warning: failed to save query_memory_encoder_optimizer: {e}")
+                raise RuntimeError(
+                    f"Failed to save query_memory_encoder_optimizer: {e}"
+                ) from e
 
+        # Only rank 0 writes the final checkpoint file. All ranks participate
+        # in the FSDP gather collectives above, but the torch.save call must
+        # be single-writer to avoid concurrent file corruption.
         checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
         if self.is_main_process:
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1066,13 +1314,15 @@ class Trainer:
             # Sync encoder gradients across DP ranks (last micro-step only).
             if self.infmem_optimizer is not None:
                 from utils.infinity_memory_hooks import sync_infmem_gradients
-                sync_infmem_gradients(self.model.generator, dp_world_size=self.data_parallel_size)
+                _sync_group = self.dp_group if self.dp_group is not None else None
+                sync_infmem_gradients(self.model.generator, group=_sync_group, average=True)
 
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm)
             if self.infmem_optimizer is not None:
                 from utils.infinity_memory_hooks import clip_infmem_grad_norm
-                infmem_grad_norm = clip_infmem_grad_norm(self.model.generator, self.max_grad_norm)
+                _infmem_max_norm = getattr(self.config, "infmem_max_grad_norm", self.max_grad_norm)
+                infmem_grad_norm = clip_infmem_grad_norm(self.model.generator, _infmem_max_norm)
             else:
                 infmem_grad_norm = torch.tensor(0.0, device=self.device)
 
@@ -1212,14 +1462,16 @@ class Trainer:
         # Sync encoder gradients across DP ranks (last micro-step only).
         if self.infmem_optimizer is not None:
             from utils.infinity_memory_hooks import sync_infmem_gradients
-            sync_infmem_gradients(self.model.generator, dp_world_size=self.data_parallel_size)
+            _sync_group = self.dp_group if self.dp_group is not None else None
+            sync_infmem_gradients(self.model.generator, group=_sync_group, average=True)
 
         # Independent gradient clipping.
         generator_grad_norm = self.model.generator.clip_grad_norm_(
             self.max_grad_norm)
         if self.infmem_optimizer is not None:
             from utils.infinity_memory_hooks import clip_infmem_grad_norm
-            infmem_grad_norm = clip_infmem_grad_norm(self.model.generator, self.max_grad_norm)
+            _infmem_max_norm = getattr(self.config, "infmem_max_grad_norm", self.max_grad_norm)
+            infmem_grad_norm = clip_infmem_grad_norm(self.model.generator, _infmem_max_norm)
         else:
             infmem_grad_norm = torch.tensor(0.0, device=self.device)
 

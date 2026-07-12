@@ -79,6 +79,15 @@ training:
   infmem_strict_update: true
   gc_interval: 100
   encoder_lr_multiplier: 5.0
+  # Independent gradient clipping for the encoder (falls back to max_grad_norm).
+  infmem_max_grad_norm: 10.0
+  # Periodic rank-consistency verification of encoder parameters.
+  infmem_verify_sync_interval: 100
+  # Allow partial InfMem resume (re-init encoder/optimizer if missing).
+  allow_partial_infmem_resume: false
+  # Allow generator EMA without encoder EMA (NOT recommended — produces a
+  # mixed EMA/non-EMA model). Defaults to false for safety.
+  allow_ema_without_encoder_ema: true
   error_recycling:
     enabled: true
     num_buckets: 50

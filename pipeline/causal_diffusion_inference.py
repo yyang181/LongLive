@@ -309,20 +309,33 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     self.kv_cache_neg[block_index]["pinned_len"].zero_()
 
         # Echo-Infinity: reset the QueryMemoryEncoder state (if attached) so
-        # each generated video starts with a fresh memory. No-op when the
-        # standard WanDiffusionWrapper is used.
+        # each generated video starts with a fresh memory. Fail-fast: a reset
+        # failure must terminate the video rather than silently carrying over
+        # the previous video's memory state.
+        from utils.infinity_memory_hooks import reset_infmem
         try:
-            from utils.infinity_memory_hooks import reset_infmem
-            reset_infmem(
+            reset_ok = reset_infmem(
                 self.generator,
                 batch_size=batch_size,
                 device=noise.device,
                 dtype=noise.dtype,
             )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to reset QueryMemoryEncoder before inference."
+            ) from exc
+        # When an encoder is expected but reset returns False, the wrapper
+        # configuration is inconsistent — abort rather than risk memory leak.
+        _enc_present = False
+        try:
+            from utils.infinity_memory_hooks import get_infmem_encoder
+            _enc_present = get_infmem_encoder(self.generator) is not None
         except Exception:
-            # Never let memory-reset failures block base inference; log only.
-            import traceback
-            traceback.print_exc()
+            _enc_present = False
+        if _enc_present and not reset_ok:
+            raise RuntimeError(
+                "QueryMemoryEncoder is attached but reset_infmem returned False."
+            )
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -739,6 +752,32 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 self._pin_current_chunk(self.kv_cache_pos, current_num_frames)
                 if use_cfg:
                     self._pin_current_chunk(self.kv_cache_neg, current_num_frames)
+
+            # Step 3.3c: reset InfMem memory state on scene cut (safe default).
+            # The default policy resets the memory encoder, eviction cursor and
+            # diagnostics so memory does not leak across shots. Cross-shot
+            # memory retention is an experimental config and must be explicit.
+            if is_scene_cut and bool(getattr(self.args, "reset_memory_on_scene_cut", True)):
+                from utils.infinity_memory_hooks import reset_infmem, resolve_inner_wan_model
+                try:
+                    _scene_reset_ok = reset_infmem(
+                        self.generator,
+                        batch_size=latents.shape[0],
+                        device=latents.device,
+                        dtype=latents.dtype,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Failed to reset QueryMemoryEncoder on scene cut."
+                    ) from exc
+                if not _scene_reset_ok:
+                    # No encoder attached — nothing to reset.
+                    pass
+                else:
+                    _inner = resolve_inner_wan_model(self.generator)
+                    if _inner is not None:
+                        object.__setattr__(_inner, "_ei_last_evicted_frames", 0)
+                        object.__setattr__(_inner, "_ei_last_evicted_tokens", 0)
 
             if streaming_decode:
                 if async_vae:

@@ -101,6 +101,12 @@ class QueryMemoryEncoder(nn.Module):
         self.num_query_groups = getattr(config, "num_query_groups", 1)
         initializer_range = getattr(config, "initializer_range", 0.014)
 
+        # Validate query-group config up-front (before building submodules).
+        if self.num_query_groups < 1:
+            raise ValueError(
+                f"num_query_groups must be >= 1, got {self.num_query_groups}"
+            )
+
         self.layers = nn.ModuleList([
             MemoryCrossAttentionLayer(hidden_dim, num_heads, ffn_dim, qk_norm, eps)
             for _ in range(n_encoder_layers)

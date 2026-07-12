@@ -46,6 +46,9 @@ output_folder: videos/dreamx_camera_i2v_ar_infmem
 num_samples: 1
 save_latents_only: false
 save_with_index: true
+# If the checkpoint contains query_memory_encoder but the wrapper has no
+# encoder attached, default to fail-fast. Set true to explicitly discard.
+allow_drop_infmem_checkpoint: false
 
 data:
   data_path: (unused; three-file i2v mode)
@@ -67,6 +70,8 @@ inference:
   async_vae: false
   vae_type: wan
   vae_device: "cuda:2"
+  # Reset InfMem memory on scene cut (safe default).
+  reset_memory_on_scene_cut: true
 
   trajectory_format: sana_dsl
   prompt_path: prompts/prompts.txt

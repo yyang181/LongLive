@@ -187,45 +187,73 @@ def maybe_detach_infmem(
 
 def sync_infmem_gradients(
     generator: Any,
-    dp_world_size: int = 1,
+    *,
+    group=None,
+    average: bool = True,
+    dp_world_size: Optional[int] = None,  # deprecated, kept for backward compat
 ) -> None:
     """All-reduce encoder gradients across data-parallel ranks.
 
     Must be called ONLY on the last micro-step of gradient accumulation.
 
-    Handles ``grad is None`` by creating zero gradients on ranks that didn't
-    receive any. Detects NaN/Inf and raises RuntimeError.
+    Two-phase protocol to avoid creating spurious zero gradients:
+      * Phase 1: collect has-grad flags for every trainable parameter via a
+        single all-reduce.
+      * Phase 2: for each parameter, only all-reduce when at least one rank
+        has a gradient. Parameters with no gradient on ANY rank keep
+        ``p.grad is None`` so AdamW does not apply weight decay to them.
     """
-    if not dist.is_initialized() or dist.get_world_size() <= 1:
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
         return
 
     encoder = get_infmem_encoder(generator)
     if encoder is None:
         return
 
-    for p in encoder.parameters():
-        if p.requires_grad:
-            if p.grad is None:
-                # Create a zero gradient so all ranks can participate in the
-                # all-reduce.
-                p.grad = torch.zeros_like(p)
-            else:
-                # Clone to avoid in-place issues after all-reduce.
-                p.grad = p.grad.clone()
+    group_world_size = dist.get_world_size(group)
+    # Backward-compat: if the caller still passes dp_world_size and no group,
+    # honor it as the divisor. Otherwise use the actual group size.
+    divisor = group_world_size
+    if group is None and dp_world_size is not None and dp_world_size > 0:
+        divisor = dp_world_size
 
-            # All-reduce (SUM).
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    params = [p for p in encoder.parameters() if p.requires_grad]
+    if not params:
+        return
 
-            # Average.
-            if dp_world_size > 1:
-                p.grad.div_(dp_world_size)
+    # Determine device for the has-grad flag tensor. Use the encoder's own
+    # parameter device (NOT cuda:{global_rank}) so multi-node is correct.
+    ref_device = next(encoder.parameters()).device
 
-            # Check for NaN / Inf.
-            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                raise RuntimeError(
-                    f"NaN/Inf detected in encoder gradient after sync. "
-                    f"Parameter shape={tuple(p.shape)}"
-                )
+    # Phase 1: collect has-grad flags.
+    local_has_grad = torch.tensor(
+        [1 if p.grad is not None else 0 for p in params],
+        device=ref_device,
+        dtype=torch.int32,
+    )
+    dist.all_reduce(local_has_grad, op=dist.ReduceOp.SUM, group=group)
+
+    # Phase 2: per-parameter all-reduce.
+    for index, p in enumerate(params):
+        grad_rank_count = int(local_has_grad[index].item())
+        if grad_rank_count == 0:
+            # No rank has a gradient for this parameter — keep grad=None so
+            # AdamW does NOT apply weight decay.
+            p.grad = None
+            continue
+        if p.grad is None:
+            # Some rank(s) have a gradient but this rank doesn't — contribute zero.
+            p.grad = torch.zeros_like(p)
+        else:
+            p.grad = p.grad.clone()
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=group)
+        if average and divisor > 1:
+            p.grad.div_(divisor)
+        if not torch.isfinite(p.grad).all():
+            raise FloatingPointError(
+                f"NaN/Inf detected in encoder gradient after sync. "
+                f"Parameter shape={tuple(p.shape)}"
+            )
 
 
 def clip_infmem_grad_norm(
@@ -234,7 +262,8 @@ def clip_infmem_grad_norm(
 ) -> torch.Tensor:
     """Clip gradients of the encoder parameters only.
 
-    Returns the total norm (before clipping) as a scalar tensor.
+    Uses :func:`torch.nn.utils.clip_grad_norm_` for parity with the generator
+    path. Returns the total norm (before clipping) as a scalar tensor.
     """
     encoder = get_infmem_encoder(generator)
     if encoder is None:
@@ -244,53 +273,131 @@ def clip_infmem_grad_norm(
     if not params:
         return torch.tensor(0.0)
 
-    total_norm = torch.norm(
-        torch.stack([torch.norm(p.grad.detach(), 2) for p in params]),
-        2,
-    )
-    clip_coef = max_norm / (total_norm + 1e-6)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    for p in params:
-        p.grad.detach().mul_(clip_coef_clamped)
+    total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm, error_if_nonfinite=True)
     return total_norm
 
 
-def broadcast_infmem_params(generator: Any) -> None:
-    """Broadcast encoder parameters + buffers from rank 0 to all ranks.
+def recursive_to_cpu(obj):
+    """Recursively detach + CPU-ize every tensor in a nested structure."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: recursive_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [recursive_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(recursive_to_cpu(v) for v in obj)
+    return obj
 
-    Also compares checksums across ranks after broadcast.
+
+def state_dict_stats(state_dict) -> dict:
+    """Compute a stable multi-statistic summary of a state_dict for verification."""
+    if state_dict is None:
+        return {"n_tensors": 0, "total_sum": 0.0, "total_sq": 0.0, "max_abs": 0.0}
+    keys = sorted(state_dict.keys())
+    total_sum = 0.0
+    total_sq = 0.0
+    max_abs = 0.0
+    n_tensors = 0
+    for k in keys:
+        v = state_dict[k]
+        if torch.is_tensor(v):
+            vf = v.detach().float()
+            total_sum += vf.sum().item()
+            total_sq += vf.pow(2).sum().item()
+            max_abs = max(max_abs, vf.abs().max().item())
+            n_tensors += 1
+    return {
+        "n_tensors": n_tensors,
+        "total_sum": total_sum,
+        "total_sq": total_sq,
+        "max_abs": max_abs,
+        "n_keys": len(keys),
+    }
+
+
+def verify_infmem_params(
+    generator: Any,
+    *,
+    group=None,
+) -> bool:
+    """Verify all ranks have identical encoder parameters + buffers.
+
+    Uses multi-statistic all-gather (sum, square-sum, max-abs, count) and
+    raises RuntimeError if any rank disagrees.
     """
-    if not dist.is_initialized() or dist.get_world_size() <= 1:
-        return
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        return True
+    encoder = get_infmem_encoder(generator)
+    if encoder is None:
+        return True
+
+    ref_device = next(encoder.parameters()).device
+    params = list(encoder.parameters())
+    buffers = list(encoder.buffers())
+    all_tensors = params + buffers
+    if not all_tensors:
+        return True
+
+    total_sum = 0.0
+    total_sq = 0.0
+    max_abs = 0.0
+    num = 0
+    for t in all_tensors:
+        tf = t.detach().float()
+        total_sum += tf.sum().item()
+        total_sq += tf.pow(2).sum().item()
+        max_abs = max(max_abs, tf.abs().max().item())
+        num += t.numel()
+    local_stats = torch.tensor(
+        [total_sum, total_sq, max_abs, float(num)],
+        device=ref_device,
+        dtype=torch.float64,
+    )
+    gathered = [torch.empty_like(local_stats) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, local_stats, group=group)
+    for r, st in enumerate(gathered):
+        if not torch.allclose(st, local_stats):
+            raise RuntimeError(
+                f"QueryMemoryEncoder parameters differ across ranks after "
+                f"broadcast/verify: rank0 stats={local_stats.tolist()} "
+                f"rank{r} stats={st.tolist()}"
+            )
+    return True
+
+
+def broadcast_infmem_params(
+    generator: Any,
+    *,
+    src: int = 0,
+    group=None,
+    verify: bool = True,
+) -> bool:
+    """Broadcast encoder parameters + buffers from ``src`` rank to all ranks.
+
+    Uses the encoder's own parameter device (NOT ``cuda:{global_rank}``) so
+    multi-node is correct. When ``verify=True``, after broadcast all ranks
+    are checked for consistency via :func:`verify_infmem_params`.
+    """
+    if not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        return True
 
     encoder = get_infmem_encoder(generator)
     if encoder is None:
-        return
+        return True
 
     # Broadcast all parameters.
     for p in encoder.parameters():
-        dist.broadcast(p.data, src=0)
+        dist.broadcast(p.data, src=src, group=group)
 
     # Broadcast all buffers.
     for buf in encoder.buffers():
-        dist.broadcast(buf.data, src=0)
+        dist.broadcast(buf.data, src=src, group=group)
 
-    # Checksum comparison.
-    rank = dist.get_rank()
-    checksum = sum(p.data.sum().item() for p in encoder.parameters())
-    checksum_tensor = torch.tensor(checksum, device=f"cuda:{rank}")
-    dist.all_reduce(checksum_tensor, op=dist.ReduceOp.SUM)
-    # If any rank disagrees, all_reduce(sum) would differ from
-    # world_size * local_checksum. We can't directly compare, but we log.
-    expected = checksum * dist.get_world_size()
-    if abs(checksum_tensor.item() - expected) > 1.0:
-        print(
-            f"[InfMem][WARN] rank {rank}: encoder param checksum mismatch "
-            f"after broadcast (local={checksum:.2f}, "
-            f"all_reduce_sum={checksum_tensor.item():.2f}, "
-            f"expected={expected:.2f})",
-            flush=True,
-        )
+    if verify:
+        verify_infmem_params(generator, group=group)
+
+    return True
 
 
 def infmem_extra_param_groups(

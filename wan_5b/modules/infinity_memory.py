@@ -50,6 +50,7 @@ import math
 import types
 import torch
 import torch.distributed as dist
+from contextlib import nullcontext
 
 from wan_5b.modules.attention import attention
 from wan_5b.modules.causal_model import (
@@ -67,6 +68,26 @@ _FIRST_BULK_LOGGED = {"flag": False}
 def _reset_log_flags() -> None:
     _FIRST_LONG_LOGGED["flag"] = False
     _FIRST_BULK_LOGGED["flag"] = False
+
+
+def _infmem_autocast_context(reference: torch.Tensor):
+    """Return an autocast context matching the reference tensor's dtype.
+
+    Only enables CUDA autocast when the reference tensor is a CUDA half /
+    bfloat16 tensor. This keeps the FP32 encoder parameters numerically
+    correct while letting the runtime BF16 query_state flow through the
+    encoder's Linear layers without dtype-mismatch errors. CPU / FP32
+    tensors return a no-op context so unit tests and FP32 training work.
+    """
+    if (
+        reference.is_cuda
+        and reference.dtype in (torch.float16, torch.bfloat16)
+    ):
+        return torch.autocast(
+            device_type="cuda",
+            dtype=reference.dtype,
+        )
+    return nullcontext()
 
 
 def _compute_relative_positions(
@@ -650,20 +671,53 @@ def _model_forward_inference_infmem(
     num_blocks = len(self.blocks)
     if enc is not None and getattr(enc, "has_history", False):
         num_query_groups = getattr(enc, "num_query_groups", 1)
-        if num_query_groups > 1:
-            blocks_per_group = num_blocks // num_query_groups
-            group_kvs = [enc.get_kv(group_index=g) for g in range(num_query_groups)]
-            _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
-            _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
-            memory_kv_list = [
-                group_kvs[min(i // blocks_per_group, num_query_groups - 1)]
-                for i in range(num_blocks)
-            ]
-        else:
-            kv = enc.get_kv()
-            _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
-            _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
-            memory_kv_list = [kv] * num_blocks
+        # Validate query-group configuration before use.
+        if num_query_groups < 1:
+            raise ValueError(
+                f"num_query_groups must be >= 1, got {num_query_groups}"
+            )
+        if num_query_groups > num_blocks:
+            raise ValueError(
+                f"num_query_groups ({num_query_groups}) > num_blocks "
+                f"({num_blocks})"
+            )
+        if num_blocks % num_query_groups != 0:
+            raise ValueError(
+                f"num_blocks ({num_blocks}) must be divisible by "
+                f"num_query_groups ({num_query_groups})"
+            )
+        # Reference hidden tensor for autocast dtype selection. Encoder
+        # parameters are FP32 but the runtime query_state may be BF16, so we
+        # match the hidden x dtype to avoid FP32/BF16 matmul mismatches.
+        _autocast_ref = x
+        with _infmem_autocast_context(_autocast_ref):
+            if num_query_groups > 1:
+                blocks_per_group = num_blocks // num_query_groups
+                group_kvs = [
+                    enc.get_kv(group_index=g)
+                    for g in range(num_query_groups)
+                ]
+                _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
+                _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
+                memory_kv_list = []
+                for i in range(num_blocks):
+                    g = min(i // blocks_per_group, num_query_groups - 1)
+                    mk, mv = group_kvs[g]
+                    if mk is not None:
+                        mk = mk.to(device=x.device, dtype=x.dtype)
+                        mv = mv.to(device=x.device, dtype=x.dtype)
+                    memory_kv_list.append((mk, mv))
+            else:
+                kv = enc.get_kv()
+                _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
+                _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
+                if kv is not None:
+                    mk, mv = kv
+                    mk = mk.to(device=x.device, dtype=x.dtype)
+                    mv = mv.to(device=x.device, dtype=x.dtype)
+                    memory_kv_list = [(mk, mv)] * num_blocks
+                else:
+                    memory_kv_list = [None] * num_blocks
     else:
         memory_kv_list = [None] * num_blocks
 
@@ -718,6 +772,13 @@ def _model_forward_inference_infmem(
     # ---------- INFMEM: capture EVICTED KV → encoder.update() ------------
     # We do this BEFORE `_apply_cache_updates` so that the eviction snapshot
     # is taken from the pre-shift KV cache.
+    #
+    # The ONLY source of truth for how many tokens were evicted is the
+    # ``cache_update_info`` dict returned by the self-attention forward
+    # (``num_evicted_tokens`` + ``sink_tokens``). We MUST NOT re-derive the
+    # evicted-frame count from a local cursor like ``_ei_prev_window_start``
+    # because multi-shot pinned-sink layouts shift the effective sink, which
+    # would make a static ``sink_tok`` capture the wrong slice.
     if (
         kv_cache is not None
         and cache_update_infos
@@ -728,44 +789,61 @@ def _model_forward_inference_infmem(
         last_update_info = cache_update_infos[-1][1]
         update_dict = last_update_info[2] if len(last_update_info) > 2 else None
 
-        sink_frames = self.blocks[0].self_attn.sink_size
-        sink_tok = sink_frames * frame_seqlen
-        max_attn = self.blocks[0].self_attn.max_attention_size
-        recent_window_frames = (max_attn - sink_tok) // frame_seqlen
-        current_end_tok = last_update_info[0]
-        num_new_frames = (current_end_tok - current_start) // frame_seqlen
-        current_end_frame = current_start // frame_seqlen + num_new_frames
+        # Canonical sink (stable global sink) used for the sink anchor.
+        canonical_sink_frames = self.blocks[0].self_attn.sink_size
+        canonical_sink_tokens = canonical_sink_frames * frame_seqlen
 
-        oldest_recent_frame = max(sink_frames, current_end_frame - recent_window_frames)
-        prev_oldest = (
-            self._ei_prev_window_start
-            if self._ei_prev_window_start is not None else sink_frames
+        # Only perform a memory update when the self-attention actually
+        # reported a roll-and-insert eviction with a positive token count.
+        do_memory_update = (
+            update_dict is not None
+            and update_dict.get("action") == "roll_and_insert"
+            and int(update_dict.get("num_evicted_tokens", 0)) > 0
         )
-        num_exited_frames = max(0, oldest_recent_frame - prev_oldest)
-        self._ei_prev_window_start = oldest_recent_frame
 
-        # Track total evicted frames for post-training validation.
-        prev_total = getattr(self, "_ei_total_evicted_frames", 0)
-        object.__setattr__(self, "_ei_total_evicted_frames", prev_total + num_exited_frames)
+        if do_memory_update:
+            effective_sink_tokens = int(update_dict["sink_tokens"])
+            num_evicted_tokens = int(update_dict["num_evicted_tokens"])
+            assert effective_sink_tokens >= 0, (
+                f"effective_sink_tokens must be >= 0, got {effective_sink_tokens}"
+            )
+            assert num_evicted_tokens > 0, (
+                f"num_evicted_tokens must be > 0, got {num_evicted_tokens}"
+            )
+            assert num_evicted_tokens % frame_seqlen == 0, (
+                f"num_evicted_tokens ({num_evicted_tokens}) must be a multiple "
+                f"of frame_seqlen ({frame_seqlen})"
+            )
 
-        if num_exited_frames > 0:
-            num_exited_tokens = num_exited_frames * frame_seqlen
-            if update_dict is not None and update_dict.get("action") == "roll_and_insert":
-                capture_start = sink_tok
-            else:
-                capture_start = prev_oldest * frame_seqlen
-
+            # Capture from the pre-shift cache using the REAL effective sink
+            # (which includes pinned shot sinks under multi-shot). Do NOT use
+            # the static ``sink_tok`` here.
             cache_blk = kv_cache[last_block_idx]
-            exited_k = cache_blk["k"][:, capture_start:capture_start + num_exited_tokens].clone()
-            exited_v = cache_blk["v"][:, capture_start:capture_start + num_exited_tokens].clone()
-            sink_k = cache_blk["k"][:, :sink_tok].clone() if sink_tok > 0 else None
-            sink_v = cache_blk["v"][:, :sink_tok].clone() if sink_tok > 0 else None
+            capture_start = effective_sink_tokens
+            capture_end = capture_start + num_evicted_tokens
+            exited_k = cache_blk["k"][:, capture_start:capture_end].clone()
+            exited_v = cache_blk["v"][:, capture_start:capture_end].clone()
 
-            # Use CUDA BF16 autocast for encoder update — encoder stays FP32
-            # but the update computation runs in bf16 for speed.
+            # Sink anchor uses the CANONICAL (stable global) sink, NOT the
+            # effective (pinned-inclusive) sink, so temporary pinned shot
+            # sinks are not folded into long-term memory.
+            if canonical_sink_tokens > 0:
+                sink_k = cache_blk["k"][:, :canonical_sink_tokens].clone()
+                sink_v = cache_blk["v"][:, :canonical_sink_tokens].clone()
+            else:
+                sink_k = None
+                sink_v = None
+
+            num_evicted_frames = num_evicted_tokens // frame_seqlen
+            prev_total = getattr(self, "_ei_total_evicted_frames", 0)
+            object.__setattr__(self, "_ei_total_evicted_frames", prev_total + num_evicted_frames)
+            # Track for diagnostics only — must NOT drive the capture.
+            object.__setattr__(self, "_ei_last_evicted_frames", num_evicted_frames)
+            object.__setattr__(self, "_ei_last_evicted_tokens", num_evicted_tokens)
+
             strict_update = getattr(self, "_ei_strict_update", True)
             try:
-                with torch.autocast(device_type=exited_k.device.type, dtype=torch.bfloat16):
+                with _infmem_autocast_context(exited_k):
                     enc.update(exited_k, exited_v, sink_k, sink_v)
             except Exception as exc:
                 if strict_update:
@@ -776,6 +854,11 @@ def _model_forward_inference_infmem(
                 if not getattr(self, "_ei_update_error_logged", False):
                     print(f"[InfMem][warn] encoder.update failed: {exc}", flush=True)
                     self._ei_update_error_logged = True
+        else:
+            # No eviction this chunk — update the diagnostics cursor so
+            # downstream logging still has a value, but do NOT capture.
+            object.__setattr__(self, "_ei_last_evicted_frames", 0)
+            object.__setattr__(self, "_ei_last_evicted_tokens", 0)
 
     if kv_cache is not None and cache_update_infos and not defer_cache_updates:
         self._apply_cache_updates(kv_cache, cache_update_infos)
@@ -848,6 +931,11 @@ def attach_infmem(
         model._ei_prev_window_start = None
     if not hasattr(model, "_ei_total_evicted_frames"):
         model._ei_total_evicted_frames = 0
+    # Diagnostics populated from the real cache_update_info metadata.
+    if not hasattr(model, "_ei_last_evicted_frames"):
+        model._ei_last_evicted_frames = 0
+    if not hasattr(model, "_ei_last_evicted_tokens"):
+        model._ei_last_evicted_tokens = 0
     model._ei_strict_update = True
 
     _reset_log_flags()

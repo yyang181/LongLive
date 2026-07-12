@@ -24,6 +24,20 @@ class CausalDiffusion(BaseModel):
         if self.independent_first_frame and not getattr(args, "i2v", False):
             self.generator.model.independent_first_frame = True
 
+        # Gradient checkpointing recomputes the block forward during backward,
+        # but InfMem streaming training mutates the KV cache and QueryMemoryEncoder
+        # state between chunks — the recomputed tensors will have different
+        # shapes (cache has grown / shifted), causing CheckpointError. The two
+        # features are fundamentally incompatible.
+        _infmem_streaming = bool(getattr(args, "infmem_streaming_training", False))
+        if args.gradient_checkpointing and _infmem_streaming:
+            import logging as _logging
+            _logging.warning(
+                "gradient_checkpointing=true is incompatible with "
+                "infmem_streaming_training (stateful KV cache + memory encoder "
+                "breaks checkpoint recomputation). Disabling gradient checkpointing."
+            )
+            args.gradient_checkpointing = False
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
 
@@ -243,9 +257,21 @@ class CausalDiffusion(BaseModel):
         )
         from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
         try:
-            reset_infmem(self.generator, batch_size=batch_size, device=noisy_latents.device, dtype=noisy_latents.dtype)
-        except Exception as e:
-            print(f"[InfMem][warn] reset_infmem failed (BPTT detach still active): {e}", flush=True)
+            reset_ok = reset_infmem(
+                self.generator,
+                batch_size=batch_size,
+                device=noisy_latents.device,
+                dtype=noisy_latents.dtype,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to reset QueryMemoryEncoder before streaming training."
+            ) from exc
+        if not reset_ok:
+            raise RuntimeError(
+                "InfMem streaming training is enabled, but no memory encoder "
+                "was reset."
+            )
 
         if timestep_clean_aug is None:
             timestep_clean_aug = torch.zeros_like(timestep)

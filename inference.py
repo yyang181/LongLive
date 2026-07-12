@@ -539,21 +539,34 @@ if isinstance(generator_checkpoint, dict) and "query_memory_encoder" in generato
         n_params = sum(p.numel() for p in _enc.parameters())
         enc_dtype = next(_enc.parameters()).dtype
         enc_device = next(_enc.parameters()).device
-        # Checksum for verification.
-        checksum = sum(v.float().sum().item() for v in enc_state.values())
+        # Checksum for verification (saved).
+        saved_stats = {
+            "n_tensors": n_loaded,
+            "total_sum": sum(v.float().sum().item() for v in enc_state.values()),
+        }
         if local_rank == 0:
             print(
                 f"[InfMem] Loaded query_memory_encoder for inference: "
                 f"tensors={n_loaded}, params={n_params:,}, "
                 f"dtype={enc_dtype}, device={enc_device}, "
-                f"checksum={checksum:.4f}",
+                f"saved_checksum={saved_stats['total_sum']:.4f}",
                 flush=True,
             )
         _infmem_enc_loaded = True
     else:
+        # checkpoint has encoder but the selected wrapper has no encoder
+        # attached — this is a configuration mismatch. Default fail-fast
+        # unless explicitly allowed.
+        if not bool(getattr(config, "allow_drop_infmem_checkpoint", False)):
+            raise RuntimeError(
+                "Checkpoint contains QueryMemoryEncoder weights, but the "
+                "selected wrapper has no encoder attached. Set "
+                "allow_drop_infmem_checkpoint=true to explicitly discard "
+                "the encoder weights."
+            )
         if local_rank == 0:
-            print("[InfMem][WARN] query_memory_encoder in checkpoint but no encoder "
-                  "attached to pipeline — ignoring.")
+            print("[InfMem][WARN] query_memory_encoder in checkpoint dropped "
+                  "(allow_drop_infmem_checkpoint=true).")
 elif isinstance(generator_checkpoint, dict):
     # Check if the wrapper has an encoder but the checkpoint doesn't.
     from utils.infinity_memory_hooks import get_infmem_encoder
@@ -599,6 +612,50 @@ elif loaded_prequantized_generator and local_rank == 0:
 
 pipeline.generator.model.eval().requires_grad_(False)
 configure_generator_torch_compile(pipeline, config)
+
+# ---- InfMem encoder post-pipeline verification ----
+# After all pipeline ``.to()`` calls, re-verify the encoder is on the right
+# device and still FP32 (pipeline.to(bf16) should NOT have cast it because the
+# encoder is attached via object.__setattr__, outside the module tree).
+if _infmem_enc_loaded:
+    from utils.infinity_memory_hooks import (
+        get_infmem_encoder, move_infmem_encoder, state_dict_stats,
+    )
+    enc = get_infmem_encoder(pipeline.generator)
+    if enc is not None:
+        _dev_ok = all(p.device == device for p in enc.parameters())
+        _dtype_ok = all(p.dtype == torch.float32 for p in enc.parameters())
+        if not (_dev_ok and _dtype_ok):
+            if local_rank == 0:
+                print(
+                    f"[InfMem] encoder post-pipeline check: device_ok={_dev_ok}, "
+                    f"dtype_ok={_dtype_ok} — forcing FP32 + correct device."
+                )
+            move_infmem_encoder(
+                pipeline.generator,
+                device=device,
+                dtype=torch.float32,
+                force_cast=True,
+            )
+        # Re-enforce eval + no-grad after the forced cast.
+        enc.eval()
+        enc.requires_grad_(False)
+        # Checksum comparison (saved vs loaded).
+        loaded_stats = state_dict_stats(enc.state_dict())
+        if local_rank == 0:
+            print(
+                f"[InfMem] encoder verify: device={next(enc.parameters()).device}, "
+                f"dtype={next(enc.parameters()).dtype}, "
+                f"loaded_checksum={loaded_stats['total_sum']:.4f}, "
+                f"saved_checksum={saved_stats['total_sum']:.4f}"
+            )
+        if abs(loaded_stats["total_sum"] - saved_stats["total_sum"]) > 1e-3:
+            if local_rank == 0:
+                print(
+                    f"[InfMem][WARN] encoder checksum mismatch after pipeline.to(): "
+                    f"saved={saved_stats['total_sum']:.4f}, "
+                    f"loaded={loaded_stats['total_sum']:.4f}"
+                )
 
 vae_device_str = getattr(config, "vae_device", None)
 use_dedicated_vae_device = bool(getattr(config, "streaming_vae", False)) and bool(vae_device_str)
