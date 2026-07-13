@@ -1,57 +1,43 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Build a camera-aware LMDB dataset for Wan2.2-TI2V-5B PRoPE Bidirectional SFT
-from the *Sekai* (Leegen/Sekai) dataset using VGGT-Omega camera estimates.
+"""Build a camera-aware LMDB dataset for Wan2.2-TI2V-5B from ViPE results.
 
-Differences from ``build_camera_lmdb_5b_sekai_game.py``:
-  * Camera parameters come from VGGT-Omega (``batch_vggt_omega.py``) instead of
-    the Sekai-Game sharded NPZ.  Each video has its own ``<clip_id>.npz`` in
-    ``--camera_dir`` with keys:
-      - ``extrinsics``  : (1, T, 3, 4)  float32, w2c (world-to-camera, OpenCV)
-      - ``intrinsics``  : (1, T, 3, 3)  float32, pinhole [fx 0 cx; 0 fy cy; 0 0 1]
-      - ``num_frames``  : int64 = T
-      - ``height``      : int64  (VGGT processing resolution)
-      - ``width``       : int64
-  * **Cameras are already 4×-strided**: VGGT-Omega was run with
-    ``--frame_stride 4``, so T poses correspond to original video frames
-    ``[0, 4, 8, ..., 4*(T-1)]``.  This means each camera pose already aligns
-    1-to-1 with a Wan2.2 latent frame (4× temporal VAE).  We therefore use
-    ``vae_time_stride=1`` when subsampling the trajectory — there is no
-    additional 4× subsampling to do.
-  * Captions are read from CSV files (``--caption_csv``) with a ``videoFile``
-    column (e.g. ``clip_id.mp4``) and a ``caption`` column, instead of JSON.
-  * Intrinsics are normalized by the VGGT processing resolution
-    (``height`` / ``width`` from the NPZ), not the original capture resolution.
+ViPE (NVIDIA VIdeo Pose Estimation) outputs per-frame camera poses and
+intrinsics for each video.  This script:
 
-For each clip, this script:
-  1. Loads <MAX_FRAMES> RGB frames at <target_h x target_w>.
+  1. Loads <MAX_FRAMES> RGB frames at <target_h x target_w> from each video.
   2. Encodes them with the Wan2.2 VAE (4× temporal, 16× spatial, 48 channels)
      into a (F_lat, 48, H/16, W/16) fp16 latent.
-  3. Selects F_lat camera poses from the VGGT trajectory using
-     ``vae_time_stride=1`` (indices ``[0, 1, ..., F_lat-1]``).  Each VGGT pose
-     i corresponds to original frame 4*i, which is the *last* frame of the
-     i-th 4-frame VAE chunk — matching the ``cam_sample_strategy='last'``
-     convention from SANA / Sekai-Game.  VGGT-Omega extrinsics are w2c
-     (world-to-camera) and are stored directly as w2c ``[tx,ty,tz,qx,qy,qz,qw]``
-     without inversion.
-  4. Stores normalized intrinsics [fx/W_vggt, fy/H_vggt, cx/W_vggt, cy/H_vggt]
-     (4,) float32.
+  3. Reads ViPE camera poses (c2w, per-frame) and subsamples every 4 frames
+     to match the VAE temporal stride.  Converts c2w → w2c and stores as
+     (F_lat, 7) [tx,ty,tz, qx,qy,qz,qw] — **identical format** to
+     ``build_camera_lmdb_5b.py`` (minWM string-based builder).
+  4. Reads ViPE intrinsics [fx,fy,cx,cy] (pixel units), normalizes by the
+     original video resolution, and stores as (4,) float32.
   5. Streams each rank to its own LMDB shard, then rank-0 merges into
      ``<output_dir>/data/``.
 
-Wan2.2 VAE has ratio (4× temporal, 16× spatial), so for ``F_lat = 40``:
-    raw_frames  = (F_lat - 1) * 4 + 1 = 157
-    latent_h    = target_h / 16
-    latent_w    = target_w / 16
+ViPE results layout::
 
-Usage:
-    torchrun --nproc_per_node=2 \
-        scripts/data_preprocessing/build_camera_lmdb_5b_sekai.py \
-        --video_dir    /path/to/Sekai/video \
-        --camera_dir   /path/to/Sekai/vggt_omega_results \
-        --caption_csv  /path/to/Sekai-Game.csv /path/to/Sekai-Real-HQ.csv \
-        --output_dir   ./data/train/sekai/ \
-        --target_h 704 --target_w 1280 --max_frames 157
+    <vipe_dir>/pose/<clip_id>.npz        — 'data': (T, 4, 4) c2w, 'inds': (T,)
+    <vipe_dir>/intrinsics/<clip_id>.npz  — 'data': (T, 4) [fx,fy,cx,cy] px
+    <vipe_dir>/rgb/<clip_id>.mp4         — (optional, if --video_dir is the ViPE rgb dir)
+
+Pose convention (CRITICAL):
+  * ViPE ``pose/data`` stores **c2w** (camera-to-world) 4×4 matrices.
+  * The LMDB must store **w2c** (world-to-camera) [tx,ty,tz, qx,qy,qz,qw],
+    matching ``build_camera_lmdb_5b.py`` and ``build_viewmats_and_Ks``.
+  * Conversion: ``w2c = inv(c2w)``, then extract translation + quaternion
+    from the w2c matrix.
+
+Usage::
+    torchrun --nproc_per_node=4 \\
+        scripts/data_preprocessing/build_camera_lmdb_5b_vipe.py \\
+        --video_dir    /path/to/Sekai/video \\
+        --camera_dir   /path/to/Sekai/vipe_results/pose \\
+        --caption_csv  /path/to/Sekai-Game.csv /path/to/Sekai-Real-HQ.csv \\
+        --output_dir   ./data/train/sekai_vipe/ \\
+        --target_h 704 --target_w 1280 --max_frames 957
 """
 
 import argparse
@@ -64,7 +50,7 @@ import sys
 import time
 
 # Make the repo root importable so ``utils.*`` resolves regardless of the
-# directory torchrun is launched from (this file lives two levels below root).
+# directory torchrun is launched from.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -76,7 +62,6 @@ import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
-
 try:
     import decord; decord.bridge.set_bridge("torch"); _USE_DECORD = True
 except ImportError:
@@ -85,83 +70,126 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
-# VGGT-Omega per-video NPZ loading
+# ViPE camera loading
 # --------------------------------------------------------------------------
-def load_vggt_camera_dir(camera_dir):
-    """Scan *camera_dir* for ``<clip_id>.npz`` files produced by
-    ``batch_vggt_omega.py --cameras_only``.
+def load_vipe_cameras(camera_dir, intrinsics_dir=None):
+    """Scan *camera_dir* for ViPE ``<clip_id>.npz`` pose files.
 
-    Each NPZ has:
-        extrinsics  : (1, T, 3, 4) float32, w2c (world-to-camera, OpenCV)
-        intrinsics  : (1, T, 3, 3) float32
-        num_frames  : int64 = T
-        height      : int64  (VGGT processing resolution)
-        width       : int64
+    Each pose NPZ has:
+        data  : (T, 4, 4) float32 — c2w (camera-to-world)
+        inds  : (T,) int64        — frame indices
 
-    Returns a dict ``clip_id -> {pose: (T, 4, 4) w2c, intrinsics: (T, 3, 3),
-                                height, width}``.
+    Each intrinsics NPZ (in *intrinsics_dir*) has:
+        data  : (T, 4) float32 — [fx, fy, cx, cy] in pixel units
+        inds  : (T,) int64
+
+    Args:
+        camera_dir:     Directory containing ``<clip_id>.npz`` pose files.
+        intrinsics_dir: Directory containing ``<clip_id>.npz`` intrinsics
+                        files.  If None, auto-derived from *camera_dir* by
+                        replacing the last ``pose`` component with
+                        ``intrinsics``.
+
+    Returns:
+        dict ``clip_id -> {c2w: (T, 4, 4), intrinsics: (T, 4)}``.
     """
+    # Auto-derive intrinsics dir if not given.
+    if intrinsics_dir is None:
+        if os.path.basename(camera_dir.rstrip("/")) == "pose":
+            intrinsics_dir = os.path.join(
+                os.path.dirname(camera_dir.rstrip("/")), "intrinsics")
+        else:
+            intrinsics_dir = camera_dir  # fallback: same dir
+
     out = {}
     skipped = 0
-    for path in sorted(glob.glob(os.path.join(camera_dir, "*.npz"))):
+    pose_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
+    for path in pose_files:
         stem = os.path.splitext(os.path.basename(path))[0]
         try:
-            z = np.load(path, allow_pickle=True)
-            # Only read the small arrays we actually need; never touch
-            # 'depth' (large, and can be corrupted in old-format NPZs).
-            ext = z["extrinsics"]          # (1, T, 3, 4)  w2c
-            intr = z["intrinsics"]         # (1, T, 3, 3)
+            pz = np.load(path, allow_pickle=True)
+            c2w = np.asarray(pz["data"], dtype=np.float32)  # (T, 4, 4) c2w
         except Exception as e:
-            print(f"[WARN] skipping corrupted NPZ {stem}: {e}", flush=True)
+            print(f"[WARN] skipping corrupted pose NPZ {stem}: {e}",
+                  flush=True)
             skipped += 1
             continue
-        # Squeeze batch dim
-        ext = np.asarray(ext[0], dtype=np.float32)    # (T, 3, 4)
-        intr = np.asarray(intr[0], dtype=np.float32)  # (T, 3, 3)
-        T = ext.shape[0]
-        # Pad (T, 3, 4) -> (T, 4, 4) w2c by appending [0, 0, 0, 1]
-        # VGGT-Omega extrinsics are world-to-camera (w2c) in OpenCV
-        # coordinates (see vggt_omega/utils/pose_enc.py docstring:
-        # "Extrinsics are camera-from-world matrices in OpenCV coordinates").
-        w2c = np.tile(np.eye(4, dtype=np.float32), (T, 1, 1))
-        w2c[:, :3, :] = ext
-        # Resolution: prefer explicit height/width keys; otherwise derive
-        # from the intrinsics principal point (cx = W/2, cy = H/2).
-        keys = set(z.files)
-        if "height" in keys and "width" in keys:
-            h = int(z["height"])
-            w = int(z["width"])
-        else:
-            cx = float(intr[0, 0, 2])
-            cy = float(intr[0, 1, 2])
-            w = int(round(cx * 2))
-            h = int(round(cy * 2))
-            if w <= 0 or h <= 0:
-                w, h = 688, 384  # safe fallback
+
+        # Load intrinsics (optional — fall back to None if missing).
+        intr_path = os.path.join(intrinsics_dir, f"{stem}.npz")
+        intr = None
+        if os.path.isfile(intr_path):
+            try:
+                iz = np.load(intr_path, allow_pickle=True)
+                intr = np.asarray(iz["data"], dtype=np.float32)  # (T, 4)
+            except Exception:
+                pass
+
         out[stem] = {
-            "pose": w2c,
+            "c2w": c2w,
             "intrinsics": intr,
-            "height": h,
-            "width": w,
         }
+
     if skipped:
-        print(f"[WARN] {skipped} corrupted NPZ file(s) skipped.", flush=True)
+        print(f"[WARN] {skipped} corrupted pose NPZ file(s) skipped.",
+              flush=True)
     return out
 
 
+# --------------------------------------------------------------------------
+# Camera subsampling (c2w → w2c, 4× temporal stride)
+# --------------------------------------------------------------------------
+def poses_from_vipe_c2w(c2w_seq, n_latent, intrinsics_row,
+                         orig_w, orig_h):
+    """Subsample a ViPE c2w trajectory to ``n_latent`` w2c poses.
+
+    ViPE was run at interval=1 (every frame), so we subsample every 4
+    frames (``vae_time_stride=4``) to match the Wan2.2 VAE 4× temporal
+    compression.  Pose indices: ``[0, 4, 8, ..., 4*(n_latent-1)]``.
+
+    **Convention**: ViPE ``data`` is c2w (camera-to-world).  We invert to
+    w2c (world-to-camera) and store as ``[tx,ty,tz, qx,qy,qz,qw]`` —
+    identical to ``build_camera_lmdb_5b.py`` (minWM string-based).
+
+    Args:
+        c2w_seq:        (T, 4, 4) float32, per-frame c2w (camera-to-world).
+        n_latent:       number of latent frames (= number of camera poses).
+        intrinsics_row: (4,) [fx, fy, cx, cy] in pixel units at orig resolution.
+        orig_w/orig_h:  original video resolution (used to normalize intrinsics).
+
+    Returns:
+        intrinsics: (4,) float32, normalized [fx/W, fy/H, cx/W, cy/H].
+        poses:      (n_latent, 7) float32, w2c [tx,ty,tz, qx,qy,qz,qw].
+    """
+    L = int(c2w_seq.shape[0])
+    vae_time_stride = 4  # Wan2.2 VAE: 4× temporal compression
+    idxs = [min(i * vae_time_stride, L - 1) for i in range(n_latent)]
+
+    poses = np.zeros((n_latent, 7), dtype=np.float32)
+    for i, fi in enumerate(idxs):
+        c2w = np.asarray(c2w_seq[fi], dtype=np.float64)
+        w2c = np.linalg.inv(c2w)  # c2w → w2c
+        poses[i, :3] = w2c[:3, 3]
+        poses[i, 3:] = Rotation.from_matrix(w2c[:3, :3]).as_quat()
+
+    fx, fy, cx, cy = intrinsics_row
+    intrinsics = np.array(
+        [fx / orig_w, fy / orig_h, cx / orig_w, cy / orig_h],
+        dtype=np.float32,
+    )
+    return intrinsics, poses
+
+
+# --------------------------------------------------------------------------
+# Caption loading (CSV or JSON)
+# --------------------------------------------------------------------------
 def load_caption_csvs(csv_paths, use_parent_as_clip_id=False):
     """Merge caption data from one or more CSV or JSON files.
 
     **CSV files** must have ``videoFile`` and ``caption`` columns.
     clip_id = stem of videoFile (e.g. ``clip_001.mp4`` -> ``clip_001``).
 
-    **JSON files** (``.json``) can be either:
-      - A list of objects with ``video_path`` and ``caption`` keys (minWM-data
-        ``clips.json`` format).  clip_id is derived from ``video_path``:
-        parent directory name if *use_parent_as_clip_id*, else filename stem.
-      - A dict mapping ``clip_id -> caption`` (or ``clip_id -> {caption: ...}``).
-
-    Returns a dict ``clip_id -> caption``.
+    **JSON files** can be a list of ``{video_path, caption}`` objects.
     """
     out = {}
     for path in csv_paths:
@@ -203,76 +231,40 @@ def load_caption_csvs(csv_paths, use_parent_as_clip_id=False):
 
 
 # --------------------------------------------------------------------------
-# Camera subsampling (vae_time_stride=1 because VGGT already strided by 4)
-# --------------------------------------------------------------------------
-def poses_from_vggt_w2c(w2c_seq, n_latent, intrinsics_row,
-                         orig_w, orig_h):
-    """Subsample a VGGT-Omega w2c trajectory to ``n_latent`` w2c poses.
-
-    VGGT-Omega was run with ``--frame_stride 4``, so the trajectory already
-    has one pose per 4-frame VAE chunk.  We therefore take poses
-    ``[0, 1, ..., n_latent-1]`` directly (``vae_time_stride=1``).
-
-    VGGT-Omega's ``extrinsics`` are **world-to-camera (w2c)** in OpenCV
-    coordinates (see ``vggt_omega/utils/pose_enc.py``).  We store them
-    directly as w2c ``[tx, ty, tz, qx, qy, qz, qw]`` without any inversion.
-
-    Args:
-        w2c_seq:        (T, 4, 4) float32, per-strided-frame w2c.
-        n_latent:       number of latent frames (= number of camera poses to
-                        select).
-        intrinsics_row: (3, 3) float32 pinhole matrix at the VGGT resolution.
-        orig_w/orig_h:  VGGT processing resolution (used to normalize fx, cx /
-                        fy, cy).
-
-    Returns:
-        intrinsics: (4,) float32, normalized [fx/W, fy/H, cx/W, cy/H].
-        poses:     (n_latent, 7) float32, w2c [tx, ty, tz, qx, qy, qz, qw].
-    """
-    L = int(w2c_seq.shape[0])
-    # With vae_time_stride=1, indices are simply [0, 1, ..., n_latent-1].
-    idxs = [min(i, L - 1) for i in range(n_latent)]
-
-    poses = np.zeros((n_latent, 7), dtype=np.float32)
-    for i, fi in enumerate(idxs):
-        w2c = np.asarray(w2c_seq[fi], dtype=np.float64)
-        poses[i, :3] = w2c[:3, 3]
-        poses[i, 3:] = Rotation.from_matrix(w2c[:3, :3]).as_quat()
-
-    fx = float(intrinsics_row[0, 0])
-    fy = float(intrinsics_row[1, 1])
-    cx = float(intrinsics_row[0, 2])
-    cy = float(intrinsics_row[1, 2])
-    intrinsics = np.array(
-        [fx / orig_w, fy / orig_h, cx / orig_w, cy / orig_h],
-        dtype=np.float32,
-    )
-    return intrinsics, poses
-
-
-# --------------------------------------------------------------------------
 # Frame loading
 # --------------------------------------------------------------------------
 def load_video_frames(video_path, max_frames, target_h, target_w):
+    """Load video frames, resize to target_h x target_w, return (C,F,H,W) tensor.
+
+    Returns None if the video has fewer than *max_frames* frames.
+    Also returns the original (H, W) before resizing as the second element.
+    """
     if _USE_DECORD:
         vr = decord.VideoReader(video_path)
         if len(vr) < max_frames:
-            return None
+            return None, None
+        orig_h, orig_w = vr[0].shape[:2]
         frames = vr.get_batch(list(range(max_frames)))
         if isinstance(frames, torch.Tensor):
             frames = frames.numpy()
-        tensor = torch.from_numpy(frames).float().permute(3, 0, 1, 2)  # C,F,H,W
+        tensor = torch.from_numpy(frames).float().permute(3, 0, 1, 2)
     else:
         cap = cv2.VideoCapture(video_path)
         buf = []
+        orig_h = orig_w = None
         for _ in range(max_frames):
             ok, fr = cap.read()
             if not ok:
                 cap.release()
-                return None
+                if len(buf) < max_frames:
+                    return None, None
+                break
+            if orig_h is None:
+                orig_h, orig_w = fr.shape[:2]
             buf.append(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
         cap.release()
         tensor = torch.from_numpy(np.stack(buf)).float().permute(3, 0, 1, 2)
+
     if tensor.shape[2] != target_h or tensor.shape[3] != target_w:
         tensor = F.interpolate(
             tensor.unsqueeze(0),
@@ -280,46 +272,13 @@ def load_video_frames(video_path, max_frames, target_h, target_w):
             mode="trilinear", align_corners=False,
         ).squeeze(0)
     tensor = (tensor / 255.0 - 0.5) * 2.0
-    return tensor
+    return tensor, (orig_h, orig_w)
 
 
 # --------------------------------------------------------------------------
-# Main
+# LMDB helpers
 # --------------------------------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--video_dir", required=True,
-                   help="Directory containing <clip_id>.mp4 files")
-    p.add_argument("--camera_dir", required=True,
-                   help="Directory of VGGT-Omega <clip_id>.npz files "
-                        "(produced by batch_vggt_omega.py --cameras_only)")
-    p.add_argument("--caption_csv", required=True, nargs="+",
-                   help="One or more caption files. CSV files must have "
-                        "'videoFile' and 'caption' columns. JSON files "
-                        "(.json) can be a list of {video_path, caption} "
-                        "objects (minWM-data clips.json format) or a dict "
-                        "mapping clip_id -> caption.")
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--target_h", type=int, default=704)
-    p.add_argument("--target_w", type=int, default=1280)
-    p.add_argument("--max_frames", type=int, default=157,
-                   help="raw frame count (must give integer F_lat under 4x temporal)")
-    p.add_argument("--keep_shards", action="store_true",
-                   help="Keep the transient per-rank shard dirs after merge "
-                        "(debugging only).")
-    p.add_argument("--no_resume", action="store_true",
-                   help="Wipe any existing output ('data/' + shards) and "
-                        "reprocess everything from scratch.")
-    p.add_argument("--use_parent_as_clip_id", action="store_true",
-                   help="Use the immediate parent directory name as the "
-                        "clip_id instead of the video filename. Enables "
-                        "recursive video search. Useful for minWM-data "
-                        "where videos are stored as <clip_id>/gen.mp4.")
-    return p.parse_args()
-
-
 def _read_paths_from_lmdb(lmdb_dir):
-    """Return (count, set_of_video_paths) stored in an existing LMDB."""
     if not os.path.isfile(os.path.join(lmdb_dir, "data.mdb")):
         return 0, set()
     env = lmdb.open(lmdb_dir, readonly=True, lock=False)
@@ -344,8 +303,6 @@ def _read_paths_from_lmdb(lmdb_dir):
 def _flush_pending_shards_into_final(output_dir, world_size, lat_shape_det,
                                      intr_shape_det, poses_shape_det,
                                      per_sample_bytes):
-    """Merge any leftover ``.rank_*`` shards from a previous interrupted run
-    into ``data/`` and delete them."""
     final_dir = os.path.join(output_dir, "data")
     pending = []
     for r in range(max(world_size, 1)):
@@ -370,15 +327,15 @@ def _flush_pending_shards_into_final(output_dir, world_size, lat_shape_det,
         if os.path.isdir(output_dir):
             for name in sorted(os.listdir(output_dir)):
                 if name.startswith(".rank_"):
-                    rd = os.path.join(output_dir, name)
-                    shutil.rmtree(rd, ignore_errors=True)
+                    shutil.rmtree(os.path.join(output_dir, name),
+                                  ignore_errors=True)
         return
 
     new_total = sum(c for _, c in pending)
     base_count, existing_paths = _read_paths_from_lmdb(final_dir)
     print(f"[pre-merge] found {len(pending)} leftover rank shard(s) with "
-          f"{new_total} samples; merging into {final_dir} (existing: {base_count}) "
-          f"before resuming.")
+          f"{new_total} samples; merging into {final_dir} (existing: "
+          f"{base_count}) before resuming.")
 
     os.makedirs(final_dir, exist_ok=True)
     fmap = int((base_count + new_total) * per_sample_bytes * 1.3) + 1_000_000_000
@@ -406,7 +363,8 @@ def _flush_pending_shards_into_final(output_dir, world_size, lat_shape_det,
                     wtxn.put(f"intrinsics_{gi}_data".encode(), intr)
                     wtxn.put(f"poses_{gi}_data".encode(), pos)
                     if path is not None:
-                        wtxn.put(f"paths_{gi}_data".encode(), path.encode("utf-8"))
+                        wtxn.put(f"paths_{gi}_data".encode(),
+                                  path.encode("utf-8"))
                 if path is not None:
                     existing_paths.add(path)
                 gi += 1
@@ -428,9 +386,39 @@ def _flush_pending_shards_into_final(output_dir, world_size, lat_shape_det,
 
     for name in sorted(os.listdir(output_dir)):
         if name.startswith(".rank_"):
-            rd = os.path.join(output_dir, name)
-            shutil.rmtree(rd, ignore_errors=True)
+            shutil.rmtree(os.path.join(output_dir, name), ignore_errors=True)
     print("[pre-merge] removed leftover rank shard dirs.")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--video_dir", required=True,
+                   help="Directory containing <clip_id>.mp4 video files.")
+    p.add_argument("--camera_dir", required=True,
+                   help="Directory of ViPE <clip_id>.npz pose files "
+                        "(c2w, per-frame).")
+    p.add_argument("--intrinsics_dir", default=None,
+                   help="Directory of ViPE <clip_id>.npz intrinsics files. "
+                        "Auto-derived from --camera_dir by replacing 'pose' "
+                        "with 'intrinsics' if omitted.")
+    p.add_argument("--caption_csv", required=True, nargs="+",
+                   help="One or more caption files. CSV files must have "
+                        "'videoFile' and 'caption' columns. JSON files can "
+                        "be a list of {video_path, caption} objects.")
+    p.add_argument("--output_dir", required=True)
+    p.add_argument("--target_h", type=int, default=704)
+    p.add_argument("--target_w", type=int, default=1280)
+    p.add_argument("--max_frames", type=int, default=957,
+                   help="raw frame count (must be 4*k+1 for Wan2.2 VAE).")
+    p.add_argument("--keep_shards", action="store_true")
+    p.add_argument("--no_resume", action="store_true")
+    p.add_argument("--use_parent_as_clip_id", action="store_true",
+                   help="Use parent directory name as clip_id (for minWM-data "
+                        "where videos are <clip_id>/gen.mp4).")
+    return p.parse_args()
 
 
 def main():
@@ -445,7 +433,7 @@ def main():
             f"target_h/target_w must be divisible by 16, got "
             f"{args.target_h}x{args.target_w}."
         )
-    n_latent = (args.max_frames - 1) // 4 + 1   # Wan2.2 VAE: 4x temporal
+    n_latent = (args.max_frames - 1) // 4 + 1
     h_lat = args.target_h // 16
     w_lat = args.target_w // 16
     lat_shape_det = (n_latent, 48, h_lat, w_lat)
@@ -470,12 +458,16 @@ def main():
         global_rank = 0
     device = torch.device(f"cuda:{local_rank}")
 
-    # ---- Load camera + caption metadata ----
+    # ---- Load ViPE cameras + captions ----
     if global_rank == 0:
-        print(f"Loading VGGT-Omega cameras from: {args.camera_dir}")
-    cam_table = load_vggt_camera_dir(args.camera_dir)
+        print(f"Loading ViPE cameras from: {args.camera_dir}")
+        if args.intrinsics_dir:
+            print(f"Intrinsics dir: {args.intrinsics_dir}")
+        else:
+            print("Intrinsics dir: (auto-derived)")
+    cam_table = load_vipe_cameras(args.camera_dir, args.intrinsics_dir)
     if global_rank == 0:
-        print(f"Loaded {len(cam_table)} VGGT camera NPZ files.")
+        print(f"Loaded {len(cam_table)} ViPE camera NPZ files.")
 
     cap_table = load_caption_csvs(
         args.caption_csv, use_parent_as_clip_id=args.use_parent_as_clip_id)
@@ -486,7 +478,6 @@ def main():
     # ---- Build the valid clip list (video ∩ camera ∩ caption) ----
     valid = []
     missing_video = missing_camera = missing_caption = 0
-    # Iterate over video files that exist on disk
     if args.use_parent_as_clip_id:
         video_files = sorted(glob.glob(
             os.path.join(args.video_dir, "**", "*.mp4"), recursive=True))
@@ -504,18 +495,16 @@ def main():
             missing_caption += 1
             continue
         cam = cam_table[clip_id]
-        # Need at least n_latent camera poses
-        if cam["pose"].shape[0] < n_latent:
+        # Need at least max_frames camera poses (interval=1)
+        if cam["c2w"].shape[0] < args.max_frames:
             missing_camera += 1
             continue
         valid.append({
             "clip_id":    clip_id,
             "video_path": vp,
             "caption":    cap_table[clip_id],
-            "w2c":        cam["pose"],   # (T, 4, 4) w2c
-            "intr_mat":   cam["intrinsics"][0],   # (3, 3) first frame
-            "vggt_h":     cam["height"],
-            "vggt_w":     cam["width"],
+            "c2w":        cam["c2w"],            # (T, 4, 4) c2w
+            "intr":       cam["intrinsics"],      # (T, 4) or None
         })
 
     if global_rank == 0:
@@ -532,7 +521,7 @@ def main():
     final_dir = os.path.join(args.output_dir, "data")
     rank_dir = os.path.join(args.output_dir, f".rank_{global_rank}")
 
-    # ---- Optional clean slate ----
+    # ---- Clean slate or pre-merge ----
     if args.no_resume:
         if global_rank == 0 and os.path.exists(final_dir):
             shutil.rmtree(final_dir)
@@ -541,11 +530,6 @@ def main():
         if world_size > 1:
             torch.distributed.barrier()
     else:
-        # ---- Pre-merge any leftover .rank_* shards from a previous run ----
-        # After this step, ``final_dir`` is the single source of truth for
-        # "already done" and there are no leftover ``.rank_*`` shards, so all
-        # ranks can compute an identical ``remaining`` list and repartition it
-        # for balanced work distribution.
         if global_rank == 0:
             _flush_pending_shards_into_final(
                 args.output_dir, world_size,
@@ -555,24 +539,18 @@ def main():
         if world_size > 1:
             torch.distributed.barrier()
 
-    # ---- Resume: read the merged-done set (identical on every rank) ----
+    # ---- Resume ----
     done_paths = set()
     if not args.no_resume:
         _, merged_paths = _read_paths_from_lmdb(final_dir)
         done_paths |= merged_paths
 
-    # ---- Filter out already-done clips BEFORE sharding, so the remaining
-    # work is (re)balanced across all GPUs on every resume. Without this,
-    # ranks whose slice of ``valid`` happens to be fully done would sit idle
-    # while other ranks carry all the load. ``valid`` order is deterministic
-    # (same on every rank) so every rank sees the same ``remaining``.
     remaining = [it for it in valid if it["video_path"] not in done_paths]
     if global_rank == 0:
         print(f"[resume] {len(done_paths)} clips already in merged data/; "
               f"{len(remaining)} clips still to process "
               f"(re-partitioning across {world_size} GPU(s)).")
 
-    # Shard the *remaining* work.
     if world_size > 1:
         per_gpu = (len(remaining) + world_size - 1) // world_size
         shard = remaining[global_rank * per_gpu:(global_rank + 1) * per_gpu]
@@ -583,18 +561,15 @@ def main():
     rank_map = int(max(len(shard), 1) * per_sample_bytes * 1.3) + 100_000_000
     rank_env = lmdb.open(rank_dir, map_size=rank_map, subdir=True)
 
-    # Defensive: if for any reason this rank's freshly-created shard already
-    # has entries (should not happen because pre-merge wipes all shards),
-    # continue appending instead of overwriting.
     count = 0
     with rank_env.begin() as txn:
         cnt_raw = txn.get(b"__count__")
         if cnt_raw is not None:
             count = int(cnt_raw.decode())
             for j in range(count):
-                pt = txn.get(f"paths_{j}_data".encode())
-                if pt is not None:
-                    done_paths.add(pt.decode("utf-8"))
+                p = txn.get(f"paths_{j}_data".encode())
+                if p is not None:
+                    done_paths.add(p.decode("utf-8"))
 
     errors = 0
     first_shape = None
@@ -606,22 +581,30 @@ def main():
             pbar.set_postfix(ok=count, err=errors, skip=len(done_paths))
             continue
         try:
-            frames = load_video_frames(
+            frames, orig_hw = load_video_frames(
                 item["video_path"], args.max_frames,
                 args.target_h, args.target_w)
-            if frames is None:
+            if frames is None or orig_hw is None:
                 errors += 1; continue
+            orig_h, orig_w = orig_hw
             pixel = frames.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
             with torch.no_grad():
-                latent = vae.encode_to_latent(pixel)  # (1, F_lat, 48, h, w)
+                latent = vae.encode_to_latent(pixel)
             latent_np = latent[0].float().cpu().numpy().astype(np.float16)
-            # vae_time_stride=1: VGGT cameras are already 4×-strided, so each
-            # camera pose i corresponds to latent frame i directly.
-            # VGGT-Omega extrinsics are w2c (world-to-camera) — stored directly
-            # without inversion.
-            intrinsics, poses = poses_from_vggt_w2c(
-                item["w2c"], n_latent, item["intr_mat"],
-                orig_w=item["vggt_w"], orig_h=item["vggt_h"])
+
+            # Get intrinsics row [fx, fy, cx, cy] in pixel units.
+            if item["intr"] is not None:
+                intr_row = item["intr"][0]  # first frame
+            else:
+                # Fallback: assume principal point at center, fov ~60°
+                intr_row = np.array(
+                    [orig_w * 0.75, orig_h * 0.75,
+                     orig_w / 2.0, orig_h / 2.0], dtype=np.float32)
+
+            # Convert ViPE c2w → w2c poses (4× temporal subsampling).
+            intrinsics, poses = poses_from_vipe_c2w(
+                item["c2w"], n_latent, intr_row,
+                orig_w=orig_w, orig_h=orig_h)
         except Exception as e:
             print(f"[GPU{local_rank}] failed {item.get('video_path')}: {e}")
             errors += 1; continue
@@ -657,7 +640,7 @@ def main():
     rank_env.sync(); rank_env.close()
     print(f"GPU{local_rank}: {count} OK, {errors} errors, {time.time()-t0:.0f}s")
 
-    # ---- Phase 2: rank-0 appends new shard samples into the merged data/ ----
+    # ---- Phase 2: rank-0 merges ----
     if world_size > 1:
         torch.distributed.barrier()
 
@@ -713,7 +696,8 @@ def main():
                         wtxn.put(f"intrinsics_{gi}_data".encode(), intr)
                         wtxn.put(f"poses_{gi}_data".encode(), pos)
                         if path is not None:
-                            wtxn.put(f"paths_{gi}_data".encode(), path.encode("utf-8"))
+                            wtxn.put(f"paths_{gi}_data".encode(),
+                                      path.encode("utf-8"))
                     if path is not None:
                         existing_paths.add(path)
                     gi += 1
