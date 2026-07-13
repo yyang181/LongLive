@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import random
 
 import torch
 import torch.distributed as dist
@@ -81,6 +82,79 @@ class Trainer(DiffusionTrainer):
 
         return clean_latent, viewmats, Ks, conditional_dict
 
+    def _streaming_inject_error_block(
+        self,
+        tensor,
+        buffer,
+        index_chunk,
+        block_index,
+        *,
+        sample_any_t=False,
+    ):
+        if buffer is None or buffer.is_empty():
+            return tensor, False
+        if (
+            getattr(self.model, "er_skip_block_0", False)
+            and (getattr(self.model, "er_block_offset", 0) + block_index) == 0
+        ):
+            return tensor, False
+
+        result = tensor.clone()
+        injected = False
+        for batch_idx in range(result.shape[0]):
+            if sample_any_t:
+                if getattr(buffer, "num_blocks", 0) > 0:
+                    err = buffer.sample_pos_any_t(
+                        block_index, device=result.device, dtype=result.dtype
+                    )
+                else:
+                    err = buffer.sample_global(device=result.device, dtype=result.dtype)
+            else:
+                block_pos = block_index if getattr(buffer, "num_blocks", 0) > 0 else None
+                err = buffer.sample(
+                    index_chunk[batch_idx, 0].item(),
+                    device=result.device,
+                    dtype=result.dtype,
+                    block_pos=block_pos,
+                )
+            if err is not None:
+                result[batch_idx] = result[batch_idx] + err[: result.shape[1]]
+                injected = True
+        return result, injected
+
+    def _streaming_collect_error_items(self, buffer, error_chunk, index_chunk, block_index):
+        if buffer is None:
+            return []
+
+        use_distributed = self.step <= getattr(self.model, "er_buffer_warmup_iter", 0)
+        if not use_distributed or not dist.is_initialized() or dist.get_world_size() <= 1:
+            err_list = [error_chunk.detach().contiguous()]
+            idx_list = [index_chunk.detach().contiguous()]
+        else:
+            if getattr(buffer, "num_blocks", 0) > 0 and self.dp_group is not None:
+                comm_group = self.dp_group
+                comm_size = dist.get_world_size(comm_group)
+            else:
+                comm_group = None
+                comm_size = dist.get_world_size()
+            err_local = error_chunk.detach().contiguous()
+            idx_local = index_chunk.detach().contiguous()
+            err_list = [torch.empty_like(err_local) for _ in range(comm_size)]
+            idx_list = [torch.empty_like(idx_local) for _ in range(comm_size)]
+            if comm_group is None:
+                dist.all_gather(err_list, err_local)
+                dist.all_gather(idx_list, idx_local)
+            else:
+                dist.all_gather(err_list, err_local, group=comm_group)
+                dist.all_gather(idx_list, idx_local, group=comm_group)
+
+        block_pos = block_index if getattr(buffer, "num_blocks", 0) > 0 else None
+        items = []
+        for err_rank, idx_rank in zip(err_list, idx_list):
+            for batch_idx in range(err_rank.shape[0]):
+                items.append((err_rank[batch_idx], idx_rank[batch_idx, 0].item(), block_pos))
+        return items
+
     def _train_one_step_camera(self, batch, accumulation_step=0, accumulation_steps=1):
         """Chunk-wise streaming supervised loss with Echo-style cache updates.
 
@@ -120,22 +194,8 @@ class Trainer(DiffusionTrainer):
         )
 
         noise = torch.randn_like(clean_latent)
-        noisy_latents = self.model.scheduler.add_noise(
-            clean_latent.flatten(0, 1),
-            noise.flatten(0, 1),
-            timestep.flatten(0, 1),
-        ).unflatten(0, (batch_size, num_frame))
-        training_target = self.model.scheduler.training_target(clean_latent, noise, timestep)
-
         if context_frames > 0:
-            noisy_latents[:, :context_frames] = initial_latent.to(
-                device=noisy_latents.device, dtype=noisy_latents.dtype
-            )
-            training_target[:, :context_frames] = 0
             timestep[:, :context_frames] = 0
-
-        clean_latent_aug = clean_latent
-        timestep_clean_aug = torch.zeros_like(timestep)
 
         kv_cache, crossattn_cache = self.model._build_streaming_caches(
             batch_size, clean_latent.dtype, clean_latent.device, frame_seq_length
@@ -156,6 +216,20 @@ class Trainer(DiffusionTrainer):
             self.generator_optimizer.zero_grad(set_to_none=True)
             self.infmem_optimizer.zero_grad(set_to_none=True)
 
+        er_ready = (
+            self.model.error_buffer is not None
+            and self.model.noise_error_buffer is not None
+            and self.step >= getattr(self.model, "er_start_step", 0)
+        )
+        er_use_clean = (
+            er_ready
+            and getattr(self.model, "er_clean_prob", 0.0) > 0
+            and random.random() < self.model.er_clean_prob
+        )
+        er_context_injected = False
+        er_latent_injected = False
+        er_noise_injected = False
+
         valid_count = float(batch_size * max(num_frame - context_frames, 1))
         total_loss_value = torch.zeros([], device=self.device, dtype=torch.float32)
         chunk_count = 0
@@ -172,11 +246,56 @@ class Trainer(DiffusionTrainer):
             chunk_viewmats = viewmats[:, start:end]
             chunk_Ks = Ks[:, start:end]
             current_start = start * frame_seq_length
+            index_chunk = index[:, start:end]
+            timestep_chunk = timestep[:, start:end]
 
-            flow_pred, _ = self.model.generator(
-                noisy_image_or_video=noisy_latents[:, start:end],
+            clean_chunk_for_noise = clean_latent[:, start:end]
+            noise_chunk_for_train = noise[:, start:end]
+            if er_ready and not er_use_clean:
+                if (
+                    self.model.er_noise_inject_prob > 0
+                    and not self.model.noise_error_buffer.is_empty()
+                    and random.random() < self.model.er_noise_inject_prob
+                ):
+                    noise_chunk_for_train, injected = self._streaming_inject_error_block(
+                        noise_chunk_for_train,
+                        self.model.noise_error_buffer,
+                        index_chunk,
+                        block_index,
+                    )
+                    er_noise_injected = er_noise_injected or injected
+                if (
+                    self.model.er_latent_inject_prob > 0
+                    and not self.model.error_buffer.is_empty()
+                    and random.random() < self.model.er_latent_inject_prob
+                ):
+                    clean_chunk_for_noise, injected = self._streaming_inject_error_block(
+                        clean_chunk_for_noise,
+                        self.model.error_buffer,
+                        index_chunk,
+                        block_index,
+                    )
+                    er_latent_injected = er_latent_injected or injected
+
+            noisy_chunk = self.model.scheduler.add_noise(
+                clean_chunk_for_noise.flatten(0, 1),
+                noise_chunk_for_train.flatten(0, 1),
+                timestep_chunk.flatten(0, 1),
+            ).unflatten(0, (batch_size, end - start))
+            training_target_chunk = self.model.scheduler.training_target(
+                clean_latent[:, start:end], noise_chunk_for_train, timestep_chunk
+            )
+            if context_frames > 0 and start < context_frames:
+                pinned = max(0, min(end, context_frames) - start)
+                noisy_chunk[:, :pinned] = initial_latent[:, start:start + pinned].to(
+                    device=noisy_chunk.device, dtype=noisy_chunk.dtype
+                )
+                training_target_chunk[:, :pinned] = 0
+
+            flow_pred, x0_pred = self.model.generator(
+                noisy_image_or_video=noisy_chunk,
                 conditional_dict=block_cond,
-                timestep=timestep[:, start:end],
+                timestep=timestep_chunk,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
@@ -189,11 +308,11 @@ class Trainer(DiffusionTrainer):
 
             per_frame = torch.nn.functional.mse_loss(
                 flow_pred.float(),
-                training_target[:, start:end].float(),
+                training_target_chunk.float(),
                 reduction="none",
             ).mean(dim=(2, 3, 4))
             weight = self.model.scheduler.training_weight(
-                timestep[:, start:end]
+                timestep_chunk
             ).unflatten(0, (batch_size, end - start)).float()
             per_frame = per_frame * weight
             if context_frames > 0 and start < context_frames:
@@ -202,12 +321,47 @@ class Trainer(DiffusionTrainer):
             (chunk_loss / accumulation_steps).backward()
             total_loss_value = total_loss_value + chunk_loss.detach()
 
-            # Echo-Infinity-style context/cache advancement: state update only.
+            # Echo-Infinity-style context/cache advancement: feed the model's
+            # denoised prediction (optionally with context_noise), not GT clean latent.
             with torch.no_grad():
+                context_base = x0_pred.detach().clone()
+                if er_ready and not er_use_clean:
+                    if (
+                        self.model.er_context_inject_prob > 0
+                        and not self.model.error_buffer.is_empty()
+                        and random.random() < self.model.er_context_inject_prob
+                    ):
+                        context_base, injected = self._streaming_inject_error_block(
+                            context_base,
+                            self.model.error_buffer,
+                            index_chunk,
+                            block_index,
+                            sample_any_t=True,
+                        )
+                        er_context_injected = er_context_injected or injected
+
+                context_timestep = torch.full_like(
+                    timestep_chunk,
+                    float(getattr(self.config, "context_noise", 0)),
+                )
+                context_noise = torch.randn_like(context_base)
+                if context_frames > 0 and start < context_frames:
+                    pinned = max(0, min(end, context_frames) - start)
+                    context_base[:, :pinned] = initial_latent[:, start:start + pinned].to(
+                        device=context_base.device, dtype=context_base.dtype
+                    )
+                    context_noise[:, :pinned] = 0
+                    context_timestep[:, :pinned] = 0
+                context_noisy = self.model.scheduler.add_noise(
+                    context_base.flatten(0, 1),
+                    context_noise.flatten(0, 1),
+                    context_timestep.flatten(0, 1),
+                ).unflatten(0, (batch_size, end - start))
+
                 self.model.generator(
-                    noisy_image_or_video=clean_latent_aug[:, start:end],
+                    noisy_image_or_video=context_noisy,
                     conditional_dict=block_cond,
-                    timestep=timestep_clean_aug[:, start:end],
+                    timestep=context_timestep,
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
@@ -215,6 +369,33 @@ class Trainer(DiffusionTrainer):
                     viewmats=chunk_viewmats,
                     Ks=chunk_Ks,
                 )
+
+                if er_ready:
+                    latent_err = x0_pred.detach() - clean_latent[:, start:end].detach()
+                    sigma = self.model.scheduler.sigmas.to(flow_pred.device)[index_chunk].reshape(
+                        batch_size, end - start, 1, 1, 1
+                    ).to(flow_pred.dtype)
+                    noise_err = (
+                        flow_pred.detach() - training_target_chunk.detach()
+                    ) * (1.0 - sigma)
+
+                    lat_items = self._streaming_collect_error_items(
+                        self.model.error_buffer, latent_err, index_chunk, block_index
+                    )
+                    noise_items = self._streaming_collect_error_items(
+                        self.model.noise_error_buffer, noise_err, index_chunk, block_index
+                    )
+                    should_update = True
+                    if (
+                        er_use_clean
+                        and random.random() >= self.model.er_clean_buffer_update_prob
+                    ):
+                        should_update = False
+                    if should_update:
+                        self.model._apply_gathered_items(self.model.error_buffer, lat_items)
+                        self.model._apply_gathered_items(
+                            self.model.noise_error_buffer, noise_items
+                        )
 
             chunk_count += 1
             maybe_detach_infmem(
@@ -256,6 +437,18 @@ class Trainer(DiffusionTrainer):
             "infmem_grad_norm": infmem_grad_norm.item(),
             "infmem_lr": self.infmem_optimizer.param_groups[0]["lr"],
         }
+        if self.model.error_buffer is not None:
+            buf_stats = self.model.error_buffer.stats()
+            noise_buf_stats = self.model.noise_error_buffer.stats()
+            wandb_loss_dict.update({
+                "er_total_added": buf_stats["total_added"],
+                "er_filled_buckets": buf_stats["filled_buckets"],
+                "er_total_entries": buf_stats["total_entries"],
+                "er_noise_total_entries": noise_buf_stats["total_entries"],
+                "er_injected": er_context_injected,
+                "er_latent_injected": er_latent_injected,
+                "er_noise_injected": er_noise_injected,
+            })
         infmem_log_str = self._log_infmem_eviction_diagnostics(wandb_loss_dict)
         if self.is_main_process:
             if not self.disable_wandb:

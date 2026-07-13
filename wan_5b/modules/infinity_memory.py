@@ -291,6 +291,14 @@ def _self_attn_infmem_forward(
             v_sink_raw = cache_v[:, :effective_sink]
 
         local_k_parts, local_v_parts = [], []
+        if num_evicted_tokens > 0:
+            # Bridge segment: keep the just-evicted K/V visible for this
+            # forward. It is not written back to local cache; after the
+            # clean/context update it is committed to QueryMemoryEncoder.
+            evict_start = effective_sink
+            evict_end = evict_start + num_evicted_tokens
+            local_k_parts.append(cache_k[:, evict_start:evict_end])
+            local_v_parts.append(cache_v[:, evict_start:evict_end])
         if num_rolled_tokens > 0:
             roll_start = effective_sink + num_evicted_tokens
             roll_end = roll_start + num_rolled_tokens
@@ -358,9 +366,11 @@ def _self_attn_infmem_forward(
             v_local_raw = torch.cat(local_v_parts, dim=1) if len(local_v_parts) > 1 else local_v_parts[0]
 
     # -------- Relative RoPE layout --------------------------------------
-    num_cache_frames = local_end_index // frame_seqlen
     sink_size_frames = effective_sink // frame_seqlen
-    R_active = num_cache_frames - sink_size_frames
+    # Use the actually attended local K/V length. In roll-and-insert, this may
+    # include a temporary bridge segment for the just-evicted chunk, even though
+    # that segment will not remain in the physical local cache after apply.
+    R_active = (k_local_raw.shape[1] // frame_seqlen) if k_local_raw is not None else 0
     N_Q_rr = int(_CURRENT_GRID_META.get("memory_frames", 0)) if memory_kv is not None else 0
     current_start_frame = current_start // frame_seqlen
     num_frame_per_block_attr = getattr(self, "num_frame_per_block_attr", 8)

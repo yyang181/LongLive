@@ -668,7 +668,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache_pos,
                     current_start=current_start_frame * self.frame_seq_length,
                     cache_start=cache_start_frame * self.frame_seq_length,
+                    defer_cache_updates=True,
                     update_memory=False,
+                    apply_cache_updates=False,
                     **self._camera_kwargs(current_start_frame, current_num_frames)
                 )
                 if use_cfg:
@@ -680,7 +682,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache_neg,
                         current_start=current_start_frame * self.frame_seq_length,
                         cache_start=cache_start_frame * self.frame_seq_length,
+                        defer_cache_updates=True,
                         update_memory=False,
+                        apply_cache_updates=False,
                         **self._camera_kwargs(current_start_frame, current_num_frames)
                     )
                     flow_pred = flow_pred_uncond + self.guidance_scale * (

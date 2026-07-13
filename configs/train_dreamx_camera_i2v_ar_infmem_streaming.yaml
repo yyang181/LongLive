@@ -84,6 +84,8 @@ training:
   # Match Echo-Infinity: clean/context cache-memory update is a state update,
   # not a supervised prediction graph, so keep it under no_grad.
   infmem_clean_update_no_grad: true
+  # Cache/memory update feeds x0_pred re-noised at this timestep (Echo-Infinity style).
+  context_noise: 0
   infmem_strict_update: true
   gc_interval: 100
   encoder_lr_multiplier: 5.0
