@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+lmdb_vis/
 .venv/
 data/
 checkpoints/
