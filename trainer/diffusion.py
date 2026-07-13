@@ -899,31 +899,13 @@ class Trainer:
         # 6. Set up EMA parameter containers
         ema_weight = config.ema_weight
         self.generator_ema = None
-        # EMA safety: generator EMA must not be used with an attached encoder
-        # unless an encoder EMA is also maintained, otherwise the model
-        # silently mixes EMA generator + non-EMA encoder. Until an encoder
-        # EMA is implemented, refuse rather than silently producing a mixed
-        # model. This can be explicitly bypassed with
-        # ``allow_ema_without_encoder_ema``.
-        _has_enc_for_ema = (
-            self.infmem_optimizer is not None
-            or self._pending_infmem_optimizer_state is not None
-        )
-        if (
-            (ema_weight is not None) and (ema_weight > 0.0)
-            and _has_enc_for_ema
-            and not bool(getattr(config, "allow_ema_without_encoder_ema", False))
-        ):
-            raise RuntimeError(
-                "Generator EMA cannot be used with InfMem until "
-                "QueryMemoryEncoder EMA is implemented. Set "
-                "allow_ema_without_encoder_ema=true to explicitly accept a "
-                "mixed EMA/non-EMA model."
-            )
         if (ema_weight is not None) and (ema_weight > 0.0) and (self.step >= config.ema_start_step):
             if self.is_main_process:
                 print(f"Setting up EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            from utils.infinity_memory_hooks import InfMemEMA, get_infmem_encoder
+            if get_infmem_encoder(self.model.generator) is not None:
+                self.infmem_ema = InfMemEMA(self.model.generator, decay=ema_weight)
 
         ##############################################################################################################
         # 7. (If resuming) Load optimizer and EMA from checkpoint
@@ -933,6 +915,15 @@ class Trainer:
         if raw_state is not None:
             if "generator_ema" in raw_state and self.generator_ema is not None:
                 self.generator_ema.load_state_dict(raw_state["generator_ema"])
+                if self.infmem_ema is not None:
+                    if "query_memory_encoder_ema" not in raw_state:
+                        if not bool(getattr(config, "allow_legacy_missing_infmem_ema", False)):
+                            raise RuntimeError(
+                                "EMA generator checkpoint is missing 'query_memory_encoder_ema'. "
+                                "Set allow_legacy_missing_infmem_ema=true only for legacy checkpoints."
+                            )
+                    else:
+                        self.infmem_ema.load_state_dict(raw_state["query_memory_encoder_ema"])
                 if self.is_main_process:
                     print("Resuming generator EMA...")
             else:
@@ -1133,6 +1124,8 @@ class Trainer:
                 "generator_optimizer": generator_opim_state_dict,
                 "step": self.step,
             }
+            if self.infmem_ema is not None:
+                state_dict["query_memory_encoder_ema"] = self.infmem_ema.state_dict()
         else:
             state_dict = {
                 "generator": generator_state_dict,
@@ -1421,10 +1414,15 @@ class Trainer:
                 (getattr(self.config, "ema_weight", None) is not None) and \
                 (self.config.ema_weight > 0):
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            from utils.infinity_memory_hooks import InfMemEMA, get_infmem_encoder
+            if get_infmem_encoder(self.model.generator) is not None:
+                self.infmem_ema = InfMemEMA(self.model.generator, decay=self.config.ema_weight)
 
         # Update EMA after optimizer step
         if self.generator_ema is not None and self.step >= self.config.ema_start_step:
             self.generator_ema.update(self.model.generator)
+            if self.infmem_ema is not None:
+                self.infmem_ema.update(self.model.generator)
 
         wandb_loss_dict = {
             "generator_loss": generator_loss.item(),
@@ -1564,9 +1562,14 @@ class Trainer:
                 (getattr(self.config, "ema_weight", None) is not None) and \
                 (self.config.ema_weight > 0):
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            from utils.infinity_memory_hooks import InfMemEMA, get_infmem_encoder
+            if get_infmem_encoder(self.model.generator) is not None:
+                self.infmem_ema = InfMemEMA(self.model.generator, decay=self.config.ema_weight)
 
         if self.generator_ema is not None and self.step >= self.config.ema_start_step:
             self.generator_ema.update(self.model.generator)
+            if self.infmem_ema is not None:
+                self.infmem_ema.update(self.model.generator)
 
         self.step += 1
 
@@ -1633,6 +1636,8 @@ class Trainer:
                     tmp = p.data.clone().float().cpu()
                     p.data.copy_(ema_val.to(dtype=p.dtype, device=p.device))
                     self.generator_ema.shadow[cleaned_name] = tmp
+        if self.infmem_ema is not None:
+            self.infmem_ema.swap(self.model.generator)
 
     def _run_evaluation_inference(self):
         gc.collect()

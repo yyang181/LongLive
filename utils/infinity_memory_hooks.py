@@ -109,6 +109,63 @@ def load_infmem_state_dict(generator: Any, state: Any, strict: bool = True) -> b
     return True
 
 
+class InfMemEMA:
+    """CPU EMA shadow for the out-of-FSDP ``QueryMemoryEncoder``."""
+
+    def __init__(self, generator: Any, decay: float):
+        encoder = get_infmem_encoder(generator)
+        if encoder is None:
+            raise ValueError("InfMemEMA requires an attached QueryMemoryEncoder")
+        self.decay = float(decay)
+        self.shadow = self._snapshot(encoder)
+
+    @staticmethod
+    def _snapshot(encoder: torch.nn.Module) -> dict:
+        return {
+            name: (value.detach().float().cpu().clone()
+                   if value.is_floating_point() else value.detach().cpu().clone())
+            for name, value in encoder.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, generator: Any) -> None:
+        encoder = get_infmem_encoder(generator)
+        if encoder is None:
+            raise RuntimeError("QueryMemoryEncoder is unavailable for EMA update")
+        for name, value in encoder.state_dict().items():
+            value = value.detach()
+            if name not in self.shadow:
+                self.shadow[name] = (value.float().cpu().clone()
+                                     if value.is_floating_point() else value.cpu().clone())
+            elif value.is_floating_point():
+                self.shadow[name].lerp_(value.float().cpu(), 1.0 - self.decay)
+            else:
+                self.shadow[name].copy_(value.cpu())
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {name: value.detach().cpu().clone() for name, value in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = float(state["decay"])
+        self.shadow = {
+            name: value.detach().cpu().clone()
+            for name, value in state["shadow"].items()
+        }
+
+    @torch.no_grad()
+    def swap(self, generator: Any) -> None:
+        """Swap raw encoder weights and EMA shadow; calling twice restores both."""
+        encoder = get_infmem_encoder(generator)
+        if encoder is None:
+            raise RuntimeError("QueryMemoryEncoder is unavailable for EMA swap")
+        current = self._snapshot(encoder)
+        encoder.load_state_dict(self.shadow, strict=True)
+        self.shadow = current
+
+
 def reset_infmem(
     generator: Any,
     batch_size: int,

@@ -47,12 +47,20 @@ def load_generator_checkpoint(generator, checkpoint_path: str, *, use_ema: bool 
     if strict is None:
         strict = not use_ema
     result = generator.load_state_dict(state_dict, strict=strict)
-    if isinstance(checkpoint, Mapping) and "query_memory_encoder" in checkpoint:
-        try:
+    if isinstance(checkpoint, Mapping):
+        encoder_key = "query_memory_encoder_ema" if use_ema else "query_memory_encoder"
+        if use_ema and encoder_key not in checkpoint:
+            raise RuntimeError(
+                "EMA generator checkpoint is missing 'query_memory_encoder_ema'; "
+                "refusing to mix EMA generator weights with a raw memory encoder."
+            )
+        if encoder_key in checkpoint:
             from utils.infinity_memory_hooks import load_infmem_state_dict
-            load_infmem_state_dict(generator, checkpoint["query_memory_encoder"], strict=True)
-        except Exception as exc:
-            print(f"Warning: failed to load query_memory_encoder: {exc}")
+            encoder_state = checkpoint[encoder_key]
+            if use_ema:
+                encoder_state = encoder_state["shadow"]
+            if not load_infmem_state_dict(generator, encoder_state, strict=True):
+                raise RuntimeError("Checkpoint contains memory encoder weights but no encoder is attached.")
     return result
 
 
@@ -224,12 +232,20 @@ def setup_nvfp4_pipeline(
     else:
         load_strict = not use_ema
         pipeline.generator.load_state_dict(state_dict, strict=load_strict)
-        if isinstance(checkpoint, Mapping) and "query_memory_encoder" in checkpoint:
-            try:
+        if isinstance(checkpoint, Mapping):
+            encoder_key = "query_memory_encoder_ema" if use_ema else "query_memory_encoder"
+            if use_ema and encoder_key not in checkpoint:
+                raise RuntimeError(
+                    "EMA generator checkpoint is missing 'query_memory_encoder_ema'; "
+                    "refusing to mix EMA generator weights with a raw memory encoder."
+                )
+            if encoder_key in checkpoint:
                 from utils.infinity_memory_hooks import load_infmem_state_dict
-                load_infmem_state_dict(pipeline.generator, checkpoint["query_memory_encoder"], strict=True)
-            except Exception as exc:
-                print(f"Warning: failed to load query_memory_encoder: {exc}")
+                encoder_state = checkpoint[encoder_key]
+                if use_ema:
+                    encoder_state = encoder_state["shadow"]
+                if not load_infmem_state_dict(pipeline.generator, encoder_state, strict=True):
+                    raise RuntimeError("Checkpoint contains memory encoder weights but no encoder is attached.")
 
         if has_lora_request:
             # Apply + merge LoRA on the BF16 base before quantization. Move the

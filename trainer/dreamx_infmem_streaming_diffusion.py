@@ -321,6 +321,16 @@ class Trainer(DiffusionTrainer):
             (chunk_loss / accumulation_steps).backward()
             total_loss_value = total_loss_value + chunk_loss.detach()
 
+            # Let the loss consume the prior query state before truncating
+            # BPTT; the newly updated state must survive into the next block.
+            chunk_count += 1
+            maybe_detach_infmem(
+                self.model.generator,
+                chunk_count,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+            )
+
             # Echo-Infinity-style context/cache advancement: feed the model's
             # denoised prediction (optionally with context_noise), not GT clean latent.
             with torch.no_grad():
@@ -366,6 +376,7 @@ class Trainer(DiffusionTrainer):
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     update_memory=True,
+                    memory_update_with_grad=True,
                     viewmats=chunk_viewmats,
                     Ks=chunk_Ks,
                 )
@@ -397,14 +408,6 @@ class Trainer(DiffusionTrainer):
                             self.model.noise_error_buffer, noise_items
                         )
 
-            chunk_count += 1
-            maybe_detach_infmem(
-                self.model.generator,
-                chunk_count,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-            )
-
         if accumulation_step != accumulation_steps - 1:
             return None
 
@@ -428,8 +431,12 @@ class Trainer(DiffusionTrainer):
             and (self.config.ema_weight > 0)
         ):
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            from utils.infinity_memory_hooks import InfMemEMA
+            self.infmem_ema = InfMemEMA(self.model.generator, decay=self.config.ema_weight)
         if self.generator_ema is not None and self.step >= self.config.ema_start_step:
             self.generator_ema.update(self.model.generator)
+            if self.infmem_ema is not None:
+                self.infmem_ema.update(self.model.generator)
 
         wandb_loss_dict = {
             "generator_loss": total_loss_value.item(),

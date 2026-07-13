@@ -95,9 +95,9 @@ training:
   infmem_verify_sync_interval: 100
   # Allow partial InfMem resume (re-init encoder/optimizer if missing).
   allow_partial_infmem_resume: false
-  # Allow generator EMA without encoder EMA (NOT recommended — produces a
-  # mixed EMA/non-EMA model). Defaults to false for safety.
-  allow_ema_without_encoder_ema: true
+  # Generator and QueryMemoryEncoder EMA are maintained as a matched pair.
+  allow_ema_without_encoder_ema: false
+  allow_legacy_missing_infmem_ema: false
   error_recycling:
     enabled: true
     num_buckets: 50

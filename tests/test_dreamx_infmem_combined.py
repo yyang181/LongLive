@@ -234,7 +234,9 @@ class TestConfigFiles(unittest.TestCase):
         mk = cfg["model_kwargs"]
         self.assertEqual(mk["local_attn_size"], 12)
         self.assertEqual(mk["sink_size"], 4)
-        self.assertEqual(mk["relative_rope_pmax"], 32)
+        # Window budget: sink(4) + local(12) + memory(3) + block(4) = 23 < 24.
+        self.assertEqual(mk["relative_rope_pmax"], 24)
+        self.assertEqual(mk["memory_kwargs"]["Q_frames"], 3)
         # n_encoder_layers should be 2, not 30
         self.assertEqual(mk["memory_kwargs"]["n_encoder_layers"], 2)
         self.assertNotIn("num_layers", mk["memory_kwargs"])

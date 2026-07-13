@@ -11,6 +11,7 @@ The tests build a *minimal* QueryMemoryEncoder directly (no full Wan model)
 so they run on CPU without GPU or distributed.
 """
 
+import copy
 import io
 import os
 import sys
@@ -85,6 +86,29 @@ class _FakeGenerator:
 
     def __init__(self, encoder):
         self.model = _FakeInner(encoder)
+
+
+class TestInfMemEMA(unittest.TestCase):
+    """The external encoder EMA must be CPU-resident and round-trippable."""
+
+    def test_ema_update_and_roundtrip(self):
+        from utils.infinity_memory_hooks import InfMemEMA
+
+        enc = _build_encoder()
+        generator = _FakeGenerator(enc)
+        ema = InfMemEMA(generator, decay=0.5)
+        name, parameter = next(iter(enc.named_parameters()))
+        before = ema.shadow[name].clone()
+        with torch.no_grad():
+            parameter.add_(2.0)
+        ema.update(generator)
+        self.assertTrue(torch.allclose(ema.shadow[name], before + 1.0))
+        state = ema.state_dict()
+        self.assertTrue(all(v.device.type == "cpu" for v in state["shadow"].values()))
+        loaded = InfMemEMA(generator, decay=0.1)
+        loaded.load_state_dict(state)
+        self.assertEqual(loaded.decay, 0.5)
+        self.assertTrue(torch.equal(loaded.shadow[name], ema.shadow[name]))
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +229,8 @@ class TestOptimizerRoundTrip(unittest.TestCase):
         enc_a = _build_encoder().to(device)
         opt_a = torch.optim.AdamW(enc_a.parameters(), lr=1e-3)
         self._train_step(enc_a, opt_a, seed=100)
-        self._train_step(enc_a, opt_a, seed=200)
-        # Record a parameter + optimizer state.
-        ref_param = next(enc_a.parameters()).detach().clone()
-        ref_state = opt_a.state_dict()
+        # Record optimizer state at the checkpoint boundary.
+        ref_state = copy.deepcopy(opt_a.state_dict())
         # Verify Adam state exists (exp_avg / exp_avg_sq).
         any_state = next(iter(ref_state["state"].values()))
         self.assertIn("exp_avg", any_state)
@@ -261,6 +283,8 @@ class TestOptimizerRoundTrip(unittest.TestCase):
             )
 
         # One more step with identical data → identical parameters.
+        self._train_step(enc_a, opt_a, seed=200)
+        ref_param = next(enc_a.parameters()).detach().clone()
         self._train_step(enc_b, opt_b, seed=200)
         new_param = next(enc_b.parameters()).detach().clone()
         torch.testing.assert_close(ref_param, new_param, rtol=0, atol=0)

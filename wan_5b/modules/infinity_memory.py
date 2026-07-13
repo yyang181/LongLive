@@ -630,6 +630,7 @@ def _model_forward_inference_infmem(
     cache_start=0,
     defer_cache_updates=False,
     update_memory=True,
+    memory_update_with_grad=False,
     viewmats=None,
     Ks=None,
 ):
@@ -926,8 +927,19 @@ def _model_forward_inference_infmem(
 
             strict_update = getattr(self, "_ei_strict_update", True)
             try:
-                with _infmem_autocast_context(exited_k):
-                    enc.update(exited_k, exited_v, sink_k, sink_v)
+                # The recache forward remains no-grad, while the compact
+                # encoder update is differentiable for the next chunk loss.
+                # Detaching cache tensors prevents retaining the 5B graph.
+                update_grad_context = (
+                    torch.enable_grad() if memory_update_with_grad else torch.no_grad()
+                )
+                with update_grad_context, _infmem_autocast_context(exited_k):
+                    enc.update(
+                        exited_k.detach(),
+                        exited_v.detach(),
+                        None if sink_k is None else sink_k.detach(),
+                        None if sink_v is None else sink_v.detach(),
+                    )
             except Exception as exc:
                 if strict_update:
                     raise RuntimeError(
