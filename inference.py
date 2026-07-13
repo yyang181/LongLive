@@ -615,26 +615,26 @@ configure_generator_torch_compile(pipeline, config)
 
 # ---- InfMem encoder post-pipeline verification ----
 # After all pipeline ``.to()`` calls, re-verify the encoder is on the right
-# device and still FP32 (pipeline.to(bf16) should NOT have cast it because the
-# encoder is attached via object.__setattr__, outside the module tree).
+# device/dtype. Echo-Infinity runs the external encoder in the runtime dtype.
 if _infmem_enc_loaded:
     from utils.infinity_memory_hooks import (
         get_infmem_encoder, move_infmem_encoder, state_dict_stats,
     )
     enc = get_infmem_encoder(pipeline.generator)
     if enc is not None:
+        _target_dtype = torch.bfloat16
         _dev_ok = all(p.device == device for p in enc.parameters())
-        _dtype_ok = all(p.dtype == torch.float32 for p in enc.parameters())
+        _dtype_ok = all(p.dtype == _target_dtype for p in enc.parameters())
         if not (_dev_ok and _dtype_ok):
             if local_rank == 0:
                 print(
                     f"[InfMem] encoder post-pipeline check: device_ok={_dev_ok}, "
-                    f"dtype_ok={_dtype_ok} — forcing FP32 + correct device."
+                    f"dtype_ok={_dtype_ok} — forcing {_target_dtype} + correct device."
                 )
             move_infmem_encoder(
                 pipeline.generator,
                 device=device,
-                dtype=torch.float32,
+                dtype=_target_dtype,
                 force_cast=True,
             )
         # Re-enforce eval + no-grad after the forced cast.

@@ -11,6 +11,7 @@ from trainer import (
     ScoreDistillationTrainer,
     DiffusionTrainer,
     CameraBidirectionalDiffusionTrainer,
+    DreamXInfMemStreamingDiffusionTrainer,
 )
 from utils.config import normalize_config
 
@@ -96,6 +97,8 @@ def main():
         trainer = DiffusionTrainer(config)
     elif config.trainer == "camera_bidirectional_diffusion":
         trainer = CameraBidirectionalDiffusionTrainer(config)
+    elif config.trainer == "dreamx_infmem_streaming_diffusion":
+        trainer = DreamXInfMemStreamingDiffusionTrainer(config)
     else:
         raise ValueError(f"Unknown trainer type: {config.trainer}")
     trainer.train()

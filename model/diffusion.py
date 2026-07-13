@@ -24,22 +24,39 @@ class CausalDiffusion(BaseModel):
         if self.independent_first_frame and not getattr(args, "i2v", False):
             self.generator.model.independent_first_frame = True
 
-        # Gradient checkpointing recomputes the block forward during backward,
-        # but InfMem streaming training mutates the KV cache and QueryMemoryEncoder
-        # state between chunks — the recomputed tensors will have different
-        # shapes (cache has grown / shifted), causing CheckpointError. The two
-        # features are fundamentally incompatible.
+        # InfMem streaming training uses a mutable KV cache / memory state.
+        # Even when the clean update runs under no_grad, checkpoint recomputation
+        # during backward would read the later mutated cache and produce tensors
+        # with different shapes. Disable PyTorch activation checkpointing for
+        # this path and rely on the smaller Echo-Infinity-style encoder +
+        # no_grad clean update to keep first-step memory bounded.
         _infmem_streaming = bool(getattr(args, "infmem_streaming_training", False))
         if args.gradient_checkpointing and _infmem_streaming:
             import logging as _logging
             _logging.warning(
                 "gradient_checkpointing=true is incompatible with "
-                "infmem_streaming_training (stateful KV cache + memory encoder "
-                "breaks checkpoint recomputation). Disabling gradient checkpointing."
+                "infmem_streaming_training because KV/memory state mutates "
+                "between forward and checkpoint recomputation. Disabling "
+                "gradient checkpointing."
             )
             args.gradient_checkpointing = False
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
+
+        if _infmem_streaming and getattr(self.generator.model, "query_memory_encoder", None) is not None:
+            clip_frames = int(list(getattr(args, "image_or_video_shape", [1, 0]))[1])
+            local_attn_size = int(getattr(self.generator.model, "local_attn_size", -1))
+            if local_attn_size == -1:
+                local_attn_size = 3 * int(self.num_frame_per_block)
+            if clip_frames <= local_attn_size:
+                raise ValueError(
+                    "infmem_streaming_training=true with QueryMemoryEncoder, but "
+                    f"image_or_video_shape[1]={clip_frames} <= local_attn_size="
+                    f"{local_attn_size}. The training clip is too short to trigger "
+                    "KV eviction, so encoder.update() will never happen and memory "
+                    "will not actually be trained. Reduce local_attn_size or use "
+                    "longer training clips."
+                )
 
         # Step 2: Initialize all hyperparameters
         self.num_train_timestep = args.num_train_timestep
@@ -158,14 +175,12 @@ class CausalDiffusion(BaseModel):
 
         self.generator = wrapper_cls(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
-        # If the wrapper attached an Echo-Infinity memory encoder, make sure
-        # its parameters are trainable too (they live outside FSDP flat-params
-        # thanks to object.__setattr__). Encoder stays FP32 — do NOT cast.
+        # If the wrapper attached an Echo-Infinity memory encoder, keep it
+        # trainable outside FSDP. Do not force FP32 here: Echo-Infinity casts
+        # the encoder to the runtime training dtype after FSDP wrapping.
         _encoder = getattr(self.generator.model, "query_memory_encoder", None)
         if _encoder is not None:
             _encoder.requires_grad_(True)
-            # Enforce FP32 for encoder parameters.
-            _encoder = _encoder.float()
             object.__setattr__(self.generator.model, "query_memory_encoder", _encoder)
             object.__setattr__(self.generator, "query_memory_encoder", _encoder)
 
@@ -311,21 +326,30 @@ class CausalDiffusion(BaseModel):
                 Ks=chunk_Ks,
             )
             flow_chunks.append(flow_pred)
-            x0_pred_chunks.append(x0_pred)
+            # x0_pred is only used for logging/error-buffer updates downstream;
+            # detaching it avoids retaining an extra graph for every streaming
+            # chunk while leaving the flow loss unchanged.
+            x0_pred_chunks.append(x0_pred.detach())
 
             clean_chunk = clean_latent_aug[:, start:end]
             clean_timestep_chunk = timestep_clean_aug[:, start:end]
-            self.generator(
-                noisy_image_or_video=clean_chunk,
-                conditional_dict=block_cond,
-                timestep=clean_timestep_chunk,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start=start * frame_seq_length,
-                update_memory=True,
-                viewmats=chunk_viewmats,
-                Ks=chunk_Ks,
+            clean_update_ctx = (
+                torch.no_grad()
+                if bool(getattr(self.args, "infmem_clean_update_no_grad", True))
+                else torch.enable_grad()
             )
+            with clean_update_ctx:
+                self.generator(
+                    noisy_image_or_video=clean_chunk,
+                    conditional_dict=block_cond,
+                    timestep=clean_timestep_chunk,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=start * frame_seq_length,
+                    update_memory=True,
+                    viewmats=chunk_viewmats,
+                    Ks=chunk_Ks,
+                )
             chunk_count += 1
             if maybe_detach_infmem is not None:
                 maybe_detach_infmem(

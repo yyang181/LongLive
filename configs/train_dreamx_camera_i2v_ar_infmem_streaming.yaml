@@ -59,7 +59,8 @@ model_kwargs:
     initializer_range: 0.014
 
 algorithm:
-  trainer: diffusion
+  # Independent Echo-Infinity-style chunk-wise streaming trainer.
+  trainer: dreamx_infmem_streaming_diffusion
   i2v: true
   causal: true
   teacher_forcing: true

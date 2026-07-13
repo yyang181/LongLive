@@ -81,6 +81,12 @@ class QueryMemoryEncoder(nn.Module):
         gate_init_bias = getattr(config, "gate_init_bias", 2.0)
         qk_norm = getattr(config, "qk_norm", True)
         eps = 1e-06
+        if hidden_dim != num_heads * head_dim:
+            raise ValueError(
+                f"QueryMemoryEncoder requires hidden_dim == num_heads * head_dim, "
+                f"got hidden_dim={hidden_dim}, num_heads={num_heads}, "
+                f"head_dim={head_dim}."
+            )
         self.M = Q_frames * M_tokens_per_frame
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -207,6 +213,34 @@ class QueryMemoryEncoder(nn.Module):
 
     # ---------------------------------------------------------------- update
 
+    def _adapt_cached_kv_to_encoder_heads(self, k, v):
+        """Adapt Wan-5B cached KV heads to the encoder attention shape.
+
+        Echo-Infinity's public encoder uses 1536 hidden / 12 heads, while
+        Wan2.2-5B content KV uses 3072 hidden / 24 heads. We keep the smaller
+        encoder and downsample/upsample heads only at the KV boundary.
+        """
+        if k.shape[-1] != self.head_dim or v.shape[-1] != self.head_dim:
+            raise ValueError(
+                f"Cached KV head_dim must match encoder head_dim={self.head_dim}, "
+                f"got k={tuple(k.shape)}, v={tuple(v.shape)}."
+            )
+        src_heads = int(k.shape[2])
+        dst_heads = int(self.num_heads)
+        if src_heads == dst_heads:
+            return k, v
+        if src_heads % dst_heads == 0:
+            group = src_heads // dst_heads
+            new_shape = (k.shape[0], k.shape[1], dst_heads, group, k.shape[3])
+            return k.reshape(new_shape).mean(dim=3), v.reshape(new_shape).mean(dim=3)
+        if dst_heads % src_heads == 0:
+            repeat = dst_heads // src_heads
+            return k.repeat_interleave(repeat, dim=2), v.repeat_interleave(repeat, dim=2)
+        raise ValueError(
+            f"Cannot adapt cached KV heads from {src_heads} to encoder heads "
+            f"{dst_heads}; one must divide the other."
+        )
+
     def update(self, evicted_k, evicted_v, sink_k=None, sink_v=None):
         if self.query_state is None:
             self.reset(
@@ -231,6 +265,7 @@ class QueryMemoryEncoder(nn.Module):
         else:
             ctx_k = evicted_k
             ctx_v = evicted_v
+        ctx_k, ctx_v = self._adapt_cached_kv_to_encoder_heads(ctx_k, ctx_v)
 
         def _update_single_group(qs, connector_proj, gate_linear):
             state = qs

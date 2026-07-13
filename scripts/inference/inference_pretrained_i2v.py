@@ -91,6 +91,56 @@ def to_bf16(d: dict) -> dict:
     return {k: (v.to(torch.bfloat16) if torch.is_tensor(v) else v) for k, v in d.items()}
 
 
+def _resolve_checkpoint_path(path: str | None) -> str | None:
+    if not path:
+        return path
+    model_pt = os.path.join(path, "model.pt")
+    if os.path.isdir(path) and os.path.isfile(model_pt):
+        return model_pt
+    return path
+
+
+def _delegate_config_inference(args, unknown: list[str]) -> None:
+    """Run the unified LongLive AR/camera/InfMem inference entry point.
+
+    This keeps validation for fine-tuned DreamX Camera + InfMem checkpoints on
+    the same CausalDiffusionInferencePipeline path used by training-time eval,
+    while preserving this script's historical --image_list/--prompt_list CLI.
+    """
+    argv = [
+        "inference.py",
+        "--config_path",
+        args.config_path,
+    ]
+    ckpt = _resolve_checkpoint_path(args.generator_ckpt)
+    if ckpt:
+        argv.append(f"checkpoints.generator_ckpt={ckpt}")
+    if args.image_list:
+        argv.append(f"inference.image_path={args.image_list}")
+    if args.prompt_list:
+        argv.append(f"inference.prompt_path={args.prompt_list}")
+    if args.trajectory_list:
+        argv.append(f"inference.trajectory_path={args.trajectory_list}")
+    if args.output_dir:
+        argv.append(f"inference.output_folder={args.output_dir}")
+    if args.sampling_steps is not None:
+        argv.append(f"inference.sampling_steps={int(args.sampling_steps)}")
+    if args.guidance_scale is not None:
+        argv.append(f"inference.guidance_scale={float(args.guidance_scale)}")
+    if args.max_clips is not None and args.max_clips > 0:
+        argv.append(f"inference_iter={int(args.max_clips) - 1}")
+    argv.extend(unknown)
+
+    print("[i2v-config] Delegating to LongLive inference.py:")
+    print(" ".join(argv))
+    old_argv = sys.argv
+    try:
+        sys.argv = argv
+        runpy.run_path(str(_REPO_ROOT / "inference.py"), run_name="__main__")
+    finally:
+        sys.argv = old_argv
+
+
 # --------------------------------------------------------------------------
 # Main I2V inference loop
 # --------------------------------------------------------------------------
@@ -244,6 +294,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pretrained Wan2.2-TI2V-5B Image-to-Video inference."
     )
+    # Config-driven fine-tuned validation mode. When provided, this script
+    # delegates to inference.py so DreamX Camera / InfMem / Relative-RoPE use
+    # the same model wrapper and pipeline as training-time inference.
+    parser.add_argument("--config_path", default=None,
+                        help="Config for fine-tuned LongLive inference; delegates to inference.py.")
+    parser.add_argument("--generator_ckpt", default=None,
+                        help="Fine-tuned checkpoint path or checkpoint_model_* directory.")
+    parser.add_argument("--trajectory_list", default=None,
+                        help="Optional trajectory list override for config-driven inference.")
+
     # Single-clip mode
     parser.add_argument("--image", default=None, help="Path to a source image.")
     parser.add_argument("--prompt", default=None, help="Text prompt for the clip.")
@@ -260,9 +320,9 @@ def main() -> None:
 
     # Negative prompt + sampling
     parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
-    parser.add_argument("--sampling_steps", type=int, default=50)
-    parser.add_argument("--guidance_scale", type=float, default=5.0)
-    parser.add_argument("--timestep_shift", type=float, default=5.0)
+    parser.add_argument("--sampling_steps", type=int, default=None)
+    parser.add_argument("--guidance_scale", type=float, default=None)
+    parser.add_argument("--timestep_shift", type=float, default=None)
 
     # Latent shape (defaults match the camera-bidir configs: 704x1280, 77 frames).
     parser.add_argument("--num_latent_frames", type=int, default=20)
@@ -275,7 +335,18 @@ def main() -> None:
     parser.add_argument("--max_clips", type=int, default=-1,
                         help="Cap number of clips to render in batch mode.")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if args.config_path is not None:
+        _delegate_config_inference(args, unknown)
+        return
+    if unknown:
+        parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
+    if args.sampling_steps is None:
+        args.sampling_steps = 50
+    if args.guidance_scale is None:
+        args.guidance_scale = 5.0
+    if args.timestep_shift is None:
+        args.timestep_shift = 5.0
 
     # ---- resolve job list ----
     if args.image_list and args.prompt_list:

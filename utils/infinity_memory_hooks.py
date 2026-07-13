@@ -83,14 +83,12 @@ def move_infmem_encoder(
     encoder = get_infmem_encoder(generator)
     if encoder is None:
         return False
-    if device is not None:
+    if device is not None and dtype is not None:
+        encoder.to(device=device, dtype=dtype)
+    elif device is not None:
         encoder.to(device=device)
-    if force_cast and dtype is not None:
+    elif dtype is not None:
         encoder.to(dtype=dtype)
-    elif dtype is not None and not force_cast:
-        # Even without force_cast, move to device but keep FP32 params.
-        # The caller may pass dtype for autocast context but we don't cast.
-        pass
     return True
 
 

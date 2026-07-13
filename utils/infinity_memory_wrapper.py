@@ -46,51 +46,122 @@ class _EncoderConfig:
             setattr(self, k, v)
 
 
-def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
-    """Build the encoder-side config with LongLive-5B safe defaults.
-
-    Wan2.2-TI2V-5B has 30 blocks, dim=3072 and each frame corresponds to
-    ``grid_h * grid_w = 22 * 40 = 880`` visual tokens (1280x704 latent at
-    16x16 patch size). These override Echo-Infinity's Wan2.1 (1560) defaults."""
-
-    defaults: Dict[str, Any] = {
-        # --- structural (must match Wan2.2-TI2V-5B) ---
-        "hidden_dim": 3072,
-        "num_heads": 24,
-        "n_encoder_layers": 2,
-        "head_dim": 128,
-        "tokens_per_frame": 880,          # 22 * 40 for 1280x704 latent
-        # --- memory sizing ---
-        "Q_frames": 8,
-        "M_tokens_per_frame": 32,
-        "num_query_groups": 1,
-        # --- optimisation ---
-        "bptt_clips": 2,
-        "encoder_lr_multiplier": 5.0,
-        # --- feature toggles ---
-        "use_sink_anchor": True,
-        "use_batch_update": False,
-        "use_residual_update": True,
-        "use_post_norm": True,
-        "use_vib": False,
-        "vib_kl_weight": 1.0e-4,
-        # --- init ---
-        "initializer_range": 0.02,
-    }
-    memory_kwargs = dict(memory_kwargs or {})
-    # Echo-Infinity configs often use these names. QueryMemoryEncoder reads
-    # the Wan-style names below, so normalize them before constructing it.
+def _normalize_memory_kwargs(memory_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize deprecated Echo/LongLive aliases before encoder creation."""
+    normalized = dict(memory_kwargs or {})
     aliases = {
         "dim": "hidden_dim",
         "num_layers": "n_encoder_layers",
         "init_scale": "initializer_range",
     }
     for src, dst in aliases.items():
-        if src in memory_kwargs and dst not in memory_kwargs:
-            memory_kwargs[dst] = memory_kwargs[src]
-        memory_kwargs.pop(src, None)
-    defaults.update(memory_kwargs)
+        if src in normalized and dst in normalized:
+            if normalized[src] != normalized[dst]:
+                raise ValueError(
+                    f"memory_kwargs contains both deprecated '{src}'={normalized[src]} "
+                    f"and '{dst}'={normalized[dst]} with different values. "
+                    f"Remove '{src}' and keep '{dst}'."
+                )
+        elif src in normalized:
+            normalized[dst] = normalized[src]
+        normalized.pop(src, None)
+    return normalized
+
+
+def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
+    """Build the encoder-side config with Echo-Infinity-like safe defaults.
+
+    Wan2.2-TI2V-5B uses 880 visual tokens per latent frame at 1280x704
+    (22 * 40). The memory encoder defaults follow Echo-Infinity's public
+    configuration scale (1536 hidden / 12 heads / 2 layers) rather than the
+    full Wan-5B hidden size, with KV head adaptation handled at runtime.
+    """
+
+    defaults: Dict[str, Any] = {
+        # --- structural (Echo-Infinity public scale; adapted to Wan-5B KV) ---
+        "hidden_dim": 1536,
+        "num_heads": 12,
+        "n_encoder_layers": 2,
+        "head_dim": 128,
+        "tokens_per_frame": 880,          # 22 * 40 for 1280x704 latent
+        # --- memory sizing ---
+        "Q_frames": 3,
+        "M_tokens_per_frame": 32,
+        "num_query_groups": 1,
+        # --- optimisation ---
+        "bptt_clips": 1,
+        "encoder_lr_multiplier": 5.0,
+        # --- feature toggles ---
+        "use_sink_anchor": False,
+        "use_batch_update": False,
+        "use_residual_update": True,
+        "use_post_norm": True,
+        "use_vib": False,
+        "vib_kl_weight": 1.0e-4,
+        # --- init ---
+        "initializer_range": 0.014,
+    }
+    defaults.update(_normalize_memory_kwargs(memory_kwargs))
     return _EncoderConfig(**defaults)
+
+
+def _estimate_query_memory_encoder_params(cfg: _EncoderConfig) -> int:
+    """Estimate QueryMemoryEncoder parameter count before instantiation."""
+    hidden_dim = int(getattr(cfg, "hidden_dim"))
+    num_heads = int(getattr(cfg, "num_heads"))
+    head_dim = int(getattr(cfg, "head_dim"))
+    n_encoder_layers = int(getattr(cfg, "n_encoder_layers"))
+    q_frames = int(getattr(cfg, "Q_frames"))
+    m_tokens_per_frame = int(getattr(cfg, "M_tokens_per_frame"))
+    num_query_groups = int(getattr(cfg, "num_query_groups", 1))
+    qk_norm = bool(getattr(cfg, "qk_norm", True))
+    use_post_norm = bool(getattr(cfg, "use_post_norm", False))
+    use_vib = bool(getattr(cfg, "use_vib", False))
+    normalize_memory_k = bool(getattr(cfg, "normalize_memory_k", False))
+
+    memory_tokens = q_frames * m_tokens_per_frame
+    kv_out_dim = num_heads * head_dim
+    ffn_dim = hidden_dim * 4
+
+    # MemoryCrossAttentionLayer: q/o, q/norm1/norm2, and 2-layer FFN.
+    layer_params = 0
+    layer_params += hidden_dim * hidden_dim + hidden_dim  # q
+    layer_params += hidden_dim * hidden_dim + hidden_dim  # o
+    layer_params += hidden_dim if qk_norm else 0          # norm_q
+    layer_params += hidden_dim                            # norm1
+    layer_params += hidden_dim                            # norm2
+    layer_params += hidden_dim * ffn_dim + ffn_dim        # ffn.0
+    layer_params += ffn_dim * hidden_dim + hidden_dim     # ffn.2
+    total = n_encoder_layers * layer_params
+
+    # Per query group parameters.
+    per_group = 0
+    per_group += memory_tokens * hidden_dim               # query_init
+    per_group += hidden_dim * hidden_dim + hidden_dim     # connector_proj.0
+    per_group += hidden_dim * hidden_dim + hidden_dim     # connector_proj.2
+    per_group += hidden_dim                               # connector_proj RMSNorm
+    per_group += (hidden_dim * 2) * hidden_dim + hidden_dim  # gate_linear
+    per_group += hidden_dim * kv_out_dim + kv_out_dim     # to_k
+    per_group += hidden_dim * kv_out_dim + kv_out_dim     # to_v
+    per_group += kv_out_dim if normalize_memory_k else 0
+    total += num_query_groups * per_group
+
+    if use_post_norm:
+        total += hidden_dim
+    if use_vib:
+        total += 2 * (hidden_dim * hidden_dim + hidden_dim)
+    return int(total)
+
+
+def _format_encoder_hparams(cfg: _EncoderConfig) -> str:
+    keys = (
+        "hidden_dim", "num_heads", "head_dim", "n_encoder_layers",
+        "tokens_per_frame", "Q_frames", "M_tokens_per_frame",
+        "num_query_groups", "bptt_clips", "encoder_lr_multiplier",
+        "use_sink_anchor", "use_batch_update", "use_residual_update",
+        "use_post_norm", "use_vib", "initializer_range",
+    )
+    return ", ".join(f"{k}={getattr(cfg, k, None)}" for k in keys)
 
 
 def _attach_infmem_to_wrapper(
@@ -132,41 +203,38 @@ def _attach_infmem_to_wrapper(
     # trainer must recognise this attribute and build a separate
     # optimizer param group; see ``model.diffusion._initialize_models``.
     if memory_kwargs is not None:
-        mk = dict(memory_kwargs)
-        # Conflict check: if both ``num_layers`` and ``n_encoder_layers`` are
-        # present with different values, the user may have a stale config.
-        if "num_layers" in mk and "n_encoder_layers" in mk:
-            if int(mk["num_layers"]) != int(mk["n_encoder_layers"]):
-                raise ValueError(
-                    f"memory_kwargs contains both 'num_layers'={mk['num_layers']} "
-                    f"and 'n_encoder_layers'={mk['n_encoder_layers']} with "
-                    f"different values. Remove the deprecated 'num_layers' key."
-                )
         enc_cfg = _make_encoder_config(memory_kwargs)
-        encoder = QueryMemoryEncoder(enc_cfg)
-
-        # Print layer count and parameter count.
-        n_enc_layers = int(getattr(encoder, "layers", None) and len(encoder.layers) or getattr(enc_cfg, "n_encoder_layers", 0))
-        n_params = sum(p.numel() for p in encoder.parameters())
+        estimated_params = _estimate_query_memory_encoder_params(enc_cfg)
         _MAX_ENCODER_PARAMS = 300_000_000
-        print(
-            f"[InfMem] QueryMemoryEncoder created: "
-            f"n_encoder_layers={n_enc_layers}, "
-            f"params={n_params:,} ({n_params / 1e6:.2f}M)",
-            flush=True,
-        )
-        if n_params > _MAX_ENCODER_PARAMS:
+        hparam_str = _format_encoder_hparams(enc_cfg)
+        if estimated_params > _MAX_ENCODER_PARAMS:
             raise ValueError(
-                f"QueryMemoryEncoder parameter count ({n_params:,}) exceeds "
-                f"the maximum allowed ({_MAX_ENCODER_PARAMS:,}). Reduce "
-                f"n_encoder_layers or hidden_dim in memory_kwargs."
+                f"Estimated QueryMemoryEncoder parameter count "
+                f"({estimated_params:,}) exceeds the maximum allowed "
+                f"({_MAX_ENCODER_PARAMS:,}) before construction. "
+                f"memory_kwargs: {hparam_str}"
             )
 
-        # Enforce FP32 for encoder parameters. The encoder lives outside FSDP
-        # and must NOT be cast to bf16 permanently — autocast handles mixed
-        # precision at compute time.
-        encoder = encoder.float()
+        print(
+            f"[InfMem] QueryMemoryEncoder config accepted: "
+            f"estimated_params={estimated_params:,} "
+            f"({estimated_params / 1e6:.2f}M), {hparam_str}",
+            flush=True,
+        )
+        encoder = QueryMemoryEncoder(enc_cfg)
+        n_params = sum(p.numel() for p in encoder.parameters())
+        print(
+            f"[InfMem] QueryMemoryEncoder created: "
+            f"params={n_params:,} ({n_params / 1e6:.2f}M), "
+            f"hidden_dim={getattr(enc_cfg, 'hidden_dim', None)}, "
+            f"n_encoder_layers={getattr(enc_cfg, 'n_encoder_layers', None)}, "
+            f"Q_frames={getattr(enc_cfg, 'Q_frames', None)}, "
+            f"M_tokens_per_frame={getattr(enc_cfg, 'M_tokens_per_frame', None)}",
+            flush=True,
+        )
 
+        # Keep the encoder outside FSDP, but do not force FP32 here. The
+        # trainer moves/casts it to the runtime dtype following Echo-Infinity.
         object.__setattr__(wrapper.model, "query_memory_encoder", encoder)
         object.__setattr__(wrapper, "query_memory_encoder", encoder)
     else:

@@ -248,6 +248,12 @@ def _self_attn_infmem_forward(
     cache_k = kv_cache["k"]
     cache_v = kv_cache["v"]
 
+    # Build only the actually attended sink/local segments instead of cloning
+    # the full KV cache. A full clone costs ~130MB/layer for 12 cached frames
+    # at Wan-5B shape and easily causes OOM when gradient checkpointing is off.
+    k_sink_raw = v_sink_raw = None
+    k_local_raw = v_local_raw = None
+
     if (
         self.local_attn_size != -1
         and current_end > _cache_global_end
@@ -260,25 +266,11 @@ def _self_attn_infmem_forward(
         )
         local_start_index = local_end_index - num_new_tokens
 
-        temp_k = cache_k.clone()
-        temp_v = cache_v.clone()
-        temp_k[:, effective_sink:effective_sink + num_rolled_tokens] = temp_k[
-            :,
-            effective_sink + num_evicted_tokens:
-            effective_sink + num_evicted_tokens + num_rolled_tokens,
-        ].clone()
-        temp_v[:, effective_sink:effective_sink + num_rolled_tokens] = temp_v[
-            :,
-            effective_sink + num_evicted_tokens:
-            effective_sink + num_evicted_tokens + num_rolled_tokens,
-        ].clone()
-
         write_start_index = max(local_start_index, effective_sink) if is_recompute else local_start_index
         roped_offset = max(0, write_start_index - local_start_index)
         write_len = max(0, local_end_index - write_start_index)
-        if write_len > 0:
-            temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
-            temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+        new_k = k[:, roped_offset:roped_offset + write_len]
+        new_v = v[:, roped_offset:roped_offset + write_len]
 
         pinned_shift = num_evicted_tokens if (has_pinned and pinned_start_val >= effective_sink) else 0
         cache_update_info = {
@@ -288,33 +280,82 @@ def _self_attn_infmem_forward(
             "num_evicted_tokens": num_evicted_tokens,
             "local_start_index": local_start_index,
             "local_end_index": local_end_index,
-            "new_k": k[:, roped_offset:roped_offset + write_len],
-            "new_v": v[:, roped_offset:roped_offset + write_len],
+            "new_k": new_k,
+            "new_v": new_v,
             "current_end": current_end,
             "pinned_shift": pinned_shift,
         }
+
+        if effective_sink > 0:
+            k_sink_raw = cache_k[:, :effective_sink]
+            v_sink_raw = cache_v[:, :effective_sink]
+
+        local_k_parts, local_v_parts = [], []
+        if num_rolled_tokens > 0:
+            roll_start = effective_sink + num_evicted_tokens
+            roll_end = roll_start + num_rolled_tokens
+            local_k_parts.append(cache_k[:, roll_start:roll_end])
+            local_v_parts.append(cache_v[:, roll_start:roll_end])
+        if write_len > 0:
+            local_k_parts.append(new_k)
+            local_v_parts.append(new_v)
+        if local_k_parts:
+            k_local_raw = torch.cat(local_k_parts, dim=1) if len(local_k_parts) > 1 else local_k_parts[0]
+            v_local_raw = torch.cat(local_v_parts, dim=1) if len(local_v_parts) > 1 else local_v_parts[0]
     else:
         local_end_index = _cache_local_end + current_end - _cache_global_end
         local_start_index = local_end_index - num_new_tokens
 
-        temp_k = cache_k.clone()
-        temp_v = cache_v.clone()
         write_start_index = max(local_start_index, effective_sink) if is_recompute else local_start_index
         roped_offset = max(0, write_start_index - local_start_index)
         write_len = max(0, local_end_index - write_start_index)
-        if write_len > 0:
-            temp_k[:, write_start_index:local_end_index] = k[:, roped_offset:roped_offset + write_len]
-            temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+        new_k = k[:, roped_offset:roped_offset + write_len]
+        new_v = v[:, roped_offset:roped_offset + write_len]
 
         cache_update_info = {
             "action": "direct_insert",
             "local_start_index": local_start_index,
             "local_end_index": local_end_index,
-            "new_k": k[:, roped_offset:roped_offset + write_len],
-            "new_v": v[:, roped_offset:roped_offset + write_len],
+            "new_k": new_k,
+            "new_v": new_v,
             "current_end": current_end,
             "pinned_shift": 0,
         }
+
+        if effective_sink > 0:
+            if write_len > 0 and write_start_index < effective_sink:
+                sink_k_parts, sink_v_parts = [], []
+                if write_start_index > 0:
+                    sink_k_parts.append(cache_k[:, :write_start_index])
+                    sink_v_parts.append(cache_v[:, :write_start_index])
+                overlap_end = min(local_end_index, effective_sink)
+                overlap_len = max(0, overlap_end - write_start_index)
+                if overlap_len > 0:
+                    sink_k_parts.append(k[:, roped_offset:roped_offset + overlap_len])
+                    sink_v_parts.append(v[:, roped_offset:roped_offset + overlap_len])
+                if overlap_end < effective_sink:
+                    sink_k_parts.append(cache_k[:, overlap_end:effective_sink])
+                    sink_v_parts.append(cache_v[:, overlap_end:effective_sink])
+                k_sink_raw = torch.cat(sink_k_parts, dim=1) if len(sink_k_parts) > 1 else sink_k_parts[0]
+                v_sink_raw = torch.cat(sink_v_parts, dim=1) if len(sink_v_parts) > 1 else sink_v_parts[0]
+            else:
+                k_sink_raw = cache_k[:, :effective_sink]
+                v_sink_raw = cache_v[:, :effective_sink]
+
+        local_k_parts, local_v_parts = [], []
+        prefix_end = max(effective_sink, min(write_start_index, local_end_index))
+        if prefix_end > effective_sink:
+            local_k_parts.append(cache_k[:, effective_sink:prefix_end])
+            local_v_parts.append(cache_v[:, effective_sink:prefix_end])
+        insert_start = max(write_start_index, effective_sink)
+        if write_len > 0 and local_end_index > insert_start:
+            insert_offset = roped_offset + (insert_start - write_start_index)
+            insert_len = local_end_index - insert_start
+            local_k_parts.append(k[:, insert_offset:insert_offset + insert_len])
+            local_v_parts.append(v[:, insert_offset:insert_offset + insert_len])
+        if local_k_parts:
+            k_local_raw = torch.cat(local_k_parts, dim=1) if len(local_k_parts) > 1 else local_k_parts[0]
+            v_local_raw = torch.cat(local_v_parts, dim=1) if len(local_v_parts) > 1 else local_v_parts[0]
 
     # -------- Relative RoPE layout --------------------------------------
     num_cache_frames = local_end_index // frame_seqlen
@@ -355,9 +396,8 @@ def _self_attn_infmem_forward(
     # ---- Apply RoPE per-segment (sink | memory | local | Q) --------------
     grid_py = [(num_new_frames, h, w)] * b
 
-    if effective_sink > 0:
-        k_sink_raw = temp_k[:, :effective_sink]
-        v_sink = temp_v[:, :effective_sink]
+    if effective_sink > 0 and k_sink_raw is not None:
+        v_sink = v_sink_raw
         sink_grid = [(sink_size_frames, h, w)] * b
         k_sink = causal_rope_apply(
             k_sink_raw, sink_grid, freqs, start_frame=0,
@@ -368,9 +408,8 @@ def _self_attn_infmem_forward(
         k_sink = None
         v_sink = None
 
-    if R_active > 0:
-        k_local_raw = temp_k[:, effective_sink:local_end_index]
-        v_local = temp_v[:, effective_sink:local_end_index]
+    if R_active > 0 and k_local_raw is not None:
+        v_local = v_local_raw
         local_grid = [(R_active, h, w)] * b
         k_local = causal_rope_apply(
             k_local_raw, local_grid, freqs,
@@ -669,6 +708,33 @@ def _model_forward_inference_infmem(
     frame_seqlen = _CURRENT_GRID_META["frame_seqlen"]
     enc = getattr(self, "query_memory_encoder", None)
     num_blocks = len(self.blocks)
+
+    def _adapt_memory_kv_to_model_heads(kv_pair):
+        if kv_pair is None:
+            return None
+        mk, mv = kv_pair
+        model_heads = int(getattr(self, "num_heads"))
+        model_head_dim = int(getattr(self, "dim")) // model_heads
+        if mk.shape[-1] != model_head_dim or mv.shape[-1] != model_head_dim:
+            raise ValueError(
+                f"Memory KV head_dim must match model head_dim={model_head_dim}, "
+                f"got k={tuple(mk.shape)}, v={tuple(mv.shape)}."
+            )
+        src_heads = int(mk.shape[2])
+        if src_heads == model_heads:
+            return mk, mv
+        if model_heads % src_heads == 0:
+            repeat = model_heads // src_heads
+            return mk.repeat_interleave(repeat, dim=2), mv.repeat_interleave(repeat, dim=2)
+        if src_heads % model_heads == 0:
+            group = src_heads // model_heads
+            new_shape = (mk.shape[0], mk.shape[1], model_heads, group, mk.shape[3])
+            return mk.reshape(new_shape).mean(dim=3), mv.reshape(new_shape).mean(dim=3)
+        raise ValueError(
+            f"Cannot adapt memory KV heads from {src_heads} to model heads "
+            f"{model_heads}; one must divide the other."
+        )
+
     if enc is not None and getattr(enc, "has_history", False):
         num_query_groups = getattr(enc, "num_query_groups", 1)
         # Validate query-group configuration before use.
@@ -686,9 +752,9 @@ def _model_forward_inference_infmem(
                 f"num_blocks ({num_blocks}) must be divisible by "
                 f"num_query_groups ({num_query_groups})"
             )
-        # Reference hidden tensor for autocast dtype selection. Encoder
-        # parameters are FP32 but the runtime query_state may be BF16, so we
-        # match the hidden x dtype to avoid FP32/BF16 matmul mismatches.
+        # Reference hidden tensor for autocast dtype selection. The external
+        # encoder runs in the training dtype, and we still keep this context so
+        # mixed-precision calls stay aligned with the hidden states.
         _autocast_ref = x
         with _infmem_autocast_context(_autocast_ref):
             if num_query_groups > 1:
@@ -702,15 +768,18 @@ def _model_forward_inference_infmem(
                 memory_kv_list = []
                 for i in range(num_blocks):
                     g = min(i // blocks_per_group, num_query_groups - 1)
-                    mk, mv = group_kvs[g]
-                    if mk is not None:
+                    kv_pair = _adapt_memory_kv_to_model_heads(group_kvs[g])
+                    if kv_pair is not None:
+                        mk, mv = kv_pair
                         mk = mk.to(device=x.device, dtype=x.dtype)
                         mv = mv.to(device=x.device, dtype=x.dtype)
-                    memory_kv_list.append((mk, mv))
+                        kv_pair = (mk, mv)
+                    memory_kv_list.append(kv_pair)
             else:
                 kv = enc.get_kv()
                 _CURRENT_GRID_META["memory_frames"] = int(getattr(enc, "Q_frames", 0) or 0)
                 _CURRENT_GRID_META["memory_tokens_per_frame"] = int(getattr(enc, "M_tokens_per_frame", frame_seqlen) or frame_seqlen)
+                kv = _adapt_memory_kv_to_model_heads(kv)
                 if kv is not None:
                     mk, mv = kv
                     mk = mk.to(device=x.device, dtype=x.dtype)
@@ -744,9 +813,13 @@ def _model_forward_inference_infmem(
         return custom_forward
 
     cache_update_infos = []
+    # Do not use torch.utils.checkpoint on the InfMem KV-cache path: backward
+    # recomputation would see the cache after subsequent clean/context updates,
+    # so saved/recomputed tensor metadata can differ.
+    use_block_checkpoint = False
     for block_index, block in enumerate(self.blocks):
         kwargs["memory_kv"] = memory_kv_list[block_index]
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
+        if use_block_checkpoint:
             kwargs.update({
                 "kv_cache": kv_cache[block_index],
                 "current_start": current_start,

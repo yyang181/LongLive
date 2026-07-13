@@ -88,6 +88,8 @@ class Trainer:
         self._pending_infmem_optimizer_meta = None
         self._is_infmem_combined = False
         self.infmem_ema = None
+        self._infmem_zero_eviction_steps = 0
+        self._infmem_zero_eviction_warned = False
 
         # Step 1: Initialize the distributed training environment (rank, seed, dtype, logging etc.)
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -536,7 +538,24 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # Detect camera LMDB data early. It contains precomputed latents, so
+        # the VAE is not needed for training even if legacy configs set
+        # load_raw_video=true. Also skip VAE when evaluation is disabled; keeping
+        # Wan VAE on GPU wastes several GB and can trigger OOM on 4-GPU InfMem.
+        data_path = getattr(config, "data_path", "")
+        self.use_camera_lmdb = os.path.isfile(
+            os.path.join(data_path, "data.mdb")
+        ) or (
+            os.path.isdir(data_path)
+            and any(os.path.isfile(os.path.join(data_path, d, "data.mdb"))
+                    for d in os.listdir(data_path))
+        )
+        evaluation_interval = section_get(
+            config, "evaluation", "interval", getattr(config, "generate_interval", 0)
+        )
+        needs_vae_for_training = bool(getattr(config, "load_raw_video", False)) and not self.use_camera_lmdb
+        needs_vae_for_eval = (not config.no_visualize) and evaluation_interval > 0
+        if needs_vae_for_training or needs_vae_for_eval:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -544,23 +563,17 @@ class Trainer:
             from utils.infinity_memory_hooks import (
                 move_infmem_encoder, get_infmem_encoder, broadcast_infmem_params,
             )
-            # Encoder stays FP32 — only move to device, do NOT cast dtype.
+            # Match Echo-Infinity: encoder is outside FSDP but runs in the
+            # same dtype as the training path (bf16 when mixed_precision=true).
             moved_infmem = move_infmem_encoder(
                 self.model.generator,
                 device=torch.device(self.device),
-                dtype=None,
-                force_cast=False,
+                dtype=self.dtype,
+                force_cast=True,
             )
             if moved_infmem:
                 _enc_check = get_infmem_encoder(self.model.generator)
                 if _enc_check is not None:
-                    # Runtime assertion: encoder parameters MUST stay FP32.
-                    assert all(
-                        p.dtype == torch.float32 for p in _enc_check.parameters()
-                    ), (
-                        "QueryMemoryEncoder parameters must be FP32 but found "
-                        f"{[p.dtype for p in _enc_check.parameters()]}"
-                    )
                     if self.is_main_process:
                         n_enc_params = sum(p.numel() for p in _enc_check.parameters())
                         n_enc_layers = len(getattr(_enc_check, "layers", []))
@@ -569,6 +582,9 @@ class Trainer:
                         print(
                             f"[InfMem] query_memory_encoder on device={enc_device}, "
                             f"dtype={enc_dtype}, layers={n_enc_layers}, "
+                            f"hidden_dim={getattr(_enc_check, 'hidden_dim', None)}, "
+                            f"Q_frames={getattr(_enc_check, 'Q_frames', None)}, "
+                            f"M_tokens_per_frame={getattr(_enc_check, 'M_tokens_per_frame', None)}, "
                             f"params={n_enc_params:,}"
                         )
                     # Broadcast encoder init from rank 0 so all ranks start
@@ -689,9 +705,9 @@ class Trainer:
                 # Validate checkpoint metadata (architecture consistency).
                 if self._pending_infmem_optimizer_meta is not None and self.is_main_process:
                     meta = self._pending_infmem_optimizer_meta
-                    saved_n_params = meta.get("n_params")
+                    saved_n_params = meta.get("num_params", meta.get("n_params"))
                     saved_n_layers = meta.get("n_encoder_layers")
-                    saved_dtype = meta.get("dtype")
+                    saved_dtype = meta.get("parameter_dtype", meta.get("dtype"))
                     cur_n_params = sum(p.numel() for p in _infmem_encoder.parameters())
                     cur_n_layers = len(getattr(_infmem_encoder, "layers", []))
                     if saved_n_params is not None and int(saved_n_params) != cur_n_params:
@@ -704,11 +720,13 @@ class Trainer:
                             f"Encoder layer count mismatch: checkpoint={saved_n_layers}, "
                             f"current={cur_n_layers}"
                         )
-                    if saved_dtype is not None:
-                        if "float32" not in str(saved_dtype):
-                            raise RuntimeError(
-                                f"Encoder dtype mismatch: checkpoint={saved_dtype}, "
-                                f"expected torch.float32"
+                    if saved_dtype is not None and self.is_main_process:
+                        cur_dtype = str(next(_infmem_encoder.parameters()).dtype)
+                        if str(saved_dtype) != cur_dtype:
+                            print(
+                                f"[InfMem][WARN] Encoder dtype changed from checkpoint "
+                                f"{saved_dtype} to runtime {cur_dtype}; loading weights and "
+                                f"optimizer state will follow the runtime dtype."
                             )
                 # Clear pending state.
                 self._pending_infmem_optimizer_state = None
@@ -1142,7 +1160,7 @@ class Trainer:
                             p.numel() for p in enc.parameters() if p.requires_grad
                         ),
                         "n_encoder_layers": len(getattr(enc, "layers", [])),
-                        "parameter_dtype": "torch.float32",
+                        "parameter_dtype": str(next(enc.parameters()).dtype),
                         "local_attn_size": getattr(
                             getattr(enc, "blocks", [None])[0] if hasattr(enc, "blocks") else enc,
                             "local_attn_size", None,
@@ -1225,6 +1243,65 @@ class Trainer:
         torch.cuda.empty_cache()
         import gc
         gc.collect()
+
+    def _log_infmem_eviction_diagnostics(self, wandb_loss_dict=None):
+        """Print early-step InfMem eviction/update diagnostics on rank 0."""
+        if self.infmem_optimizer is None:
+            return ""
+        try:
+            from utils.infinity_memory_hooks import (
+                get_infmem_encoder, resolve_inner_wan_model,
+            )
+            inner = resolve_inner_wan_model(self.model.generator)
+            enc = get_infmem_encoder(self.model.generator)
+        except Exception:
+            inner = None
+            enc = None
+        if inner is None or enc is None:
+            return ""
+
+        evicted_tokens = int(getattr(inner, "_ei_last_evicted_tokens", 0) or 0)
+        evicted_frames = int(getattr(inner, "_ei_last_evicted_frames", 0) or 0)
+        total_evicted_frames = int(getattr(inner, "_ei_total_evicted_frames", 0) or 0)
+        update_count = int(getattr(enc, "_update_count", 0) or 0)
+        if wandb_loss_dict is not None:
+            wandb_loss_dict["infmem_evicted_tokens"] = evicted_tokens
+            wandb_loss_dict["infmem_evicted_frames"] = evicted_frames
+            wandb_loss_dict["infmem_total_evicted_frames"] = total_evicted_frames
+            wandb_loss_dict["infmem_update_count"] = update_count
+
+        if 1 <= self.step <= 20:
+            if evicted_tokens == 0 and evicted_frames == 0:
+                self._infmem_zero_eviction_steps += 1
+            else:
+                self._infmem_zero_eviction_steps = 0
+            if self.is_main_process:
+                print(
+                    f"[InfMem][step {self.step:07d}] "
+                    f"num_evicted_tokens={evicted_tokens}, "
+                    f"_ei_last_evicted_frames={evicted_frames}, "
+                    f"_ei_total_evicted_frames={total_evicted_frames}, "
+                    f"encoder_update_count={update_count}",
+                    flush=True,
+                )
+                if (
+                    self.step == 20
+                    and self._infmem_zero_eviction_steps >= 20
+                    and not self._infmem_zero_eviction_warned
+                ):
+                    print(
+                        "[InfMem][WARN] num_evicted_tokens stayed 0 for the "
+                        "first 20 steps. The current local_attn_size or clip "
+                        "length likely prevents KV eviction, so memory is not "
+                        "being trained.",
+                        flush=True,
+                    )
+                    self._infmem_zero_eviction_warned = True
+        return (
+            f", infmem_evicted_tokens={evicted_tokens}, "
+            f"infmem_evicted_frames={evicted_frames}, "
+            f"infmem_updates={update_count}"
+        )
 
     def train_one_step(self, batch, accumulation_step=0, accumulation_steps=None):
         accumulation_steps = accumulation_steps or getattr(self, "gradient_accumulation_steps", 1)
@@ -1376,6 +1453,8 @@ class Trainer:
                 f"ctx={ctx_flag} lat={lat_flag} noise={noise_flag}"
             )
 
+        infmem_log_str = self._log_infmem_eviction_diagnostics(wandb_loss_dict)
+
         # Step 5: Logging
         if self.is_main_process:
             if not self.disable_wandb:
@@ -1384,6 +1463,7 @@ class Trainer:
                 f"[step {self.step:07d}] "
                 f"generator_loss={wandb_loss_dict['generator_loss']:.6f}, "
                 f"generator_grad_norm={wandb_loss_dict['generator_grad_norm']:.6f}"
+                f"{infmem_log_str}"
                 f"{er_log_str}"
             )
 
@@ -1497,6 +1577,7 @@ class Trainer:
         if self.infmem_optimizer is not None:
             wandb_loss_dict["infmem_grad_norm"] = infmem_grad_norm.item()
             wandb_loss_dict["infmem_lr"] = self.infmem_optimizer.param_groups[0]["lr"]
+        infmem_log_str = self._log_infmem_eviction_diagnostics(wandb_loss_dict)
         if self.is_main_process:
             if not self.disable_wandb:
                 wandb.log(wandb_loss_dict, step=self.step)
@@ -1504,6 +1585,7 @@ class Trainer:
                 f"[step {self.step:07d}] "
                 f"generator_loss={wandb_loss_dict['generator_loss']:.6f}, "
                 f"generator_grad_norm={wandb_loss_dict['generator_grad_norm']:.6f}"
+                f"{infmem_log_str}"
             )
 
         if self.step % self.config.gc_interval == 0:
