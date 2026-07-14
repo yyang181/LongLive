@@ -1,7 +1,7 @@
-/nfs/yixinyang/code/sana/data/third_person/demo_0.png
-/nfs/yixinyang/code/sana/data/third_person/demo_1.png
-/nfs/yixinyang/code/sana/data/third_person/demo_2.png
-/nfs/yixinyang/code/sana/data/third_person/demo_3.png
-/nfs/yixinyang/code/sana/data/third_person/demo_4.png
-/nfs/yixinyang/code/sana/data/third_person/demo_5.png
-/nfs/yixinyang/code/sana/data/third_person/demo_6.png
+data/test/third_person/demo_0.png
+data/test/third_person/demo_1.png
+data/test/third_person/demo_2.png
+data/test/third_person/demo_3.png
+data/test/third_person/demo_4.png
+data/test/third_person/demo_5.png
+data/test/third_person/demo_6.png
