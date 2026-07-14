@@ -240,6 +240,15 @@ class TestConfigFiles(unittest.TestCase):
         )
         self.assertTrue(cfg["training"].get("streaming_fsdp_no_sync", False))
         self.assertFalse(cfg["infra"].get("gradient_checkpointing", True))
+        self.assertFalse(cfg["model_kwargs"]["memory_kwargs"]["use_residual_update"])
+        self.assertFalse(
+            cfg["training"]["error_recycling"]["context_inject_on_self_feed"]
+        )
+        generator_ckpt = cfg["checkpoints"]["generator_ckpt"]
+        self.assertTrue(generator_ckpt.endswith("checkpoint_model_001540/model.pt"))
+        self.assertTrue(
+            os.path.isfile(os.path.join(os.path.dirname(__file__), "..", generator_ckpt))
+        )
 
     def test_train_config_new_hyperparams(self):
         """Verify the new hyperparameters match the updated recipe."""
@@ -528,5 +537,61 @@ class TestStreamingTrainerBoundedGpuMemory(unittest.TestCase):
         self.assertNotIn("[batch_size, 512, num_heads, head_dim]", cache_src)
 
 
+class TestCheckpointKwargsSnapshot(unittest.TestCase):
+    """Regression test for per-block kwargs during checkpoint recomputation."""
+    def test_backward_reuses_each_blocks_forward_kwargs(self):
+        from torch.utils.checkpoint import checkpoint
+        from wan_5b.modules.infinity_memory import _create_checkpoint_forward
+        class _ScaleBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(()))
+            def forward(self, x, scale):
+                return torch.sin(x * self.weight * scale)
+        x = torch.ones((), requires_grad=True)
+        blocks = [_ScaleBlock(), _ScaleBlock()]
+        outputs = []
+        for index, block in enumerate(blocks):
+            call_kwargs = {"scale": float(index + 1)}
+            outputs.append(
+                checkpoint(
+                    _create_checkpoint_forward(block),
+                    x,
+                    **call_kwargs,
+                    use_reentrant=False,
+                )
+            )
+        sum(outputs).backward()
+        expected = [torch.cos(torch.tensor(1.0)), 2 * torch.cos(torch.tensor(2.0))]
+        for block, expected_grad in zip(blocks, expected):
+            self.assertTrue(torch.allclose(block.weight.grad, expected_grad))
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestMemoryGradientCoverage(unittest.TestCase):
+    def test_query_init_connector_and_gate_receive_gradients(self):
+        import types
+        from tests.test_infmem_runtime_cuda import _build_encoder
+        from utils.infinity_memory_hooks import maybe_detach_infmem
+        from wan_5b.modules.infinity_memory import _infmem_autocast_context
+        device = torch.device("cuda")
+        encoder = _build_encoder(device)
+        encoder.use_residual_update = False
+        generator = types.SimpleNamespace(
+            model=types.SimpleNamespace(query_memory_encoder=encoder)
+        )
+        encoder.reset(batch_size=1, device=device, dtype=torch.bfloat16)
+        maybe_detach_infmem(generator, chunk_count=1)
+        evicted_k = torch.randn(
+            1, 8, encoder.num_heads, encoder.head_dim,
+            device=device, dtype=torch.bfloat16,
+        )
+        evicted_v = torch.randn_like(evicted_k)
+        with _infmem_autocast_context(evicted_k):
+            encoder.update(evicted_k, evicted_v)
+            memory_k, memory_v = encoder.get_kv()
+        loss = memory_k.float().square().mean() + memory_v.float().square().mean()
+        loss.backward()
+        self.assertIsNotNone(encoder.query_init.grad)
+        self.assertTrue(any(p.grad is not None for p in encoder.connector_proj.parameters()))
+        self.assertTrue(any(p.grad is not None for p in encoder.gate_linear.parameters()))
 if __name__ == "__main__":
     unittest.main()

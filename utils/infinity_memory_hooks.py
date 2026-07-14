@@ -218,7 +218,9 @@ def maybe_detach_infmem(
     bptt_clips = int(getattr(encoder, "bptt_clips", 1) or 1)
     if bptt_clips <= 0 or chunk_count % bptt_clips != 0:
         return False
-    encoder.detach_state()
+    # Keep query_init connected until the first eviction; otherwise it never receives loss.
+    if getattr(encoder, "has_history", False):
+        encoder.detach_state()
     # Detach KV cache tensors to cut the autograd graph — only the actual
     # k/v data tensors, not the scalar index tensors.
     if kv_cache is not None:

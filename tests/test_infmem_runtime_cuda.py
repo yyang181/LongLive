@@ -150,6 +150,32 @@ class TestUpdateAutocast(unittest.TestCase):
         self.assertGreater(grad_norm, 0.0)
 
 
+    def test_pre_history_detach_preserves_query_init_gradient(self):
+        """The first memory-supervised loss must train query_init."""
+        import types
+        from utils.infinity_memory_hooks import maybe_detach_infmem
+        device = torch.device("cuda")
+        enc = _build_encoder(device)
+        enc.use_residual_update = False
+        inner = types.SimpleNamespace(query_memory_encoder=enc)
+        generator = types.SimpleNamespace(model=inner)
+        enc.reset(batch_size=1, device=device, dtype=torch.bfloat16)
+        maybe_detach_infmem(generator, chunk_count=1)
+        evicted_k = torch.randn(
+            1, 8, enc.num_heads, enc.head_dim, device=device, dtype=torch.bfloat16
+        )
+        evicted_v = torch.randn_like(evicted_k)
+        with _infmem_autocast_context(evicted_k):
+            enc.update(evicted_k, evicted_v)
+            memory_k, memory_v = enc.get_kv()
+        loss = memory_k.float().square().mean() + memory_v.float().square().mean()
+        loss.backward()
+        self.assertIsNotNone(enc.query_init.grad)
+        self.assertTrue(torch.isfinite(enc.query_init.grad).all())
+        self.assertTrue(any(p.grad is not None for p in enc.connector_proj.parameters()))
+        self.assertTrue(any(p.grad is not None for p in enc.gate_linear.parameters()))
+
+
 @unittest.skipUnless(_HAS_CUDA, "CUDA required for these tests")
 class TestStreamingMemoryUpdate(unittest.TestCase):
     """Test 5: 20-frame streaming teacher-forcing produces real evictions."""

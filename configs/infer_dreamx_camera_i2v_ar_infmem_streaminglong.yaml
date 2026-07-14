@@ -32,7 +32,7 @@ model_kwargs:
     encoder_lr_multiplier: 5.0
     use_sink_anchor: false
     use_batch_update: false
-    use_residual_update: true
+    use_residual_update: false
     use_post_norm: true
     use_vib: false
     initializer_range: 0.014
@@ -84,7 +84,8 @@ inference:
   overlay_corner: bottom-left
 
 checkpoints:
-  generator_ckpt: logs/train_dreamx_camera_i2v_ar_infmem_streaming_b300/checkpoint_model_000600/model.pt
+  # Must be a checkpoint trained with use_residual_update=false.
+  generator_ckpt: null
   lora_ckpt: null
 
 logging:

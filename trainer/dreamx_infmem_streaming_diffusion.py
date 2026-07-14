@@ -425,6 +425,8 @@ class Trainer(DiffusionTrainer):
                 context_base = x0_pred.detach().clone()
                 if er_ready and not er_use_clean:
                     if (
+                        getattr(self.model, "er_context_inject_on_self_feed", False)
+                        and
                         self.model.er_context_inject_prob > 0
                         and not self.model.error_buffer.is_empty()
                         and random.random() < self.model.er_context_inject_prob

@@ -90,6 +90,13 @@ def _infmem_autocast_context(reference: torch.Tensor):
     return nullcontext()
 
 
+def _create_checkpoint_forward(module):
+    """Bind only the block; checkpoint supplies a fresh kwargs snapshot."""
+    def custom_forward(*inputs, **checkpoint_kwargs):
+        return module(*inputs, **checkpoint_kwargs)
+    return custom_forward
+
+
 def _compute_relative_positions(
     current_start_frame: int,
     B: int,
@@ -830,10 +837,6 @@ def _model_forward_inference_infmem(
         prope_meta=prope_meta,
     )
 
-    def create_custom_forward(module):
-        def custom_forward(*inputs, **_kwargs):
-            return module(*inputs, **_kwargs)
-        return custom_forward
 
     cache_update_infos = []
     # Checkpointing is safe only for the streaming trainer's prediction pass:
@@ -855,7 +858,7 @@ def _model_forward_inference_infmem(
                 "cache_start": cache_start,
             })
             result = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(block), x, **kwargs, use_reentrant=False,
+                _create_checkpoint_forward(block), x, **kwargs, use_reentrant=False,
             )
         else:
             kwargs.update({

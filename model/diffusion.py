@@ -149,6 +149,11 @@ class CausalDiffusion(BaseModel):
             self.er_start_step = int(cfg_dict.get("start_step", 0))
             self.er_buffer_warmup_iter = int(cfg_dict.get("buffer_warmup_iter", 50))
             self.er_skip_block_0 = bool(cfg_dict.get("skip_block_0", False))
+            # x0_pred is already self-fed by the streaming trainer; sampled context
+            # error on top of it is an explicit opt-in to avoid double-counting drift.
+            self.er_context_inject_on_self_feed = bool(
+                cfg_dict.get("context_inject_on_self_feed", False)
+            )
 
     def _initialize_models(self, args, device):
         model_name = getattr(args.model_kwargs, "model_name", "Wan2.2-TI2V-5B")
