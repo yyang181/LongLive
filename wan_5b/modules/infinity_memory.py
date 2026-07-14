@@ -123,6 +123,17 @@ def _compute_relative_positions(
         use_memory = True
         mem_end = local_start - 1
         mem_start = mem_end - N_Q + 1
+        # During early inference chunks the local window may extend back to
+        # the sink boundary, leaving no room for the memory segment between
+        # sink and local.  In that case the computed [mem_start, mem_end]
+        # would overlap the sink's [0, N_S-1], producing invalid RoPE
+        # positions.  Disable memory for this chunk — the model attends
+        # to sink + local + Q only, which is the same pattern used before
+        # the encoder accumulates any history.
+        if mem_start < N_S:
+            use_memory = False
+            mem_start = -1
+            mem_end = -1
     return dict(
         is_bulk_forward=is_bulk_forward,
         use_memory=use_memory,
