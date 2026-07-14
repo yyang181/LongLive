@@ -642,6 +642,7 @@ def _model_forward_inference_infmem(
     defer_cache_updates=False,
     update_memory=True,
     memory_update_with_grad=False,
+    checkpoint_blocks=False,
     viewmats=None,
     Ks=None,
 ):
@@ -835,10 +836,16 @@ def _model_forward_inference_infmem(
         return custom_forward
 
     cache_update_infos = []
-    # Do not use torch.utils.checkpoint on the InfMem KV-cache path: backward
-    # recomputation would see the cache after subsequent clean/context updates,
-    # so saved/recomputed tensor metadata can differ.
-    use_block_checkpoint = False
+    # Checkpointing is safe only for the streaming trainer's prediction pass:
+    # it defers cache writes, skips memory updates, and backprops immediately
+    # before the clean/context pass mutates either state. Legacy streaming
+    # paths update the cache before backward and must leave this flag disabled.
+    use_block_checkpoint = bool(
+        checkpoint_blocks
+        and torch.is_grad_enabled()
+        and defer_cache_updates
+        and not update_memory
+    )
     for block_index, block in enumerate(self.blocks):
         kwargs["memory_kv"] = memory_kv_list[block_index]
         if use_block_checkpoint:

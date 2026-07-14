@@ -15,8 +15,8 @@ infra:
   sequence_parallel_size: 1
   sharding_strategy: hybrid_full
   mixed_precision: true
-  # InfMem streaming mutates KV/memory state; PyTorch activation checkpointing
-  # would recompute against a later cache state and fail metadata checks.
+  # The generic model checkpoint flag stays off: legacy InfMem paths can
+  # mutate cache state before backward.
   gradient_checkpointing: false
   vae_halo_latents: 28
   generator_fsdp_wrap_strategy: size
@@ -84,6 +84,13 @@ training:
   # Match Echo-Infinity: clean/context cache-memory update is a state update,
   # not a supervised prediction graph, so keep it under no_grad.
   infmem_clean_update_no_grad: true
+  # Safe block checkpointing for this trainer's prediction pass only. Each
+  # chunk backprops before its clean/context cache update.
+  streaming_activation_checkpointing: true
+  # Accumulate full local FSDP gradients across streaming chunks and only
+  # reduce-scatter on the final chunk of the final accumulation micro-step.
+  # Disable if the extra unsharded-gradient memory is not affordable.
+  streaming_fsdp_no_sync: true
   # Cache/memory update feeds x0_pred re-noised at this timestep (Echo-Infinity style).
   context_noise: 0
   infmem_strict_update: true

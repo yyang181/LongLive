@@ -78,6 +78,10 @@ class TestInfMemSignatureCompatibility(unittest.TestCase):
         params = sig.parameters
         self.assertIn("viewmats", params, "viewmats must be in the patched _forward_inference signature")
         self.assertIn("Ks", params, "Ks must be in the patched _forward_inference signature")
+        self.assertIn(
+            "checkpoint_blocks", params,
+            "checkpoint_blocks must explicitly gate safe streaming recomputation",
+        )
 
     def test_block_forward_accepts_prope_meta(self):
         """_block_infmem_forward signature includes prope_meta."""
@@ -101,6 +105,7 @@ class TestInfMemSignatureCompatibility(unittest.TestCase):
         params = sig.parameters
         self.assertIn("viewmats", params)
         self.assertIn("Ks", params)
+        self.assertIn("checkpoint_blocks", params)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +228,18 @@ class TestConfigFiles(unittest.TestCase):
         self.assertTrue(cfg["algorithm"].get("causal", False))
         self.assertTrue(cfg["algorithm"].get("teacher_forcing", False))
         self.assertTrue(cfg["algorithm"].get("independent_first_frame", False))
+
+    def test_streaming_train_config_enables_safe_checkpointing(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..",
+            "configs", "train_dreamx_camera_i2v_ar_infmem_streaming.yaml",
+        )
+        cfg = self._load_yaml(path)
+        self.assertTrue(
+            cfg["training"].get("streaming_activation_checkpointing", False)
+        )
+        self.assertTrue(cfg["training"].get("streaming_fsdp_no_sync", False))
+        self.assertFalse(cfg["infra"].get("gradient_checkpointing", True))
 
     def test_train_config_new_hyperparams(self):
         """Verify the new hyperparameters match the updated recipe."""
@@ -458,6 +475,47 @@ class TestStreamingTrainerBoundedGpuMemory(unittest.TestCase):
         self.assertIn("Ks_cpu[:, start:end].to(", train_src)
         self.assertIn("torch.randn_like(clean_chunk)", train_src)
         self.assertNotIn("torch.randn_like(clean_latent_cpu)", train_src)
+        self.assertIn(
+            "checkpoint_blocks=self.streaming_activation_checkpointing", train_src
+        )
+        self.assertIn(
+            "with self._fsdp_gradient_sync_context(sync_gradients)", train_src
+        )
+        self.assertIn("end == num_frame", train_src)
+        self.assertIn(
+            "accumulation_step == accumulation_steps - 1", train_src
+        )
+
+    def test_fsdp_no_sync_context_is_configurable(self):
+        import pathlib
+
+        trainer_path = (
+            pathlib.Path(__file__).parent.parent
+            / "trainer"
+            / "dreamx_infmem_streaming_diffusion.py"
+        )
+        context_src = self._method_source(
+            trainer_path, "_fsdp_gradient_sync_context"
+        )
+        self.assertIn("self.model.generator.no_sync()", context_src)
+        self.assertIn("not self.streaming_fsdp_no_sync", context_src)
+        self.assertIn("nullcontext()", context_src)
+
+    def test_checkpointing_is_gated_to_the_safe_prediction_pass(self):
+        import pathlib
+
+        infmem_path = (
+            pathlib.Path(__file__).parent.parent
+            / "wan_5b"
+            / "modules"
+            / "infinity_memory.py"
+        )
+        forward_src = self._method_source(
+            infmem_path, "_model_forward_inference_infmem"
+        )
+        self.assertIn("checkpoint_blocks", forward_src)
+        self.assertIn("and defer_cache_updates", forward_src)
+        self.assertIn("and not update_memory", forward_src)
 
     def test_unused_cross_attention_cache_has_no_dense_kv_allocation(self):
         import pathlib

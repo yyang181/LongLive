@@ -468,6 +468,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         update_memory: bool = True,
         memory_update_with_grad: bool = False,
         apply_cache_updates: bool = True,
+        checkpoint_blocks: bool = False,
         viewmats: Optional[torch.Tensor] = None,
         Ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -490,6 +491,11 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         # X0 prediction
         if kv_cache is not None:
+            # Stock causal models do not accept the InfMem-only kwarg. Pass it
+            # only when the specialized streaming trainer explicitly enables it.
+            checkpoint_kwargs = (
+                {"checkpoint_blocks": True} if checkpoint_blocks else {}
+            )
             flow_pred = self._call_model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
@@ -504,6 +510,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 apply_deferred_cache_updates=apply_cache_updates,
                 viewmats=viewmats,
                 Ks=Ks,
+                **checkpoint_kwargs,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import gc
 import logging
 import random
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -50,11 +51,35 @@ class Trainer(DiffusionTrainer):
                 "dreamx_infmem_streaming_diffusion requires an attached "
                 "QueryMemoryEncoder; check model_kwargs.wrapper_cls and memory_kwargs."
             )
-        if bool(getattr(config, "gradient_checkpointing", False)) and self.is_main_process:
-            print(
-                "[DreamXInfMemStreaming] gradient_checkpointing is ignored for "
-                "mutable KV-cache streaming training."
+        self.streaming_activation_checkpointing = bool(
+            getattr(config, "streaming_activation_checkpointing", True)
+        )
+        self.streaming_fsdp_no_sync = bool(
+            getattr(config, "streaming_fsdp_no_sync", True)
+        )
+        if self.streaming_fsdp_no_sync and not hasattr(
+            self.model.generator, "no_sync"
+        ):
+            raise TypeError(
+                "streaming_fsdp_no_sync requires the generator to be the "
+                "root FSDP module."
             )
+        if self.streaming_activation_checkpointing and self.is_main_process:
+            print(
+                "[DreamXInfMemStreaming] block activation checkpointing enabled "
+                "for immediate-backward prediction forwards."
+            )
+        if self.streaming_fsdp_no_sync and self.is_main_process:
+            print(
+                "[DreamXInfMemStreaming] FSDP gradient synchronization is deferred "
+                "to the final chunk of the final accumulation micro-step."
+            )
+
+    def _fsdp_gradient_sync_context(self, sync_gradients):
+        """Return root-FSDP no_sync for intermediate streaming backwards."""
+        if sync_gradients or not self.streaming_fsdp_no_sync:
+            return nullcontext()
+        return self.model.generator.no_sync()
 
     def _prepare_camera_batch(self, batch):
         """Prepare metadata while keeping the full video tensors on CPU.
@@ -252,6 +277,22 @@ class Trainer(DiffusionTrainer):
         valid_count = float(batch_size * max(num_frame - context_frames, 1))
         total_loss_value = torch.zeros([], device=self.device, dtype=torch.float32)
         chunk_count = 0
+        num_chunks = num_frame // self.model.num_frame_per_block
+        if (
+            accumulation_step == 0
+            and self.is_main_process
+            and not getattr(self, "_fsdp_sync_schedule_logged", False)
+        ):
+            sync_backwards = (
+                1 if self.streaming_fsdp_no_sync
+                else num_chunks * accumulation_steps
+            )
+            print(
+                "[DreamXInfMemStreaming] FSDP backward sync schedule: "
+                f"chunks={num_chunks}, accumulation_steps={accumulation_steps}, "
+                f"synchronized_backwards_per_optimizer_step={sync_backwards}."
+            )
+            self._fsdp_sync_schedule_logged = True
 
         for block_index, start in enumerate(range(0, num_frame, self.model.num_frame_per_block)):
             end = start + self.model.num_frame_per_block
@@ -333,33 +374,39 @@ class Trainer(DiffusionTrainer):
                 )
                 training_target_chunk[:, :pinned] = 0
 
-            flow_pred, x0_pred = self.model.generator(
-                noisy_image_or_video=noisy_chunk,
-                conditional_dict=block_cond,
-                timestep=timestep_chunk,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_cache,
-                current_start=current_start,
-                defer_cache_updates=True,
-                update_memory=False,
-                apply_cache_updates=False,
-                viewmats=chunk_viewmats,
-                Ks=chunk_Ks,
+            sync_gradients = (
+                end == num_frame
+                and accumulation_step == accumulation_steps - 1
             )
+            with self._fsdp_gradient_sync_context(sync_gradients):
+                flow_pred, x0_pred = self.model.generator(
+                    noisy_image_or_video=noisy_chunk,
+                    conditional_dict=block_cond,
+                    timestep=timestep_chunk,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                    defer_cache_updates=True,
+                    update_memory=False,
+                    apply_cache_updates=False,
+                    checkpoint_blocks=self.streaming_activation_checkpointing,
+                    viewmats=chunk_viewmats,
+                    Ks=chunk_Ks,
+                )
 
-            per_frame = torch.nn.functional.mse_loss(
-                flow_pred.float(),
-                training_target_chunk.float(),
-                reduction="none",
-            ).mean(dim=(2, 3, 4))
-            weight = self.model.scheduler.training_weight(
-                timestep_chunk
-            ).unflatten(0, (batch_size, end - start)).float()
-            per_frame = per_frame * weight
-            if context_frames > 0 and start < context_frames:
-                per_frame[:, : max(0, min(end, context_frames) - start)] = 0
-            chunk_loss = per_frame.sum() / valid_count
-            (chunk_loss / accumulation_steps).backward()
+                per_frame = torch.nn.functional.mse_loss(
+                    flow_pred.float(),
+                    training_target_chunk.float(),
+                    reduction="none",
+                ).mean(dim=(2, 3, 4))
+                weight = self.model.scheduler.training_weight(
+                    timestep_chunk
+                ).unflatten(0, (batch_size, end - start)).float()
+                per_frame = per_frame * weight
+                if context_frames > 0 and start < context_frames:
+                    per_frame[:, : max(0, min(end, context_frames) - start)] = 0
+                chunk_loss = per_frame.sum() / valid_count
+                (chunk_loss / accumulation_steps).backward()
             total_loss_value = total_loss_value + chunk_loss.detach()
 
             # Let the loss consume the prior query state before truncating
