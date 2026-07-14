@@ -418,5 +418,57 @@ class TestEncoderLifecycle(unittest.TestCase):
         self.assertIn("force_cast", sig.parameters)
 
 
+# ---------------------------------------------------------------------------
+# Test 9: Streaming trainer keeps clip-length-dependent tensors off CUDA
+# ---------------------------------------------------------------------------
+class TestStreamingTrainerBoundedGpuMemory(unittest.TestCase):
+    """Regression checks for full-clip CUDA allocations in streaming training."""
+
+    @staticmethod
+    def _method_source(path, method_name):
+        import ast
+        import pathlib
+
+        source = pathlib.Path(path).read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == method_name:
+                    return ast.get_source_segment(source, node)
+        raise AssertionError(f"{method_name} not found in {path}")
+
+    def test_camera_clip_is_sliced_on_cpu_before_cuda_transfer(self):
+        import pathlib
+
+        trainer_path = (
+            pathlib.Path(__file__).parent.parent
+            / "trainer"
+            / "dreamx_infmem_streaming_diffusion.py"
+        )
+        prepare_src = self._method_source(trainer_path, "_prepare_camera_batch")
+        train_src = self._method_source(trainer_path, "_train_one_step_camera")
+
+        self.assertIn('clean_latent = batch["clean_latent"]', prepare_src)
+        self.assertNotIn(
+            'batch["clean_latent"].to(', prepare_src,
+            "The full video must not be moved to CUDA during batch preparation.",
+        )
+        self.assertIn("clean_latent_cpu[:, start:end].to(", train_src)
+        self.assertIn("viewmats_cpu[:, start:end].to(", train_src)
+        self.assertIn("Ks_cpu[:, start:end].to(", train_src)
+        self.assertIn("torch.randn_like(clean_chunk)", train_src)
+        self.assertNotIn("torch.randn_like(clean_latent_cpu)", train_src)
+
+    def test_unused_cross_attention_cache_has_no_dense_kv_allocation(self):
+        import pathlib
+
+        diffusion_path = pathlib.Path(__file__).parent.parent / "model" / "diffusion.py"
+        cache_src = self._method_source(diffusion_path, "_build_streaming_caches")
+
+        self.assertIn('"k": None', cache_src)
+        self.assertIn('"v": None', cache_src)
+        self.assertNotIn("[batch_size, 512, num_heads, head_dim]", cache_src)
+
+
 if __name__ == "__main__":
     unittest.main()

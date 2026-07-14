@@ -57,6 +57,18 @@ class Trainer(DiffusionTrainer):
             )
 
     def _prepare_camera_batch(self, batch):
+        """Prepare metadata while keeping the full video tensors on CPU.
+
+        The streaming trainer only needs one model block on the GPU at a
+        time. Moving the tensors here used to materialize the complete clip
+        on every rank and torch.randn_like(clean_latent) later allocated a
+        second full-clip tensor. Consequently GPU memory still grew linearly
+        with image_or_video_shape[1] even though autograd was chunked.
+
+        CameraLatentLMDBDataset and its collate function return CPU tensors.
+        Keep those tensors as the backing store and transfer temporal slices
+        in _train_one_step_camera instead.
+        """
         self.model.generator.train()
         text_prompts = batch["prompts"]
         if (
@@ -66,9 +78,24 @@ class Trainer(DiffusionTrainer):
         ):
             text_prompts = [p for sublist in text_prompts for p in sublist]
 
-        clean_latent = batch["clean_latent"].to(device=self.device, dtype=self.dtype)
-        viewmats = batch["viewmats"].to(device=self.device, dtype=self.dtype)
-        Ks = batch["Ks"].to(device=self.device, dtype=self.dtype)
+        clean_latent = batch["clean_latent"]
+        viewmats = batch["viewmats"]
+        Ks = batch["Ks"]
+        for name, tensor in (
+            ("clean_latent", clean_latent),
+            ("viewmats", viewmats),
+            ("Ks", Ks),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"batch[{name!r}] must be a tensor, got {type(tensor)!r}."
+                )
+            if tensor.device.type != "cpu":
+                raise ValueError(
+                    f"Streaming camera batch tensor {name!r} must remain on CPU; "
+                    f"got device={tensor.device}. Moving the full clip to CUDA "
+                    "makes memory scale with image_or_video_shape[1]."
+                )
         batch_size = len(text_prompts)
 
         with torch.no_grad():
@@ -169,11 +196,19 @@ class Trainer(DiffusionTrainer):
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
-        clean_latent, viewmats, Ks, conditional_dict = self._prepare_camera_batch(batch)
-        batch_size, num_frame, _, height, width = clean_latent.shape
+        clean_latent_cpu, viewmats_cpu, Ks_cpu, conditional_dict = (
+            self._prepare_camera_batch(batch)
+        )
+        batch_size, num_frame, _, height, width = clean_latent_cpu.shape
         frame_seq_length = (height * width) // 4
         context_frames = 1 if getattr(self.config, "i2v", False) else 0
-        initial_latent = clean_latent[:, :context_frames] if context_frames > 0 else None
+        initial_latent = (
+            clean_latent_cpu[:, :context_frames].to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            if context_frames > 0
+            else None
+        )
 
         if num_frame % self.model.num_frame_per_block != 0:
             raise ValueError(
@@ -181,32 +216,16 @@ class Trainer(DiffusionTrainer):
                 f"num_frame_per_block={self.model.num_frame_per_block}."
             )
 
-        index = self.model._get_timestep(
-            0,
-            self.model.scheduler.num_train_timesteps,
-            batch_size,
-            num_frame,
-            self.model.num_frame_per_block,
-            uniform_timestep=False,
-        )
-        timestep = self.model.scheduler.timesteps[index].to(
-            dtype=self.dtype, device=self.device
-        )
-
-        noise = torch.randn_like(clean_latent)
-        if context_frames > 0:
-            timestep[:, :context_frames] = 0
-
         kv_cache, crossattn_cache = self.model._build_streaming_caches(
-            batch_size, clean_latent.dtype, clean_latent.device, frame_seq_length
+            batch_size, self.dtype, self.device, frame_seq_length
         )
         from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
 
         if not reset_infmem(
             self.model.generator,
             batch_size=batch_size,
-            device=clean_latent.device,
-            dtype=clean_latent.dtype,
+            device=self.device,
+            dtype=self.dtype,
         ):
             raise RuntimeError(
                 "Streaming InfMem trainer requires QueryMemoryEncoder, but reset failed."
@@ -243,14 +262,36 @@ class Trainer(DiffusionTrainer):
                 for cache in crossattn_cache:
                     cache["is_init"] = False
 
-            chunk_viewmats = viewmats[:, start:end]
-            chunk_Ks = Ks[:, start:end]
+            # Keep the complete clip in host memory. Only this temporal block
+            # and its noise tensor live on CUDA.
+            clean_chunk = clean_latent_cpu[:, start:end].to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            chunk_viewmats = viewmats_cpu[:, start:end].to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            chunk_Ks = Ks_cpu[:, start:end].to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
             current_start = start * frame_seq_length
-            index_chunk = index[:, start:end]
-            timestep_chunk = timestep[:, start:end]
+            chunk_frames = end - start
+            index_chunk = self.model._get_timestep(
+                0,
+                self.model.scheduler.num_train_timesteps,
+                batch_size,
+                chunk_frames,
+                self.model.num_frame_per_block,
+                uniform_timestep=False,
+            )
+            timestep_chunk = self.model.scheduler.timesteps[index_chunk].to(
+                dtype=self.dtype, device=self.device
+            )
+            if context_frames > 0 and start < context_frames:
+                pinned = min(chunk_frames, context_frames - start)
+                timestep_chunk[:, :pinned] = 0
 
-            clean_chunk_for_noise = clean_latent[:, start:end]
-            noise_chunk_for_train = noise[:, start:end]
+            clean_chunk_for_noise = clean_chunk
+            noise_chunk_for_train = torch.randn_like(clean_chunk)
             if er_ready and not er_use_clean:
                 if (
                     self.model.er_noise_inject_prob > 0
@@ -283,7 +324,7 @@ class Trainer(DiffusionTrainer):
                 timestep_chunk.flatten(0, 1),
             ).unflatten(0, (batch_size, end - start))
             training_target_chunk = self.model.scheduler.training_target(
-                clean_latent[:, start:end], noise_chunk_for_train, timestep_chunk
+                clean_chunk, noise_chunk_for_train, timestep_chunk
             )
             if context_frames > 0 and start < context_frames:
                 pinned = max(0, min(end, context_frames) - start)
@@ -382,7 +423,7 @@ class Trainer(DiffusionTrainer):
                 )
 
                 if er_ready:
-                    latent_err = x0_pred.detach() - clean_latent[:, start:end].detach()
+                    latent_err = x0_pred.detach() - clean_chunk.detach()
                     sigma = self.model.scheduler.sigmas.to(flow_pred.device)[index_chunk].reshape(
                         batch_size, end - start, 1, 1, 1
                     ).to(flow_pred.dtype)
@@ -407,6 +448,32 @@ class Trainer(DiffusionTrainer):
                         self.model._apply_gathered_items(
                             self.model.noise_error_buffer, noise_items
                         )
+
+            # Drop the final references to this block's CUDA tensors before
+            # loading the next one. The caching allocator can reuse the same
+            # storage, keeping peak memory independent of clip length.
+            del (
+                clean_chunk,
+                clean_chunk_for_noise,
+                noise_chunk_for_train,
+                noisy_chunk,
+                training_target_chunk,
+                flow_pred,
+                x0_pred,
+                per_frame,
+                weight,
+                chunk_loss,
+                chunk_viewmats,
+                chunk_Ks,
+                index_chunk,
+                timestep_chunk,
+                context_base,
+                context_noise,
+                context_timestep,
+                context_noisy,
+            )
+            if er_ready:
+                del latent_err, sigma, noise_err, lat_items, noise_items
 
         if accumulation_step != accumulation_steps - 1:
             return None

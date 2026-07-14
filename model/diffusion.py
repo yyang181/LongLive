@@ -229,9 +229,13 @@ class CausalDiffusion(BaseModel):
                 "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
                 "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
             })
+            # MultiShotT2VCrossAttention intentionally recomputes text K/V
+            # and does not read this cache. Keep only the compatibility keys;
+            # allocating [B, 512, heads, head_dim] twice per layer wastes
+            # substantial fixed GPU memory (about 1.4 GiB for B=8 on 5B).
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                "k": None,
+                "v": None,
                 "is_init": False,
             })
         return kv_cache, crossattn_cache

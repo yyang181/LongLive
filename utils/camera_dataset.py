@@ -13,7 +13,7 @@ Top-level keys store global shapes:
 """
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import lmdb
 import numpy as np
@@ -62,8 +62,37 @@ class CameraLatentLMDBDataset(Dataset):
         containing a ``data.mdb``).
     """
 
-    def __init__(self, data_path: str, max_pair: int = int(1e8)):
+    def __init__(
+        self,
+        data_path: str,
+        max_pair: int = int(1e8),
+        target_num_frames: Optional[int] = None,
+        expected_latent_shape: Optional[Tuple[int, int, int]] = None,
+    ):
+        """Create a camera-LMDB dataset with optional prefix time cropping.
+
+        Temporal cropping is applied identically to VAE latents and camera
+        poses. Spatial/channel changes are rejected: they require VAE
+        re-encoding rather than resizing stored latents.
+        """
         self.max_pair = max_pair
+        self.target_num_frames = (
+            None if target_num_frames is None else int(target_num_frames)
+        )
+        if self.target_num_frames is not None and self.target_num_frames <= 0:
+            raise ValueError(
+                f"target_num_frames must be positive, got {self.target_num_frames}."
+            )
+        self.expected_latent_shape = (
+            None
+            if expected_latent_shape is None
+            else tuple(int(v) for v in expected_latent_shape)
+        )
+        if self.expected_latent_shape is not None and len(self.expected_latent_shape) != 3:
+            raise ValueError(
+                "expected_latent_shape must be (C, H, W), got "
+                f"{self.expected_latent_shape}."
+            )
 
         if os.path.isfile(os.path.join(data_path, "data.mdb")):
             self._sharded = False
@@ -72,6 +101,9 @@ class CameraLatentLMDBDataset(Dataset):
             self.latents_shape = _get_array_shape(self.env, "latents")
             self.intrinsics_shape = _get_array_shape(self.env, "intrinsics")
             self.poses_shape = _get_array_shape(self.env, "poses")
+            self._validate_storage_shapes(
+                self.latents_shape, self.poses_shape, data_path
+            )
             return
 
         # ---- Sharded path ----
@@ -92,11 +124,58 @@ class CameraLatentLMDBDataset(Dataset):
             sid = len(self.envs)
             self.envs.append(env)
             ls = _get_array_shape(env, "latents")
+            ps = _get_array_shape(env, "poses")
+            self._validate_storage_shapes(ls, ps, sub)
             self._latents_shapes.append(ls)
             self._intrinsics_shapes.append(_get_array_shape(env, "intrinsics"))
-            self._poses_shapes.append(_get_array_shape(env, "poses"))
+            self._poses_shapes.append(ps)
             for j in range(ls[0]):
                 self.index.append((sid, j))
+
+    def _validate_storage_shapes(self, latents_shape, poses_shape, source: str):
+        """Validate temporal cropping without hiding latent/pose mismatches."""
+        if latents_shape is None or poses_shape is None:
+            raise ValueError(f"Camera LMDB at {source} is missing latent or pose shape metadata.")
+
+        # Top-level latent shape is (N,F,C,H,W), or legacy (N,T,F,C,H,W).
+        row_shape = tuple(latents_shape[1:])
+        if len(row_shape) == 4:
+            latent_shape = row_shape
+        elif len(row_shape) == 5:
+            latent_shape = row_shape[1:]
+        else:
+            raise ValueError(
+                f"Unsupported latent row shape {row_shape} in {source}; "
+                "expected (F,C,H,W) or (T,F,C,H,W)."
+            )
+        latent_frames, *latent_spatial = latent_shape
+
+        pose_row_shape = tuple(poses_shape[1:])
+        if len(pose_row_shape) != 2 or pose_row_shape[1] != 7:
+            raise ValueError(
+                f"Unsupported pose row shape {pose_row_shape} in {source}; "
+                "expected (F,7)."
+            )
+        pose_frames = pose_row_shape[0]
+        if pose_frames != latent_frames:
+            raise ValueError(
+                f"Camera LMDB at {source} has {latent_frames} latent frames but "
+                f"{pose_frames} camera poses; they must match."
+            )
+        if (
+            self.expected_latent_shape is not None
+            and tuple(latent_spatial) != self.expected_latent_shape
+        ):
+            raise ValueError(
+                f"Camera LMDB at {source} stores latent C/H/W={tuple(latent_spatial)}, "
+                f"but config requests {self.expected_latent_shape}. Only temporal "
+                "cropping is supported; re-encode the videos for a new resolution."
+            )
+        if self.target_num_frames is not None and self.target_num_frames > latent_frames:
+            raise ValueError(
+                f"Camera LMDB at {source} has {latent_frames} frames, but config "
+                f"requests {self.target_num_frames}. Padding is not supported."
+            )
 
     def __len__(self):
         if self._sharded:
@@ -119,6 +198,14 @@ class CameraLatentLMDBDataset(Dataset):
             prompts = _retrieve_row(self.env, "prompts", str, idx)
             intrinsics = _retrieve_row(self.env, "intrinsics", np.float32, idx, self.intrinsics_shape[1:])
             poses = _retrieve_row(self.env, "poses", np.float32, idx, self.poses_shape[1:])
+
+        if self.target_num_frames is not None:
+            # Crop the same latent-frame prefix for image and camera streams.
+            if latents.ndim == 4:
+                latents = latents[:self.target_num_frames]
+            else:
+                latents = latents[:, :self.target_num_frames]
+            poses = poses[:self.target_num_frames]
 
         # latents may be (F, C, H, W) -> add T (denoising-step) axis if absent.
         # Keep storage dtype (fp16) here: the trainer immediately re-casts to

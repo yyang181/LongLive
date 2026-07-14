@@ -758,11 +758,17 @@ class Trainer:
 
         if self.use_camera_lmdb:
             from utils.camera_dataset import CameraLatentLMDBDataset
-            dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
+            configured_shape = list(config.image_or_video_shape)
+            dataset = CameraLatentLMDBDataset(
+                config.data_path,
+                max_pair=int(1e8),
+                target_num_frames=int(configured_shape[1]),
+                expected_latent_shape=tuple(int(v) for v in configured_shape[2:]),
+            )
             camera_collate_fn = _camera_latent_collate_fn
             if self.is_main_process:
                 print(f"[DiffusionTrainer] using CameraLatentLMDBDataset, "
-                      f"size={len(dataset)}")
+                      f"size={len(dataset)}, target_frames={configured_shape[1]}")
         else:
             allow_padding = getattr(config, "allow_padding", False)
             min_latent_frames = getattr(config, "min_latent_frames", 0)
