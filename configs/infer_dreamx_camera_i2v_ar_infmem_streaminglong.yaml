@@ -1,0 +1,91 @@
+# ============================================================================
+# Inference config for DreamX Camera (E-PRoPE) I2V AR + Echo-Infinity Memory
+# + Relative RoPE
+# ============================================================================
+
+model_kwargs:
+  wrapper_cls: utils.dreamx_infmem_wrapper.DreamXInfMemWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+  local_attn_size: 12
+  sink_size: 4
+
+  attn_compress: 1
+  qk_norm: true
+
+  enable_relative_rope: true
+  relative_rope_pmax: 24
+
+  # Must match configs/train_dreamx_camera_i2v_ar_infmem_streaming.yaml so
+  # query_memory_encoder checkpoint tensors load with identical shapes.
+  memory_kwargs:
+    hidden_dim: 1536
+    num_heads: 12
+    head_dim: 128
+    n_encoder_layers: 2
+    tokens_per_frame: 880
+    Q_frames: 3
+    M_tokens_per_frame: 32
+    num_query_groups: 1
+    bptt_clips: 1
+    encoder_lr_multiplier: 5.0
+    use_sink_anchor: false
+    use_batch_update: false
+    use_residual_update: true
+    use_post_norm: true
+    use_vib: false
+    initializer_range: 0.014
+
+algorithm:
+  causal: true
+  i2v: true
+  independent_first_frame: true
+  use_camera: true
+
+use_ema: false
+output_folder: videos/dreamx_camera_i2v_ar_infmem_streaming
+num_samples: 1
+save_latents_only: false
+save_with_index: true
+# If the checkpoint contains query_memory_encoder but the wrapper has no
+# encoder attached, default to fail-fast. Set true to explicitly discard.
+allow_drop_infmem_checkpoint: false
+
+data:
+  data_path: (unused; three-file i2v mode)
+  image_or_video_shape:
+  - 1
+  - 256
+  - 48
+  - 44
+  - 80
+
+inference:
+  sampling_steps: 50
+  sink_size: 4
+  guidance_scale: 3.0
+  multi_shot_sink: true
+  multi_shot_rope_offset: 8
+  independent_first_frame: true
+  streaming_vae: false
+  async_vae: false
+  vae_type: wan
+  vae_device: "cuda:2"
+  # Reset InfMem memory on scene cut (safe default).
+  reset_memory_on_scene_cut: true
+
+  trajectory_format: sana_dsl
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories_complexlong.txt
+  image_path: prompts/images.txt
+
+  action_overlay: true
+  overlay_corner: bottom-left
+
+checkpoints:
+  generator_ckpt: logs/train_dreamx_camera_i2v_ar_infmem_streaming_b300/checkpoint_model_000600/model.pt
+  lora_ckpt: null
+
+logging:
+  seed: 0
