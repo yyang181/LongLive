@@ -43,7 +43,6 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm"}
 # (with the corresponding suffix) before we consider a video "done".
 RESUME_CHECK_FILES = [
     ("pose",       ".npz"),
-    ("depth",      ".zip"),
     ("intrinsics", ".npz"),
 ]
 
