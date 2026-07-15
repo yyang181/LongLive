@@ -29,6 +29,7 @@ import wandb
 
 from model.camera_bidirectional_diffusion import CameraBidirectionalDiffusion
 from utils.camera_dataset import CameraLatentLMDBDataset, cycle
+from utils.dataset import RepeatDataset
 from utils.config import wan_default_config
 from utils.distributed import (
     EMA_FSDP, barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
@@ -231,7 +232,29 @@ class Trainer:
         # Under SP, all ranks in an SP group must load the SAME sample (they
         # process different frame chunks of it), so sampling is indexed by the
         # DP rank/size rather than the global rank/world size.
-        dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
+        base_dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
+        dataset_repeat = getattr(config, "dataset_repeat", None)
+        # ``repeat``/``repeat_dataset`` are compatibility aliases.  They must
+        # override the config default (dataset_repeat=1) when supplied via CLI.
+        alias_repeat = getattr(config, "repeat_dataset", None)
+        if alias_repeat is None:
+            alias_repeat = getattr(config, "repeat", None)
+        if alias_repeat is not None:
+            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+                raise ValueError(
+                    "Conflicting dataset repeat values: "
+                    f"dataset_repeat={dataset_repeat}, alias={alias_repeat}."
+                )
+            dataset_repeat = alias_repeat
+        if dataset_repeat is None:
+            dataset_repeat = 1
+        dataset_repeat = int(dataset_repeat)
+        if dataset_repeat < 1:
+            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
+        dataset = (
+            RepeatDataset(base_dataset, dataset_repeat)
+            if dataset_repeat > 1 else base_dataset
+        )
         sampler = DistributedSampler(dataset, num_replicas=self.data_parallel_size,
                                      rank=self.dp_rank, shuffle=True, drop_last=True)
         self.dataset = dataset
@@ -244,7 +267,11 @@ class Trainer:
             drop_last=True,
         )
         if self.is_main_process:
-            print(f"[CameraBiDiff] dataset size = {len(dataset)}")
+            if dataset_repeat > 1:
+                print(f"[CameraBiDiff] dataset size = {len(dataset)} "
+                      f"(base_size={len(base_dataset)}, repeat={dataset_repeat})")
+            else:
+                print(f"[CameraBiDiff] dataset size = {len(dataset)}")
         self.dataloader = cycle(loader)
 
         # ---- Optional resume / initialization ----

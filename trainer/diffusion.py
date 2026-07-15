@@ -820,10 +820,20 @@ class Trainer:
         # by the training repeat factor.
         base_dataset = dataset
         dataset_repeat = getattr(config, "dataset_repeat", None)
+        # ``repeat``/``repeat_dataset`` are compatibility aliases.  They must
+        # override the config default (dataset_repeat=1) when supplied via CLI.
+        alias_repeat = getattr(config, "repeat_dataset", None)
+        if alias_repeat is None:
+            alias_repeat = getattr(config, "repeat", None)
+        if alias_repeat is not None:
+            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+                raise ValueError(
+                    "Conflicting dataset repeat values: "
+                    f"dataset_repeat={dataset_repeat}, alias={alias_repeat}."
+                )
+            dataset_repeat = alias_repeat
         if dataset_repeat is None:
-            dataset_repeat = getattr(config, "repeat_dataset", None)
-        if dataset_repeat is None:
-            dataset_repeat = getattr(config, "repeat", 1)
+            dataset_repeat = 1
         dataset_repeat = int(dataset_repeat)
         if dataset_repeat < 1:
             raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
