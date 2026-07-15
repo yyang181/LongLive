@@ -3,39 +3,42 @@
 #
 # MIND stores per-clip data in ``data-<id>/`` sub-folders, each containing:
 #   - video.mp4     (1920x1080, 24 fps)
-#   - action.json   (camera_pos/camera_rpy per frame, NO caption, NO intrinsics)
+#   - action.json   (ws/ad/ud/lr controls; optional pose fields are ignored)
 #
 # Key differences from run_build_camera_lmdb_5b_sekai_original.sh:
-#   - Camera poses are parsed from action.json (camera_pos + camera_rpy Euler
-#     angles), not from NPZ files.
-#   - Intrinsics are synthesized from a default horizontal FOV (UE5 default
-#     90 deg) since MIND does not ship camera intrinsics.
-#   - Captions: action.json has no ``caption`` field in the released files;
-#     a high-quality default prompt is used instead.  Optional CSV captions
-#     can be provided via CAPTION_CSV (same schema as Sekai: videoFile + caption).
-#   - UE5 positions are in centimetres; POSE_SCALE (default 0.01) converts
-#     to metres.
+#   - Camera trajectories are generated from the official MIND 0/1/2
+#     ws/ad/ud/lr controls using the same local OpenCV convention and default
+#     0.08 m / 3 degree per-frame speeds as build_camera_lmdb_5b.py.
+#   - The root can contain both 1st_data/train and 3rd_data/train; the builder
+#     keeps relative paths so data-* names cannot collide and excludes test.
+#   - Intrinsics are synthesized from a default horizontal FOV (90 degrees)
+#     because MIND does not ship camera intrinsics.
+#   - Captions: action.json files may not contain captions; a generic gameplay
+#     prompt is used unless optional caption files are provided.
 #
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
 
-VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/MIND/3rd_data/train}
-CAMERA_DIR=${CAMERA_DIR:-/nfs/yixinyang/code/LongLive/data/MIND/3rd_data/train}
+VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/MIND}
+CAMERA_DIR=${CAMERA_DIR:-/nfs/yixinyang/code/LongLive/data/MIND}
 CAPTION_CSV=${CAPTION_CSV:-""}
 OUTPUT_DIR=${OUTPUT_DIR:-./data/train/MIND/}
 
 TARGET_H=${TARGET_H:-448}
 TARGET_W=${TARGET_W:-832}
 MAX_FRAMES=${MAX_FRAMES:-157}
-NPROC=${NPROC:-4}
+NPROC=${NPROC:-8}
 CAM_SAMPLE_STRATEGY=${CAM_SAMPLE_STRATEGY:-last}
 
 # MIND-specific options
-DEFAULT_CAPTION=${DEFAULT_CAPTION:-"A high-quality third-person gameplay video with detailed 3D environments, smooth character animation, and dynamic camera movement."}
+DEFAULT_CAPTION=${DEFAULT_CAPTION:-"A high-quality gameplay video with detailed 3D environments, smooth character animation, and dynamic camera movement."}
 CAMERA_FOV=${CAMERA_FOV:-90}
 ORIG_W=${ORIG_W:-1920}
 ORIG_H=${ORIG_H:-1080}
-POSE_SCALE=${POSE_SCALE:-0.01}
+SPLIT=${SPLIT:-train}
+FORWARD_SPEED=${FORWARD_SPEED:-0.08}
+YAW_SPEED_DEG=${YAW_SPEED_DEG:-3.0}
+PITCH_SPEED_DEG=${PITCH_SPEED_DEG:-3.0}
 
 # Resume controls (same semantics as the Sekai scripts):
 KEEP_SHARDS=${KEEP_SHARDS:-0}
@@ -64,7 +67,10 @@ CMD=(
     --camera_fov          "${CAMERA_FOV}"
     --orig_w              "${ORIG_W}"
     --orig_h              "${ORIG_H}"
-    --pose_scale          "${POSE_SCALE}"
+    --split               "${SPLIT}"
+    --forward_speed       "${FORWARD_SPEED}"
+    --yaw_speed_deg       "${YAW_SPEED_DEG}"
+    --pitch_speed_deg     "${PITCH_SPEED_DEG}"
 )
 
 # Expand CAPTION_CSV (space- or comma-separated) into an explicit argv list.

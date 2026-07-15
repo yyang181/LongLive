@@ -1,64 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Build a camera-aware LMDB dataset for Wan2.2-TI2V-5B PRoPE Bidirectional SFT
-from the **MIND** dataset (CSU-JPG/MIND) action.json release.
+"""Build a camera-aware LMDB from MIND action.json controls.
 
-MIND stores per-clip metadata in ``action.json`` (one per ``data-<id>/``
-directory) with the following schema (3rd-person mode):
+MIND action.json stores one ``ws/ad/ud/lr`` control state per raw video frame.
+This builder converts those controls to the same local OpenCV camera trajectory
+used by ``build_camera_lmdb_5b.py`` (W/S along +/-Z, A/D along +/-X, look
+controls as +/- yaw/pitch), then subsamples the trajectory at the Wan VAE's
+4-frame temporal stride. ``camera_pos/camera_rpy`` and ``actor_pos/actor_rpy``
+are intentionally not used, allowing first- and third-person clips to share
+the exact same control-to-camera representation.
 
-    {
-        "total_time":  [int]   total frames of the ground-truth video
-        "mark_time":   [int]   divider between memory context and prediction
-        "data": [
-            {
-                "time":       [int]   frame index
-                "ws/ad/ud/lr":[int]   action flags
-                "actor_pos":  {x, y, z}        character world position
-                "actor_rpy":  {x, y, z}        character Euler angles (deg)
-                "camera_pos": {x, y, z}        camera world position  (3rd-person)
-                "camera_rpy": {x, y, z}        camera Euler angles (deg)  (3rd-person)
-            },
-            ...
-        ]
-    }
-
-Key differences vs. ``build_camera_lmdb_5b_sekai_original.py``:
-  * **No NPZ camera files.** Camera extrinsics are derived from the per-frame
-    ``camera_pos`` / ``camera_rpy`` fields in action.json (3rd-person) or
-    ``actor_pos`` / ``actor_rpy`` (1st-person fallback).
-  * **No intrinsics provided.** MIND is captured in Unreal Engine 5 at
-    1920x1080; we synthesize normalized intrinsics from a configurable
-    horizontal FOV (default 90 deg, UE5's standard).
-  * **No caption field.** The action.json schema lists ``caption`` in the
-    README but the released files do not contain one.  A high-quality default
-    prompt is used instead (configurable via ``--default_caption``).
-  * **UE5 units (cm).** Positions are in centimetres; ``--pose_scale``
-    (default 0.01) converts to metres so the translation magnitude is
-    comparable to other datasets.
-
-For each clip, this script:
-  1. Loads <MAX_FRAMES> RGB frames at <target_h x target_w>.
-  2. Encodes them with the Wan2.2 VAE (4x temporal, 16x spatial, 48 channels)
-     into a (F_lat, 48, H/16, W/16) fp16 latent.
-  3. Subsamples the per-frame c2w trajectory to F_lat poses using
-     ``cam_sample_strategy='last'`` (raw indices [0, 4, ..., (F_lat-1)*4]),
-     inverts to w2c, and packs as (F_lat, 7) [tx, ty, tz, qx, qy, qz, qw].
-  4. Stores normalized intrinsics (4,) float32 [fx/W, fy/H, cx/W, cy/H].
-  5. Streams each rank to its own LMDB shard, then rank-0 merges into
-     ``<output_dir>/data/``.
-
-Wan2.2 VAE has ratio (4x temporal, 16x spatial), so for ``F_lat = 40``:
-    raw_frames  = (F_lat - 1) * 4 + 1 = 157
-    latent_h    = target_h / 16
-    latent_w    = target_w / 16
-
-Usage:
-    torchrun --nproc_per_node=4 \
-        scripts/data_preprocessing/build_camera_lmdb_5b_mind.py \
-        --video_dir       /path/to/MIND/3rd_data/train \
-        --camera_dir      /path/to/MIND/3rd_data/train \
-        --output_dir      ./data/train/MIND/ \
-        --target_h 448 --target_w 832 --max_frames 157
+MIND action values follow the official evaluator: 0=no-op, 1=forward/left/up,
+2=backward/right/down (the direction depends on the field).
 """
 
 import argparse
@@ -91,86 +44,140 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
-# MIND action.json loading
+# MIND action.json loading and action -> camera trajectory
 # --------------------------------------------------------------------------
-def load_mind_camera_dir(camera_dir, pose_scale=0.01):
-    """Scan *camera_dir* (recursively) for per-clip ``data-<id>/action.json``
-    files in the MIND layout.
 
-    Each action.json has a ``data`` array of per-frame dicts with:
-        camera_pos : {x, y, z}  (3rd-person; absent in 1st-person)
-        camera_rpy : {x, y, z}  Euler angles in degrees (3rd-person)
-        actor_pos  : {x, y, z}  (always present)
-        actor_rpy  : {x, y, z}  (always present)
+def _rot_x(theta):
+    c, sn = np.cos(theta), np.sin(theta)
+    return np.array([[1, 0, 0], [0, c, -sn], [0, sn, c]], dtype=np.float64)
 
-    For 3rd-person clips we use ``camera_pos`` / ``camera_rpy``; for
-    1st-person clips (no camera_* fields) we fall back to ``actor_pos`` /
-    ``actor_rpy``.
 
-    Returns a dict ``clip_id -> {pose: (T, 4, 4) c2w float32,
-                                 total_time: int,
-                                 has_camera: bool}``.
+def _rot_y(theta):
+    c, sn = np.cos(theta), np.sin(theta)
+    return np.array([[c, 0, sn], [0, 1, 0], [-sn, 0, c]], dtype=np.float64)
+
+
+def _generate_camera_trajectory_local(motions):
+    """Mirror the generic builder's local OpenCV trajectory integration."""
+    poses = [np.eye(4, dtype=np.float64)]
+    T = np.eye(4, dtype=np.float64)
+    for move in motions:
+        if "yaw" in move:
+            T[:3, :3] = T[:3, :3] @ _rot_y(move["yaw"])
+        if "pitch" in move:
+            T[:3, :3] = T[:3, :3] @ _rot_x(move["pitch"])
+        forward = move.get("forward", 0.0)
+        if forward:
+            T[:3, 3] += T[:3, :3] @ np.array([0.0, 0.0, forward])
+        right = move.get("right", 0.0)
+        if right:
+            T[:3, 3] += T[:3, :3] @ np.array([right, 0.0, 0.0])
+        poses.append(T.copy())
+    return poses
+
+
+def _action_to_motion(frame, forward_speed, yaw_speed, pitch_speed):
+    """Decode one MIND frame using the official 0/1/2 action encoding."""
+    values = {name: int(frame[name]) for name in ("ws", "ad", "ud", "lr")}
+    invalid = {name: value for name, value in values.items()
+               if value not in (0, 1, 2)}
+    if invalid:
+        raise ValueError(f"Invalid MIND action values {invalid}; expected 0, 1, or 2")
+
+    move = {}
+    if values["ws"] == 1:
+        move["forward"] = forward_speed
+    elif values["ws"] == 2:
+        move["forward"] = -forward_speed
+    if values["ad"] == 1:
+        move["right"] = -forward_speed
+    elif values["ad"] == 2:
+        move["right"] = forward_speed
+    if values["ud"] == 1:
+        move["pitch"] = pitch_speed
+    elif values["ud"] == 2:
+        move["pitch"] = -pitch_speed
+    if values["lr"] == 1:
+        move["yaw"] = -yaw_speed
+    elif values["lr"] == 2:
+        move["yaw"] = yaw_speed
+    return move
+
+
+def poses_from_mind_actions(frames, forward_speed=0.08,
+                            yaw_speed_deg=3.0, pitch_speed_deg=3.0):
+    """Return one local c2w pose per raw frame from MIND controls.
+
+    As in the generic pose-string builder, action at frame *t* advances the
+    camera from pose *t* to pose *t+1*. The first pose is identity.
     """
+    yaw_speed = np.deg2rad(yaw_speed_deg)
+    pitch_speed = np.deg2rad(pitch_speed_deg)
+    motions = [
+        _action_to_motion(frame, forward_speed, yaw_speed, pitch_speed)
+        for frame in frames
+    ]
+    poses = _generate_camera_trajectory_local(motions)
+    return np.stack(poses[:len(frames)], axis=0).astype(np.float32)
+
+
+def _path_matches_split(path, split):
+    """Keep only MIND ``1st_data/<split>`` and ``3rd_data/<split>`` files."""
+    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
+    for perspective in ("1st_data", "3rd_data"):
+        if perspective in parts:
+            i = parts.index(perspective)
+            return i + 1 < len(parts) and parts[i + 1] == split
+    # Also support a direct camera_dir such as .../3rd_data/train.
+    return True
+
+
+def _sample_key(sample_dir, root):
+    return os.path.normpath(os.path.relpath(sample_dir, root))
+
+
+def load_mind_action_dir(camera_dir, split="train", forward_speed=0.08,
+                          yaw_speed_deg=3.0, pitch_speed_deg=3.0):
+    """Scan MIND action files and create action-derived local c2w trajectories.
+
+    Keys are paths relative to ``camera_dir`` (e.g. ``1st_data/train/data-75``),
+    preventing collisions between first- and third-person directories.
+    """
+    root = os.path.abspath(camera_dir)
+    pattern = os.path.join(root, "**", "action.json")
     out = {}
     skipped = 0
-    pattern = os.path.join(camera_dir, "**", "action.json")
-    for path in sorted(glob.glob(pattern, recursive=True)):
-        clip_id = os.path.basename(os.path.dirname(path))
+    for action_path in sorted(glob.glob(pattern, recursive=True)):
+        if not _path_matches_split(action_path, split):
+            continue
+        sample_dir = os.path.dirname(action_path)
+        if os.path.basename(sample_dir) == "":
+            continue
+        key = _sample_key(sample_dir, root)
         try:
-            with open(path, "r") as f:
+            with open(action_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             frames = meta.get("data", [])
-            total_time = int(meta.get("total_time", len(frames)))
             if not frames:
-                skipped += 1
-                continue
-
-            # Detect whether this clip has 3rd-person camera fields.
-            has_camera = ("camera_pos" in frames[0]
-                          and "camera_rpy" in frames[0])
-
-            T = len(frames)
-            c2w_seq = np.zeros((T, 4, 4), dtype=np.float32)
-            for i, fr in enumerate(frames):
-                if has_camera:
-                    pos = fr["camera_pos"]
-                    rpy = fr["camera_rpy"]
-                else:
-                    pos = fr["actor_pos"]
-                    rpy = fr["actor_rpy"]
-
-                tx = float(pos["x"]) * pose_scale
-                ty = float(pos["y"]) * pose_scale
-                tz = float(pos["z"]) * pose_scale
-
-                roll  = float(rpy["x"])
-                pitch = float(rpy["y"])
-                yaw   = float(rpy["z"])
-
-                # UE5 intrinsic rotation order: Yaw(Z) -> Pitch(Y) -> Roll(X),
-                # which is equivalent to extrinsic 'xyz' with [roll, pitch, yaw].
-                R = Rotation.from_euler(
-                    "xyz", [roll, pitch, yaw], degrees=True
-                ).as_matrix().astype(np.float32)
-
-                c2w_seq[i, :3, :3] = R
-                c2w_seq[i, :3, 3] = [tx, ty, tz]
-                c2w_seq[i, 3, 3] = 1.0
-
-            out[clip_id] = {
-                "pose": c2w_seq,
-                "total_time": total_time,
-                "has_camera": has_camera,
+                raise ValueError("empty data array")
+            for i, frame in enumerate(frames):
+                missing = {"ws", "ad", "ud", "lr"}.difference(frame)
+                if missing:
+                    raise ValueError(f"frame {i} missing {sorted(missing)}")
+            out[key] = {
+                "pose": poses_from_mind_actions(
+                    frames, forward_speed, yaw_speed_deg, pitch_speed_deg),
+                "total_time": int(meta.get("total_time", len(frames))),
+                "clip_id": os.path.basename(sample_dir),
+                "perspective": "1st" if "1st_data" in key.split(os.sep) else "3rd",
+                "caption": meta.get("caption", ""),
             }
         except Exception as e:
-            print(f"[WARN] skipping action.json {clip_id}: {e}", flush=True)
+            print(f"[WARN] skipping action.json {action_path}: {e}", flush=True)
             skipped += 1
-            continue
-
     if skipped:
         print(f"[WARN] {skipped} action.json file(s) skipped.", flush=True)
     return out
-
 
 def load_caption_csvs(csv_paths):
     """Merge one or more CSV files with ``videoFile`` and ``caption`` columns.
@@ -325,9 +332,9 @@ def parse_args():
                    help="Per-latent-frame anchor selection strategy. "
                         "'last' (default) matches sekai_game/sekai_original.")
     p.add_argument("--default_caption", type=str,
-                   default=("A high-quality third-person gameplay video "
-                            "with detailed 3D environments, smooth character "
-                            "animation, and dynamic camera movement."),
+                   default=("A high-quality gameplay video with detailed 3D "
+                            "environments, smooth character animation, and "
+                            "dynamic camera movement."),
                    help="Caption used when no CSV caption is available.")
     p.add_argument("--camera_fov", type=float, default=90.0,
                    help="Horizontal field of view in degrees (UE5 default 90). "
@@ -336,8 +343,14 @@ def parse_args():
                    help="Original capture width for intrinsic normalization.")
     p.add_argument("--orig_h", type=int, default=1080,
                    help="Original capture height for intrinsic normalization.")
-    p.add_argument("--pose_scale", type=float, default=0.01,
-                   help="Scale factor applied to camera positions (UE5 cm -> m).")
+    p.add_argument("--split", default="train",
+                   help="MIND split to include when scanning a root (default: train).")
+    p.add_argument("--forward_speed", type=float, default=0.08,
+                   help="Camera translation per active MIND frame in metres.")
+    p.add_argument("--yaw_speed_deg", type=float, default=3.0,
+                   help="Camera yaw change per active MIND frame in degrees.")
+    p.add_argument("--pitch_speed_deg", type=float, default=3.0,
+                   help="Camera pitch change per active MIND frame in degrees.")
     p.add_argument("--keep_shards", action="store_true",
                    help="Keep the transient per-rank shard dirs after merge.")
     p.add_argument("--no_resume", action="store_true",
@@ -497,16 +510,22 @@ def main():
         global_rank = 0
     device = torch.device(f"cuda:{local_rank}")
 
-    # ---- Load camera metadata from action.json files ----
+    # ---- Load action-derived camera metadata ----
     if global_rank == 0:
-        print(f"Loading MIND action.json cameras from: {args.camera_dir}")
-        print(f"  pose_scale={args.pose_scale} (UE5 cm -> m)")
-    cam_table = load_mind_camera_dir(args.camera_dir, pose_scale=args.pose_scale)
+        print(f"Loading MIND ws/ad/ud/lr actions from: {args.camera_dir}")
+        print(f"  split={args.split}, forward={args.forward_speed}m/frame, "
+              f"yaw={args.yaw_speed_deg}deg/frame, pitch={args.pitch_speed_deg}deg/frame")
+    cam_table = load_mind_action_dir(
+        args.camera_dir, split=args.split,
+        forward_speed=args.forward_speed,
+        yaw_speed_deg=args.yaw_speed_deg,
+        pitch_speed_deg=args.pitch_speed_deg,
+    )
     if global_rank == 0:
-        n_3rd = sum(1 for v in cam_table.values() if v["has_camera"])
+        n_3rd = sum(1 for v in cam_table.values() if v["perspective"] == "3rd")
         n_1st = len(cam_table) - n_3rd
         print(f"Loaded {len(cam_table)} action.json files "
-              f"({n_3rd} 3rd-person, {n_1st} 1st-person fallback).")
+              f"({n_3rd} 3rd-person, {n_1st} 1st-person).")
 
     # ---- Load optional captions ----
     cap_table = {}
@@ -527,31 +546,31 @@ def main():
         print(f"Default normalized intrinsics (fov={args.camera_fov}deg, "
               f"orig={args.orig_w}x{args.orig_h}): {intrinsics_default}")
 
-    # ---- Build the valid clip list (video ∩ camera) ----
+    # ---- Build valid clips using relative sample keys ----
     raw_frames_needed = args.max_frames
     valid = []
     missing_camera = 0
     too_short = 0
-    video_files = sorted(glob.glob(os.path.join(args.video_dir, "**", "*.mp4"),
+    video_files = sorted(glob.glob(os.path.join(args.video_dir, "**", "video.mp4"),
                                    recursive=True))
     for vp in video_files:
-        clip_id = os.path.basename(os.path.dirname(vp))
-        if clip_id not in cam_table:
+        sample_dir = os.path.dirname(vp)
+        if not _path_matches_split(vp, args.split):
+            continue
+        key = _sample_key(sample_dir, os.path.abspath(args.video_dir))
+        if key not in cam_table:
             missing_camera += 1
             continue
-        cam = cam_table[clip_id]
-        # Need at least raw_frames_needed poses so cam_sample_strategy='last'
-        # index (F_lat-1)*4 = max_frames - 1 is in range.
+        cam = cam_table[key]
         if cam["pose"].shape[0] < raw_frames_needed:
             too_short += 1
             continue
-        # Determine caption: CSV if available, else default.
-        caption = cap_table.get(clip_id, args.default_caption)
+        caption = cap_table.get(cam["clip_id"], cam.get("caption") or args.default_caption)
         valid.append({
-            "clip_id":    clip_id,
+            "clip_id": key,
             "video_path": vp,
-            "caption":    caption,
-            "c2w":        cam["pose"],
+            "caption": caption,
+            "c2w": cam["pose"],
         })
 
     if global_rank == 0:

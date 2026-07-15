@@ -132,6 +132,8 @@ data:
   # image_or_video_shape: [1, 20, 48, 44, 80]
   data_path: data/train/dynmem-data/data_f40_h28_w52
   image_or_video_shape: [1, 40, 48, 28, 52]
+  # Logical training-dataset multiplier; validation remains un-repeated.
+  dataset_repeat: 1
   # Camera LMDB already stores latents; keeping this false avoids loading VAE
   # onto GPU during training.
   load_raw_video: false

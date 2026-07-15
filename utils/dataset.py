@@ -22,6 +22,38 @@ except ModuleNotFoundError:
 DEFAULT_SCENE_CUT_PREFIX = "The scene transitions. "
 
 
+class RepeatDataset(Dataset):
+    """Expose a dataset multiple times without copying its samples.
+
+    This is useful for small datasets with a distributed sampler: increasing
+    the logical length gives every rank enough samples per epoch while the
+    underlying dataset remains the single source of truth. A repeated index
+    is mapped back to the original dataset with modulo arithmetic, so any
+    per-sample randomization in ``__getitem__`` is still evaluated normally.
+    """
+
+    def __init__(self, dataset, repeats: int = 1):
+        repeats = int(repeats)
+        if repeats < 1:
+            raise ValueError(f"repeats must be >= 1, got {repeats}.")
+        size = len(dataset)
+        if size <= 0:
+            raise ValueError("Cannot repeat an empty dataset.")
+        self.dataset = dataset
+        self.repeats = repeats
+        self._size = size
+
+    def __len__(self):
+        return self._size * self.repeats
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        return self.dataset[idx % self._size]
+
+
 class TextDataset(Dataset):
     def __init__(self, prompt_path, extended_prompt_path=None):
         with open(prompt_path, encoding="utf-8") as f:

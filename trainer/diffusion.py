@@ -8,7 +8,10 @@ import os
 
 from model import CausalDiffusion
 from wan_5b.distributed.sp_training import SequenceParallelHelper
-from utils.dataset import MultiVideoConcatDataset, MultiTextConcatDataset, cycle, multi_video_collate_fn, eval_collate_fn
+from utils.dataset import (
+    MultiVideoConcatDataset, MultiTextConcatDataset, RepeatDataset, cycle,
+    multi_video_collate_fn, eval_collate_fn,
+)
 from utils.config import section_get, wan_default_config
 from utils.misc import set_seed
 import torch.distributed as dist
@@ -811,6 +814,25 @@ class Trainer:
                       f" (min_latent_frames={min_latent_frames})")
             if single_video_only and self.is_main_process:
                 print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
+
+        # Repeat only the training view of the dataset.  The validation loader
+        # below reuses the original LMDB object, so validation is not inflated
+        # by the training repeat factor.
+        base_dataset = dataset
+        dataset_repeat = getattr(config, "dataset_repeat", None)
+        if dataset_repeat is None:
+            dataset_repeat = getattr(config, "repeat_dataset", None)
+        if dataset_repeat is None:
+            dataset_repeat = getattr(config, "repeat", 1)
+        dataset_repeat = int(dataset_repeat)
+        if dataset_repeat < 1:
+            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
+        if dataset_repeat > 1:
+            dataset = RepeatDataset(base_dataset, dataset_repeat)
+            if self.is_main_process:
+                print(f"[DatasetRepeat] base_size={len(base_dataset)}, "
+                      f"repeat={dataset_repeat}, train_size={len(dataset)}")
+
         # SP ranks in the same SP group need the same batch because they shard
         # the sequence dimension. Use dp_rank for data parallel sampling.
         sampler_seed = int(config.seed)
@@ -843,7 +865,7 @@ class Trainer:
         if self.use_camera_lmdb:
             # Reuse the training dataset for eval — LMDB does not allow opening
             # the same environment twice in one process.
-            eval_dataset = dataset
+            eval_dataset = base_dataset
             eval_collate = _camera_latent_collate_fn
             num_blocks = 1
         else:
