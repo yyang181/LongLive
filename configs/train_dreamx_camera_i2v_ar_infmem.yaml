@@ -115,6 +115,8 @@ checkpoints:
 data:
   data_path: data/train/minWM-data/data
   image_or_video_shape: [1, 20, 48, 44, 80]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
   # Camera LMDB already stores latents; keeping this false avoids loading VAE
   # onto GPU during training.
   load_raw_video: false

@@ -117,6 +117,8 @@ training:
 data:
   data_path: data/train/minWM-data/data
   image_or_video_shape: [1, 20, 48, 44, 80]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
   load_raw_video: true
 
 # Generation settings used by training-time evaluation.

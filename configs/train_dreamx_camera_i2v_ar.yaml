@@ -75,6 +75,8 @@ checkpoints:
 data:
   data_path: data/train/minWM-data/data
   image_or_video_shape: [1, 20, 48, 44, 80]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
   # data_path: data/train/sekai_game/data_f40_h44_w80
   # image_or_video_shape: [1, 40, 48, 44, 80]
 

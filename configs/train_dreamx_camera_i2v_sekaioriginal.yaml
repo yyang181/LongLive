@@ -73,6 +73,8 @@ data:
   # image_or_video_shape: [1, 20, 48, 44, 80]
   data_path: data/train/sekai_original/data_f40_h28_w52
   image_or_video_shape: [1, 40, 48, 28, 52]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
 
 logging:
   wandb_entity: null

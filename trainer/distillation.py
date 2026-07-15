@@ -4,7 +4,10 @@ import gc
 import logging
 
 from utils.dataset import cycle
-from utils.dataset import MultiVideoConcatDataset, MultiTextConcatDataset, multi_video_collate_fn, eval_collate_fn, DEFAULT_SCENE_CUT_PREFIX
+from utils.dataset import (
+    MultiVideoConcatDataset, MultiTextConcatDataset, RepeatDataset,
+    multi_video_collate_fn, eval_collate_fn, DEFAULT_SCENE_CUT_PREFIX,
+)
 from utils.config import section_get, wan_default_config
 from utils.distributed import EMA_FSDP, fsdp_wrap, launch_distributed_job
 from utils.misc import (
@@ -515,6 +518,24 @@ class Trainer:
             collate_fn = multi_video_collate_fn
             if dist.get_rank() == 0 and single_video_only:
                 print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
+
+        base_dataset = dataset
+        dataset_repeat = getattr(config, "dataset_repeat", None)
+        alias_repeat = getattr(config, "repeat_dataset", None)
+        if alias_repeat is None:
+            alias_repeat = getattr(config, "repeat", None)
+        if alias_repeat is not None:
+            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+                raise ValueError("Conflicting dataset repeat values")
+            dataset_repeat = alias_repeat
+        if dataset_repeat is None:
+            dataset_repeat = 1
+        dataset_repeat = int(dataset_repeat)
+        if dataset_repeat < 1:
+            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
+        if dataset_repeat > 1:
+            dataset = RepeatDataset(base_dataset, dataset_repeat)
+
         random_seed = int(time.time()) % (2**31) * dist.get_rank()
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True, seed=random_seed)
@@ -525,7 +546,10 @@ class Trainer:
         )
 
         if dist.get_rank() == 0:
-            print("DATASET SIZE %d" % len(dataset))
+            if dataset_repeat > 1:
+                print(f"DATASET SIZE {len(dataset)} (base_size={len(base_dataset)}, repeat={dataset_repeat})")
+            else:
+                print("DATASET SIZE %d" % len(dataset))
         self.dataloader = cycle(dataloader)
 
         # Step 6: Initialize the validation dataloader for visualization (fixed prompts)

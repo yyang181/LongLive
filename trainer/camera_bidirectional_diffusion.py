@@ -28,8 +28,8 @@ from torch.utils.data.distributed import DistributedSampler
 import wandb
 
 from model.camera_bidirectional_diffusion import CameraBidirectionalDiffusion
-from utils.camera_dataset import CameraLatentLMDBDataset, cycle
-from utils.dataset import RepeatDataset
+from utils.camera_dataset import CameraLatentLMDBDataset
+from utils.dataset import RepeatDataset, cycle
 from utils.config import wan_default_config
 from utils.distributed import (
     EMA_FSDP, barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job,

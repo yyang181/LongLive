@@ -66,6 +66,8 @@ data:
   data_path: data/train/minWM-data/data
   # [B, F_lat, C, H_lat, W_lat] for Wan2.2-TI2V-5B (4x temporal, 16x spatial).
   image_or_video_shape: [1, 20, 48, 44, 80]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
 
 logging:
   wandb_entity: null

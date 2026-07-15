@@ -73,6 +73,8 @@ data:
   # image_or_video_shape: [1, 20, 48, 44, 80]
   data_path: data/train/minWM-data-vggt-omega/data_f20_h44_w80_part
   image_or_video_shape: [1, 20, 48, 44, 80]
+  # Logical multiplier for training samples; validation is not repeated.
+  dataset_repeat: 1
   # image_or_video_shape: [1, 40, 48, 28, 52]
 
 logging:
