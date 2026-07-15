@@ -11,6 +11,23 @@ from utils.i2v_conditioning import _overwrite_i2v_context, _zero_i2v_context_tim
 from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def configure_train_memory_only(generator, enabled: bool) -> int:
+    """Freeze the generator while leaving the external InfMem encoder trainable."""
+    if not enabled:
+        generator.requires_grad_(True)
+        return 0
+
+    generator.requires_grad_(False)
+    inner = getattr(generator, "model", None)
+    encoder = getattr(inner, "query_memory_encoder", None) if inner is not None else None
+    if encoder is None:
+        raise ValueError(
+            "train_memory_only=true requires an attached QueryMemoryEncoder."
+        )
+    encoder.requires_grad_(True)
+    return sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+
+
 class CausalDiffusion(BaseModel):
     def __init__(self, args, device):
         """
@@ -179,7 +196,10 @@ class CausalDiffusion(BaseModel):
             wrapper_cls = getattr(importlib.import_module(module_name), cls_name)
 
         self.generator = wrapper_cls(**model_kwargs, is_causal=True)
-        self.generator.model.requires_grad_(True)
+        train_memory_only = bool(getattr(args, "train_memory_only", False))
+        memory_trainable_params = configure_train_memory_only(
+            self.generator, train_memory_only
+        )
         # If the wrapper attached an Echo-Infinity memory encoder, keep it
         # trainable outside FSDP. Do not force FP32 here: Echo-Infinity casts
         # the encoder to the runtime training dtype after FSDP wrapping.
@@ -188,6 +208,17 @@ class CausalDiffusion(BaseModel):
             _encoder.requires_grad_(True)
             object.__setattr__(self.generator.model, "query_memory_encoder", _encoder)
             object.__setattr__(self.generator, "query_memory_encoder", _encoder)
+        if train_memory_only:
+            if str(getattr(args, "trainer", "")) != "dreamx_infmem_streaming_diffusion":
+                raise ValueError(
+                    "train_memory_only=true is supported only by "
+                    "dreamx_infmem_streaming_diffusion."
+                )
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(
+                    "[InfMem] train_memory_only enabled: generator frozen, "
+                    f"memory_trainable_params={memory_trainable_params:,}."
+                )
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)

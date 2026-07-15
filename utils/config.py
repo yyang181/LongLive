@@ -56,8 +56,15 @@ def _set_once(config, key, value, source):
 
 
 def section_get(config, section_key, key, default=None, aliases=()):
-    """Read a grouped config value, falling back to legacy flat names."""
+    """Read a grouped config value, falling back to legacy flat names.
+
+    When ``key`` is ``None``, return the complete grouped section. Some
+    callers need several related values and intentionally request the section
+    itself instead of an individual field.
+    """
     section = config.get(section_key, None)
+    if key is None:
+        return section if section is not None else default
     candidate_keys = (key, *aliases)
     if section is not None:
         for candidate in candidate_keys:

@@ -47,7 +47,7 @@ model_kwargs:
     n_encoder_layers: 2
     tokens_per_frame: 880
     Q_frames: 3
-    M_tokens_per_frame: 32
+    M_tokens_per_frame: 880
     num_query_groups: 1
     bptt_clips: 1
     encoder_lr_multiplier: 5.0

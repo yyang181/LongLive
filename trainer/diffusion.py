@@ -84,6 +84,7 @@ class Trainer:
         # slots and restored only after the optimizer object exists.
         # ------------------------------------------------------------------
         self.infmem_optimizer = None
+        self.generator_optimizer = None
         self._pending_infmem_optimizer_state = None
         self._pending_infmem_optimizer_meta = None
         self._is_infmem_combined = False
@@ -642,12 +643,21 @@ class Trainer:
                 for param in self.model.generator.parameters()
                 if param.requires_grad and id(param) not in _encoder_param_ids
             ]
-            self.generator_optimizer = torch.optim.AdamW(
-                base_params,
-                lr=config.lr,
-                betas=(config.beta1, config.beta2),
-                weight_decay=config.weight_decay,
-            )
+            if base_params:
+                self.generator_optimizer = torch.optim.AdamW(
+                    base_params,
+                    lr=config.lr,
+                    betas=(config.beta1, config.beta2),
+                    weight_decay=config.weight_decay,
+                )
+            elif not bool(getattr(config, "train_memory_only", False)):
+                raise RuntimeError(
+                    "Generator has no trainable parameters but train_memory_only is false."
+                )
+            elif self.is_main_process:
+                print(
+                    "[InfMem] Generator optimizer disabled; only memory will be updated."
+                )
             # Independent optimizer for the encoder.
             enc_lr_mult = float(getattr(_infmem_encoder, "encoder_lr_multiplier", 1.0) or 1.0)
             enc_lr = config.lr * enc_lr_mult
@@ -803,18 +813,18 @@ class Trainer:
                 print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
         # SP ranks in the same SP group need the same batch because they shard
         # the sequence dimension. Use dp_rank for data parallel sampling.
-        random_seed = int(time.time()) % (2**31) * dist.get_rank()
+        sampler_seed = int(config.seed)
         if self.sequence_parallel_size > 1:
             dp_rank = global_rank // self.sequence_parallel_size
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset, shuffle=True, drop_last=True,
                 rank=dp_rank, num_replicas=self.data_parallel_size,
-                seed=random_seed,
+                seed=sampler_seed,
             )
         else:
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset, shuffle=True, drop_last=True,
-                seed=random_seed,
+                seed=sampler_seed,
             )
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -898,7 +908,7 @@ class Trainer:
             print("DATASET SIZE %d" % len(dataset))
             print("EVAL DATASET SIZE %d" % len(eval_dataset))
 
-        self.dataloader = cycle(dataloader)
+        self.dataloader = cycle(dataloader, start_epoch=self.step)
         self.eval_dataloader = eval_dataloader
 
         ##############################################################################################################
@@ -908,7 +918,8 @@ class Trainer:
         if (ema_weight is not None) and (ema_weight > 0.0) and (self.step >= config.ema_start_step):
             if self.is_main_process:
                 print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            if self.generator_optimizer is not None:
+                self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
             from utils.infinity_memory_hooks import InfMemEMA, get_infmem_encoder
             if get_infmem_encoder(self.model.generator) is not None:
                 self.infmem_ema = InfMemEMA(self.model.generator, decay=ema_weight)
@@ -936,7 +947,15 @@ class Trainer:
                 if self.is_main_process:
                     print("Warning: Generator EMA checkpoint not found.")
 
-            if "generator_optimizer" in raw_state:
+            if self.infmem_ema is not None and self.generator_ema is None:
+                if "query_memory_encoder_ema" not in raw_state:
+                    if not bool(getattr(config, "allow_legacy_missing_infmem_ema", False)):
+                        raise RuntimeError(
+                            "InfMem checkpoint is missing query_memory_encoder_ema."
+                        )
+                else:
+                    self.infmem_ema.load_state_dict(raw_state["query_memory_encoder_ema"])
+            if "generator_optimizer" in raw_state and self.generator_optimizer is not None:
                 gen_osd = FSDP.optim_state_dict_to_load(
                     self.model.generator,
                     self.generator_optimizer,
@@ -947,8 +966,12 @@ class Trainer:
                 del gen_osd
                 if self.is_main_process:
                     print("Resuming generator optimizer...")
-            else:
+            elif "generator_optimizer" in raw_state:
+                del raw_state["generator_optimizer"]
                 if self.is_main_process:
+                    print("Ignoring generator optimizer checkpoint in memory-only mode.")
+            else:
+                if self.is_main_process and self.generator_optimizer is not None:
                     print("Warning: Generator optimizer checkpoint not found.")
 
             del raw_state
@@ -1104,6 +1127,7 @@ class Trainer:
             self.model.inference_pipeline = None
             torch.cuda.empty_cache()
         
+        generator_optimizer_state_dict = None
         with FSDP.state_dict_type(
             self.model.generator,
             StateDictType.FULL_STATE_DICT,
@@ -1111,8 +1135,10 @@ class Trainer:
             FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
         ):
             generator_state_dict  = self.model.generator.state_dict()
-            generator_opim_state_dict = FSDP.optim_state_dict(self.model.generator,
-                                            self.generator_optimizer)
+            if self.generator_optimizer is not None:
+                generator_optimizer_state_dict = FSDP.optim_state_dict(
+                    self.model.generator, self.generator_optimizer
+                )
 
         query_memory_encoder_state_dict = None
         try:
@@ -1127,17 +1153,17 @@ class Trainer:
             state_dict = {
                 "generator": generator_state_dict,
                 "generator_ema": self.generator_ema.state_dict(),
-                "generator_optimizer": generator_opim_state_dict,
                 "step": self.step,
             }
-            if self.infmem_ema is not None:
-                state_dict["query_memory_encoder_ema"] = self.infmem_ema.state_dict()
         else:
             state_dict = {
                 "generator": generator_state_dict,
-                "generator_optimizer": generator_opim_state_dict,
                 "step": self.step,
             }
+        if self.config.ema_start_step < self.step and self.infmem_ema is not None:
+            state_dict["query_memory_encoder_ema"] = self.infmem_ema.state_dict()
+        if generator_optimizer_state_dict is not None:
+            state_dict["generator_optimizer"] = generator_optimizer_state_dict
         if query_memory_encoder_state_dict is not None:
             state_dict["query_memory_encoder"] = query_memory_encoder_state_dict
 

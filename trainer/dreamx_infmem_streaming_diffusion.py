@@ -77,7 +77,9 @@ class Trainer(DiffusionTrainer):
 
     def _fsdp_gradient_sync_context(self, sync_gradients):
         """Return root-FSDP no_sync for intermediate streaming backwards."""
-        if sync_gradients or not self.streaming_fsdp_no_sync:
+        if (self.generator_optimizer is None
+                or sync_gradients
+                or not self.streaming_fsdp_no_sync):
             return nullcontext()
         return self.model.generator.no_sync()
 
@@ -257,7 +259,8 @@ class Trainer(DiffusionTrainer):
             )
 
         if accumulation_step == 0:
-            self.generator_optimizer.zero_grad(set_to_none=True)
+            if self.generator_optimizer is not None:
+                self.generator_optimizer.zero_grad(set_to_none=True)
             self.infmem_optimizer.zero_grad(set_to_none=True)
 
         er_ready = (
@@ -406,7 +409,13 @@ class Trainer(DiffusionTrainer):
                 if context_frames > 0 and start < context_frames:
                     per_frame[:, : max(0, min(end, context_frames) - start)] = 0
                 chunk_loss = per_frame.sum() / valid_count
-                (chunk_loss / accumulation_steps).backward()
+                scaled_chunk_loss = chunk_loss / accumulation_steps
+                if scaled_chunk_loss.requires_grad:
+                    scaled_chunk_loss.backward()
+                elif not bool(getattr(self.config, "train_memory_only", False)):
+                    raise RuntimeError(
+                        "Streaming chunk loss has no gradient path."
+                    )
             total_loss_value = total_loss_value + chunk_loss.detach()
 
             # Let the loss consume the prior query state before truncating
@@ -512,6 +521,7 @@ class Trainer(DiffusionTrainer):
                 per_frame,
                 weight,
                 chunk_loss,
+                scaled_chunk_loss,
                 chunk_viewmats,
                 chunk_Ks,
                 index_chunk,
@@ -531,26 +541,32 @@ class Trainer(DiffusionTrainer):
 
         _sync_group = self.dp_group if self.dp_group is not None else None
         sync_infmem_gradients(self.model.generator, group=_sync_group, average=True)
-        generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)
+        if self.generator_optimizer is not None:
+            generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)
+        else:
+            generator_grad_norm = torch.tensor(0.0, device=self.device)
         _infmem_max_norm = getattr(self.config, "infmem_max_grad_norm", self.max_grad_norm)
         infmem_grad_norm = clip_infmem_grad_norm(self.model.generator, _infmem_max_norm)
 
-        self.generator_optimizer.step()
+        if self.generator_optimizer is not None:
+            self.generator_optimizer.step()
         self.infmem_optimizer.step()
 
         self.step += 1
 
-        if (
-            (self.step >= self.config.ema_start_step)
-            and (self.generator_ema is None)
-            and (getattr(self.config, "ema_weight", None) is not None)
-            and (self.config.ema_weight > 0)
-        ):
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
-            from utils.infinity_memory_hooks import InfMemEMA
-            self.infmem_ema = InfMemEMA(self.model.generator, decay=self.config.ema_weight)
-        if self.generator_ema is not None and self.step >= self.config.ema_start_step:
-            self.generator_ema.update(self.model.generator)
+        ema_enabled = (
+            self.step >= self.config.ema_start_step
+            and getattr(self.config, "ema_weight", None) is not None
+            and self.config.ema_weight > 0
+        )
+        if ema_enabled:
+            if self.generator_optimizer is not None and self.generator_ema is None:
+                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            if self.infmem_ema is None:
+                from utils.infinity_memory_hooks import InfMemEMA
+                self.infmem_ema = InfMemEMA(self.model.generator, decay=self.config.ema_weight)
+            if self.generator_ema is not None:
+                self.generator_ema.update(self.model.generator)
             if self.infmem_ema is not None:
                 self.infmem_ema.update(self.model.generator)
 

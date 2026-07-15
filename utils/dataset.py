@@ -1028,10 +1028,21 @@ class MultiVideoConcatDataset(Dataset):
         )
 
 
-def cycle(dl):
+def cycle(dl, start_epoch=0):
+    """Iterate forever while advancing DistributedSampler's epoch.
+
+    Every rank must call ``set_epoch`` with the same value before creating the
+    epoch iterator. Otherwise shuffling repeats forever, and rank-local seeds
+    can produce overlapping distributed shards.
+    """
+    epoch = int(start_epoch)
     while True:
+        sampler = getattr(dl, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for data in dl:
             yield data
+        epoch += 1
 
 def multi_video_collate_fn(batch):
     # batch is a length-B list of dictionaries returned by __getitem__.

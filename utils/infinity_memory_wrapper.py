@@ -86,7 +86,7 @@ def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
         "tokens_per_frame": 880,          # 22 * 40 for 1280x704 latent
         # --- memory sizing ---
         "Q_frames": 3,
-        "M_tokens_per_frame": 32,
+        "M_tokens_per_frame": 880,
         "num_query_groups": 1,
         # --- optimisation ---
         "bptt_clips": 1,
@@ -101,7 +101,10 @@ def _make_encoder_config(memory_kwargs: Dict[str, Any]) -> _EncoderConfig:
         # --- init ---
         "initializer_range": 0.014,
     }
-    defaults.update(_normalize_memory_kwargs(memory_kwargs))
+    normalized = _normalize_memory_kwargs(memory_kwargs)
+    defaults.update(normalized)
+    if "M_tokens_per_frame" not in normalized:
+        defaults["M_tokens_per_frame"] = defaults["tokens_per_frame"]
     return _EncoderConfig(**defaults)
 
 

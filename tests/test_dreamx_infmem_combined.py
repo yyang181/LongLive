@@ -235,6 +235,11 @@ class TestConfigFiles(unittest.TestCase):
             "configs", "train_dreamx_camera_i2v_ar_infmem_streaming.yaml",
         )
         cfg = self._load_yaml(path)
+        self.assertTrue(cfg["training"].get("train_memory_only", False))
+        memory_cfg = cfg["model_kwargs"]["memory_kwargs"]
+        self.assertEqual(
+            memory_cfg["M_tokens_per_frame"], memory_cfg["tokens_per_frame"]
+        )
         self.assertTrue(
             cfg["training"].get("streaming_activation_checkpointing", False)
         )
@@ -593,5 +598,66 @@ class TestMemoryGradientCoverage(unittest.TestCase):
         self.assertIsNotNone(encoder.query_init.grad)
         self.assertTrue(any(p.grad is not None for p in encoder.connector_proj.parameters()))
         self.assertTrue(any(p.grad is not None for p in encoder.gate_linear.parameters()))
+
+class TestTrainMemoryOnly(unittest.TestCase):
+    def test_only_external_encoder_remains_trainable(self):
+        from model.diffusion import configure_train_memory_only
+
+        generator = torch.nn.Module()
+        generator.model = torch.nn.Linear(4, 4)
+        encoder = torch.nn.Linear(4, 4)
+        object.__setattr__(generator.model, "query_memory_encoder", encoder)
+        object.__setattr__(generator, "query_memory_encoder", encoder)
+
+        count = configure_train_memory_only(generator, True)
+        self.assertGreater(count, 0)
+        self.assertTrue(all(not p.requires_grad for p in generator.parameters()))
+        self.assertTrue(all(p.requires_grad for p in encoder.parameters()))
+        self.assertEqual(count, sum(p.numel() for p in encoder.parameters()))
+
+class TestEpochAwareCycle(unittest.TestCase):
+    def test_cycle_advances_sampler_epoch(self):
+        from utils.dataset import cycle
+        class Sampler:
+            def __init__(self):
+                self.epochs = []
+            def set_epoch(self, epoch):
+                self.epochs.append(epoch)
+        class Loader:
+            def __init__(self):
+                self.sampler = Sampler()
+            def __iter__(self):
+                return iter([0])
+
+        loader = Loader()
+        stream = cycle(loader, start_epoch=3)
+        self.assertEqual((next(stream), next(stream)), (0, 0))
+        self.assertEqual(loader.sampler.epochs, [3, 4])
+
+class TestDistributedSamplerSeed(unittest.TestCase):
+    def test_common_seed_produces_disjoint_shards_and_epoch_shuffle(self):
+        from torch.utils.data.distributed import DistributedSampler
+
+        dataset = list(range(16))
+        samplers = [
+            DistributedSampler(dataset, num_replicas=2, rank=0, seed=7),
+            DistributedSampler(dataset, num_replicas=2, rank=1, seed=7),
+        ]
+        for sampler in samplers: sampler.set_epoch(0)
+        shards = [list(sampler) for sampler in samplers]
+        self.assertTrue(set(shards[0]).isdisjoint(shards[1]))
+        self.assertEqual(set(shards[0]) | set(shards[1]), set(dataset))
+        first_epoch = tuple(shards[0])
+        for sampler in samplers: sampler.set_epoch(1)
+        second_epoch = tuple(samplers[0])
+        self.assertNotEqual(first_epoch, second_epoch)
+
+class TestFullSpatialMemoryGrid(unittest.TestCase):
+    def test_memory_rope_uses_video_spatial_grid(self):
+        from wan_5b.modules.infinity_memory import _self_attn_infmem_forward
+        source = inspect.getsource(_self_attn_infmem_forward)
+        self.assertIn("mem_grid = [(N_Q, h, w)] * b", source)
+        self.assertNotIn("mem_grid = [(N_Q, 1, mem_tpf)] * b", source)
+
 if __name__ == "__main__":
     unittest.main()

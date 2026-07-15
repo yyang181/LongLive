@@ -460,9 +460,17 @@ def _self_attn_infmem_forward(
     mem_v = None
     if memory_kv is not None and rr_pos["use_memory"] and (not rr_pos["is_bulk_forward"]):
         mem_k_raw, mem_v_raw = memory_kv
-        N_Q = max(1, int(_CURRENT_GRID_META.get("memory_frames", 1)))
-        mem_tpf = max(1, mem_k_raw.shape[1] // N_Q)
-        mem_grid = [(N_Q, 1, mem_tpf)] * b
+        N_Q = int(_CURRENT_GRID_META.get("memory_frames", 0))
+        if N_Q <= 0:
+            raise ValueError(f"memory_frames must be positive, got {N_Q}.")
+        expected_memory_tokens = N_Q * frame_seqlen
+        if mem_k_raw.shape[1] != expected_memory_tokens:
+            raise ValueError(
+                "Full-spatial InfMem requires Q_frames * H * W memory tokens: "
+                f"expected {N_Q} * {h} * {w} = {expected_memory_tokens}, "
+                f"got {mem_k_raw.shape[1]}."
+            )
+        mem_grid = [(N_Q, h, w)] * b
         mem_k_roped = causal_rope_apply(
             mem_k_raw, mem_grid, freqs,
             start_frame=rr_pos["mem_start"],

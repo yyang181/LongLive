@@ -73,6 +73,12 @@ class QueryMemoryEncoder(nn.Module):
         Q_frames = getattr(config, "Q_frames", 3)
         tokens_per_frame = getattr(config, "tokens_per_frame", 880)
         M_tokens_per_frame = getattr(config, "M_tokens_per_frame", tokens_per_frame)
+        if M_tokens_per_frame != tokens_per_frame:
+            raise ValueError(
+                "Full-spatial InfMem requires M_tokens_per_frame == "
+                f"tokens_per_frame, got {M_tokens_per_frame} and "
+                f"{tokens_per_frame}."
+            )
         n_encoder_layers = getattr(config, "n_encoder_layers", 2)
         hidden_dim = getattr(config, "hidden_dim", 1536)
         num_heads = getattr(config, "num_heads", 12)
