@@ -232,7 +232,15 @@ class Trainer:
         # Under SP, all ranks in an SP group must load the SAME sample (they
         # process different frame chunks of it), so sampling is indexed by the
         # DP rank/size rather than the global rank/world size.
-        base_dataset = CameraLatentLMDBDataset(config.data_path, max_pair=int(1e8))
+        configured_shape = list(config.image_or_video_shape)
+        target_num_frames = int(configured_shape[1])
+        expected_latent_shape = tuple(int(v) for v in configured_shape[2:])
+        base_dataset = CameraLatentLMDBDataset(
+            config.data_path,
+            max_pair=int(1e8),
+            target_num_frames=target_num_frames,
+            expected_latent_shape=expected_latent_shape,
+        )
         dataset_repeat = getattr(config, "dataset_repeat", None)
         # ``repeat``/``repeat_dataset`` are compatibility aliases.  They must
         # override the config default (dataset_repeat=1) when supplied via CLI.
@@ -269,9 +277,11 @@ class Trainer:
         if self.is_main_process:
             if dataset_repeat > 1:
                 print(f"[CameraBiDiff] dataset size = {len(dataset)} "
-                      f"(base_size={len(base_dataset)}, repeat={dataset_repeat})")
+                      f"(base_size={len(base_dataset)}, repeat={dataset_repeat}, "
+                      f"target_frames={target_num_frames})")
             else:
-                print(f"[CameraBiDiff] dataset size = {len(dataset)}")
+                print(f"[CameraBiDiff] dataset size = {len(dataset)} "
+                      f"(target_frames={target_num_frames})")
         self.dataloader = cycle(loader)
 
         # ---- Optional resume / initialization ----
