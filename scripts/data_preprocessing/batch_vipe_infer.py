@@ -14,14 +14,16 @@ Features
 * **Multi-GPU parallelism**: pass ``--num_gpus N`` (N > 1) to split the
   remaining videos evenly across N GPUs. Each GPU runs in its own worker
   process with ``CUDA_VISIBLE_DEVICES`` set to a single physical device.
+* **Per-video timing & ETA**: each video's processing time is printed, and an
+  estimated remaining time is shown based on the average per-video duration.
 
 Example
 -------
-    CUDA_VISIBLE_DEVICES=0,3 python batch_vipe_infer.py \
-        --input_dir  /nfs/yixinyang/code/LongLive/data/Sekai/video \
-        --output_dir /nfs/yixinyang/code/LongLive/data/Sekai/vipe_results \
-        --vipe_bin   /nfs/yixinyang/miniconda3/envs/vipe/bin/vipe \
-        --preset     lyra \
+    CUDA_VISIBLE_DEVICES=0,3 python batch_vipe_infer.py \\
+        --input_dir  /nfs/yixinyang/code/LongLive/data/Sekai/video \\
+        --output_dir /nfs/yixinyang/code/LongLive/data/Sekai/vipe_results \\
+        --vipe_bin   /nfs/yixinyang/miniconda3/envs/vipe/bin/vipe \\
+        --preset     lyra \\
         --num_gpus   2
 """
 
@@ -31,6 +33,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -65,7 +68,10 @@ def is_already_done(out_dir: Path, stem: str) -> bool:
 
 def run_one(vipe_bin, preset, video_path, out_dir, extra_args, dry_run,
             gpu_id=None, tag=""):
-    """Run VIPE inference for a single video. Returns (video_path, returncode)."""
+    """Run VIPE inference for a single video.
+
+    Returns ``(video_path, returncode, elapsed_seconds)``.
+    """
     cmd = [vipe_bin, "infer", "-p", preset, "-o", str(out_dir), str(video_path)]
     if extra_args:
         cmd.extend(extra_args)
@@ -76,31 +82,40 @@ def run_one(vipe_bin, preset, video_path, out_dir, extra_args, dry_run,
         env_str = f"CUDA_VISIBLE_DEVICES={gpu_id} " if gpu_id is not None else ""
         print(f"{prefix}[DRY-RUN] {video_path}")
         print(f"{prefix}          {env_str}{' '.join(cmd)}")
-        return video_path, 0
+        return video_path, 0, 0.0
 
     env = os.environ.copy()
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     print(f"{prefix}[RUN] {video_path}", flush=True)
+    t_start = time.time()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        elapsed = time.time() - t_start
         if result.returncode != 0:
-            print(f"{prefix}[FAIL] {video_path} (exit {result.returncode})",
-                  flush=True)
+            print(f"{prefix}[FAIL] {video_path} (exit {result.returncode}, "
+                  f"{elapsed:.1f}s)", flush=True)
             if result.stderr:
                 print(result.stderr[-2000:], flush=True)
         else:
-            print(f"{prefix}[ OK ] {video_path}", flush=True)
-        return video_path, result.returncode
+            print(f"{prefix}[ OK ] {video_path} ({elapsed:.1f}s)", flush=True)
+        return video_path, result.returncode, elapsed
     except Exception as e:
-        print(f"{prefix}[ERR ] {video_path}: {e}", flush=True)
-        return video_path, -1
+        elapsed = time.time() - t_start
+        print(f"{prefix}[ERR ] {video_path}: {e} ({elapsed:.1f}s)", flush=True)
+        return video_path, -1, elapsed
 
 
 def gpu_worker(worker_idx, gpu_id, gpu_tasks, vipe_bin, preset, extra_args,
-               dry_run, result_queue):
-    """Process all tasks assigned to one GPU. Sends results back via queue."""
+               dry_run, result_queue, total_tasks, done_counter, done_lock):
+    """Process all tasks assigned to one GPU. Sends results back via queue.
+
+    *total_tasks* is the grand total across all workers; *done_counter* is a
+    shared ``mp.Value`` for tracking how many videos have finished globally;
+    *done_lock* guards updates to the counter. These are used to compute an
+    ETA across all GPUs.
+    """
     tag = f"GPU{gpu_id}"
     n = len(gpu_tasks)
     print(f"[{tag}] Worker {worker_idx} started, "
@@ -108,9 +123,32 @@ def gpu_worker(worker_idx, gpu_id, gpu_tasks, vipe_bin, preset, extra_args,
 
     failed = []
     for i, (video_path, out_dir) in enumerate(gpu_tasks, 1):
+        t0 = time.time()
         print(f"[{tag}] --- [{i}/{n}] {video_path.name} ---", flush=True)
-        _, rc = run_one(vipe_bin, preset, video_path, out_dir,
-                        extra_args, dry_run, gpu_id=gpu_id, tag=tag)
+        _, rc, elapsed = run_one(vipe_bin, preset, video_path, out_dir,
+                                 extra_args, dry_run, gpu_id=gpu_id, tag=tag)
+
+        # Update global progress counter and compute ETA.
+        with done_lock:
+            done_counter.value += 1
+            done = done_counter.value
+        remaining_global = total_tasks - done
+        # Use exponential moving average for smoother ETA.
+        if done == 1:
+            avg = elapsed
+        else:
+            # We don't have history of all prior videos here; approximate
+            # using the current video's time as a rough average.
+            # The main process prints a better summary based on wall-clock.
+            avg = elapsed  # fallback; main process has more info
+        eta_str = _format_eta(avg * remaining_global)
+
+        print(f"[{tag}] Done [{i}/{n}] | "
+              f"Global: {done}/{total_tasks} | "
+              f"This video: {elapsed:.1f}s | "
+              f"ETA: {eta_str}",
+              flush=True)
+
         if rc != 0:
             failed.append(str(video_path))
 
@@ -126,6 +164,26 @@ def parse_visible_devices():
     if val is None or val.strip() == "":
         return None
     return [x.strip() for x in val.split(",") if x.strip() != ""]
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds into a human-readable string like ``1h23m45s``."""
+    if seconds < 0:
+        return "N/A"
+    td = timedelta(seconds=int(seconds))
+    total_sec = int(td.total_seconds())
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _format_eta(seconds: float) -> str:
+    """Alias for ``_fmt_duration`` used in ETA context."""
+    return _fmt_duration(seconds)
 
 
 def main():
@@ -240,6 +298,7 @@ def main():
     # ---- Run --------------------------------------------------------------
     t0 = time.time()
     failed = []
+    total_done = 0  # global counter for single-GPU mode
 
     if n_workers == 1:
         # Single worker: run inline (no subprocess spawn) for cleaner logs.
@@ -248,27 +307,77 @@ def main():
         tag = f"GPU{gpu_id}" if gpu_id is not None else "GPU"
         for i, (video_path, out_dir) in enumerate(buckets[0], 1):
             print(f"\n[{tag}] --- [{i}/{n}] {video_path.name} ---", flush=True)
-            _, rc = run_one(args.vipe_bin, args.preset, video_path, out_dir,
-                            args.extra_args, args.dry_run,
-                            gpu_id=gpu_id, tag=tag)
+            t_video_start = time.time()
+            _, rc, elapsed = run_one(
+                args.vipe_bin, args.preset, video_path, out_dir,
+                args.extra_args, args.dry_run,
+                gpu_id=gpu_id, tag=tag)
+            t_video_end = time.time()
+
+            total_done += 1
+            remaining = total - total_done
+            # Compute running average based on wall-clock time.
+            wall_elapsed = t_video_end - t0
+            avg_per_video = wall_elapsed / total_done
+            eta = avg_per_video * remaining
+
+            print(
+                f"[{tag}] Progress: {total_done}/{total} | "
+                f"This video: {elapsed:.1f}s | "
+                f"Avg: {avg_per_video:.1f}s | "
+                f"Elapsed: {_fmt_duration(wall_elapsed)} | "
+                f"ETA: {_fmt_duration(eta)}",
+                flush=True)
+
             if rc != 0:
                 failed.append(str(video_path))
     else:
         # Multi-GPU: one worker process per GPU.
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
+        # Shared counter for global progress across workers.
+        done_counter = ctx.Value("i", 0)
+        done_lock = ctx.Lock()
+
         procs = []
         for w_idx, gpu_id in enumerate(gpu_layout):
             p = ctx.Process(
                 target=gpu_worker,
                 args=(w_idx, gpu_id, buckets[w_idx], args.vipe_bin,
                       args.preset, args.extra_args, args.dry_run,
-                      result_queue),
+                      result_queue, total, done_counter, done_lock),
                 daemon=False,
             )
             p.start()
             procs.append(p)
             print(f"[SPAWN] Launched worker pid={p.pid} on GPU {gpu_id}.")
+
+        # Spawn a lightweight monitor thread to print periodic ETA summaries.
+        import threading
+
+        stop_monitor = threading.Event()
+
+        def _monitor():
+            while not stop_monitor.is_set():
+                time.sleep(30)
+                if stop_monitor.is_set():
+                    break
+                with done_lock:
+                    done = done_counter.value
+                wall = time.time() - t0
+                if done > 0:
+                    avg = wall / done
+                    eta = avg * (total - done)
+                    print(
+                        f"[MONITOR] Progress: {done}/{total} "
+                        f"({done/total*100:.1f}%) | "
+                        f"Elapsed: {_fmt_duration(wall)} | "
+                        f"Avg/video: {avg:.1f}s | "
+                        f"ETA: {_fmt_duration(eta)}",
+                        flush=True)
+
+        mon_thread = threading.Thread(target=_monitor, daemon=True)
+        mon_thread.start()
 
         # Collect results.
         finished = 0
@@ -276,9 +385,25 @@ def main():
             gpu_id, w_failed = result_queue.get()
             failed.extend(w_failed)
             finished += 1
+            with done_lock:
+                done = done_counter.value
+            wall = time.time() - t0
+            if done > 0:
+                avg = wall / done
+                eta = avg * (total - done)
+            else:
+                avg = 0
+                eta = 0
             print(f"[DONE] GPU {gpu_id} worker reported. "
                   f"({finished}/{n_workers} workers finished, "
-                  f"{len(w_failed)} failed on this GPU.)")
+                  f"{len(w_failed)} failed on this GPU.) "
+                  f"Global progress: {done}/{total} | "
+                  f"Elapsed: {_fmt_duration(wall)} | "
+                  f"ETA: {_fmt_duration(eta)}",
+                  flush=True)
+
+        stop_monitor.set()
+        mon_thread.join(timeout=1)
 
         for p in procs:
             p.join()
@@ -287,7 +412,8 @@ def main():
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
     print(f"Total: {total}  |  Success: {total - len(failed)}  "
-          f"|  Failed: {len(failed)}  |  Time: {elapsed:.1f}s")
+          f"|  Failed: {len(failed)}  |  "
+          f"Time: {elapsed:.1f}s ({_fmt_duration(elapsed)})")
     if failed:
         print("Failed videos:")
         for v in failed:
