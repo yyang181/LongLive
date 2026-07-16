@@ -43,7 +43,10 @@ algorithm:
   independent_first_frame: true
   use_camera: true
 
-use_ema: false
+# Match training.evaluation.use_ema. Inference loads generator EMA and
+# query_memory_encoder_ema as a matched pair (falling back to raw only when a
+# pre-EMA checkpoint has no EMA state yet).
+use_ema: true
 output_folder: videos/dreamx_camera_i2v_ar_infmem_streaming
 num_samples: 1
 save_latents_only: false
@@ -56,7 +59,7 @@ data:
   data_path: (unused; three-file i2v mode)
   image_or_video_shape:
   - 1
-  - 128
+  - 240
   - 48
   - 44
   - 80

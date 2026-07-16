@@ -110,6 +110,34 @@ class TestInfMemEMA(unittest.TestCase):
         self.assertEqual(loaded.decay, 0.5)
         self.assertTrue(torch.equal(loaded.shadow[name], ema.shadow[name]))
 
+    def test_inference_selects_matching_raw_or_ema_state(self):
+        from utils.infinity_memory_hooks import select_infmem_checkpoint_state
+
+        raw = {"weight": torch.tensor([1.0])}
+        ema = {"weight": torch.tensor([2.0])}
+        checkpoint = {
+            "query_memory_encoder": raw,
+            "query_memory_encoder_ema": {"decay": 0.99, "shadow": ema},
+        }
+
+        state, source = select_infmem_checkpoint_state(checkpoint, use_ema=False)
+        self.assertIs(state, raw)
+        self.assertEqual(source, "query_memory_encoder")
+
+        state, source = select_infmem_checkpoint_state(checkpoint, use_ema=True)
+        self.assertIs(state, ema)
+        self.assertEqual(source, "query_memory_encoder_ema.shadow")
+
+    def test_inference_ema_falls_back_to_raw_before_ema_start(self):
+        from utils.infinity_memory_hooks import select_infmem_checkpoint_state
+
+        raw = {"weight": torch.tensor([1.0])}
+        state, source = select_infmem_checkpoint_state(
+            {"query_memory_encoder": raw}, use_ema=True
+        )
+        self.assertIs(state, raw)
+        self.assertEqual(source, "query_memory_encoder")
+
 
 # ---------------------------------------------------------------------------
 # Test 1: optimizer restore order

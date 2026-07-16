@@ -11,6 +11,7 @@ The FSDP-aware model resolution mirrors
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Optional, List
 
 import torch
@@ -107,6 +108,54 @@ def load_infmem_state_dict(generator: Any, state: Any, strict: bool = True) -> b
         return False
     encoder.load_state_dict(state, strict=strict)
     return True
+
+
+def select_infmem_checkpoint_state(
+    checkpoint: Any,
+    *,
+    use_ema: bool = False,
+) -> tuple[Optional[Mapping[str, torch.Tensor]], Optional[str]]:
+    """Select raw or EMA QueryMemoryEncoder weights from a checkpoint.
+
+    ``InfMemEMA.state_dict()`` stores its tensors below ``shadow`` while the
+    non-EMA encoder is saved as a plain module state dict. Inference must
+    select the memory state with the same raw/EMA policy used for the
+    generator; otherwise a checkpoint silently mixes weights from different
+    training steps.
+
+    Returns ``(state_dict, source_key)``. For checkpoints saved before EMA
+    starts, ``use_ema=True`` falls back to the raw memory state, matching the
+    generator checkpoint fallback policy.
+    """
+    if not isinstance(checkpoint, Mapping):
+        return None, None
+
+    if use_ema and "query_memory_encoder_ema" in checkpoint:
+        ema_state = checkpoint["query_memory_encoder_ema"]
+        if not isinstance(ema_state, Mapping):
+            raise TypeError(
+                "checkpoint['query_memory_encoder_ema'] must be a mapping, "
+                f"got {type(ema_state)!r}."
+            )
+        # Current InfMemEMA format. Accept a direct tensor mapping as a
+        # compatibility path for early/hand-exported checkpoints.
+        state = ema_state.get("shadow", ema_state)
+        if not isinstance(state, Mapping):
+            raise TypeError(
+                "checkpoint['query_memory_encoder_ema']['shadow'] must be a "
+                f"mapping, got {type(state)!r}."
+            )
+        return state, "query_memory_encoder_ema.shadow"
+
+    state = checkpoint.get("query_memory_encoder")
+    if state is None:
+        return None, None
+    if not isinstance(state, Mapping):
+        raise TypeError(
+            "checkpoint['query_memory_encoder'] must be a mapping, "
+            f"got {type(state)!r}."
+        )
+    return state, "query_memory_encoder"
 
 
 class InfMemEMA:

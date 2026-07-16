@@ -534,14 +534,49 @@ elif merge_lora and local_rank == 0:
     print("merge_lora=True requested but no adapter config was found; continuing without LoRA merge")
 
 # Load query_memory_encoder before deleting checkpoint (InfMem combined path).
+# Keep its raw/EMA selection paired with the generator selection above.
 _infmem_enc_loaded = False
-if isinstance(generator_checkpoint, dict) and "query_memory_encoder" in generator_checkpoint:
-    from utils.infinity_memory_hooks import get_infmem_encoder
+if isinstance(generator_checkpoint, dict):
+    from utils.infinity_memory_hooks import (
+        get_infmem_encoder,
+        select_infmem_checkpoint_state,
+    )
+
+    enc_state, enc_state_source = select_infmem_checkpoint_state(
+        generator_checkpoint,
+        use_ema=config.use_ema,
+    )
     _enc = get_infmem_encoder(pipeline.generator)
-    if _enc is not None:
-        enc_state = generator_checkpoint["query_memory_encoder"]
+    if enc_state is not None and _enc is not None:
+        # Validate the saved runtime architecture before load_state_dict. This
+        # turns opaque query_init size mismatches into an actionable config
+        # error (for example M_tokens_per_frame=32 vs 880).
+        enc_meta = generator_checkpoint.get("query_memory_encoder_meta")
+        if isinstance(enc_meta, dict):
+            inner = getattr(pipeline.generator, "model", None)
+            expected_meta = {
+                "num_params": sum(p.numel() for p in _enc.parameters()),
+                "n_encoder_layers": len(getattr(_enc, "layers", [])),
+                "local_attn_size": getattr(inner, "local_attn_size", None),
+                "sink_size": getattr(inner, "sink_size", None),
+                "relative_rope_pmax": getattr(inner, "relative_rope_pmax", None),
+                "q_frames": getattr(_enc, "Q_frames", None),
+                "memory_tokens_per_frame": getattr(_enc, "M_tokens_per_frame", None),
+            }
+            mismatches = []
+            for key, expected in expected_meta.items():
+                saved = enc_meta.get(key)
+                if saved is not None and expected is not None and saved != expected:
+                    mismatches.append(f"{key}: checkpoint={saved}, config={expected}")
+            if mismatches:
+                raise RuntimeError(
+                    "QueryMemoryEncoder checkpoint/config mismatch: "
+                    + "; ".join(mismatches)
+                    + ". Make inference model_kwargs.memory_kwargs and streaming "
+                    "attention settings match the training run."
+                )
         _enc.load_state_dict(enc_state, strict=True)
-        # Move to inference device but keep FP32.
+        # Move to the inference device; the post-pipeline check casts bf16.
         _enc.to(device=device)
         _enc.eval()
         _enc.requires_grad_(False)
@@ -558,13 +593,14 @@ if isinstance(generator_checkpoint, dict) and "query_memory_encoder" in generato
         if local_rank == 0:
             print(
                 f"[InfMem] Loaded query_memory_encoder for inference: "
+                f"source={enc_state_source}, use_ema={config.use_ema}, "
                 f"tensors={n_loaded}, params={n_params:,}, "
                 f"dtype={enc_dtype}, device={enc_device}, "
                 f"saved_checksum={saved_stats['total_sum']:.4f}",
                 flush=True,
             )
         _infmem_enc_loaded = True
-    else:
+    elif enc_state is not None:
         # checkpoint has encoder but the selected wrapper has no encoder
         # attached — this is a configuration mismatch. Default fail-fast
         # unless explicitly allowed.
@@ -578,14 +614,11 @@ if isinstance(generator_checkpoint, dict) and "query_memory_encoder" in generato
         if local_rank == 0:
             print("[InfMem][WARN] query_memory_encoder in checkpoint dropped "
                   "(allow_drop_infmem_checkpoint=true).")
-elif isinstance(generator_checkpoint, dict):
-    # Check if the wrapper has an encoder but the checkpoint doesn't.
-    from utils.infinity_memory_hooks import get_infmem_encoder
-    _enc = get_infmem_encoder(pipeline.generator)
-    if _enc is not None and "query_memory_encoder" not in generator_checkpoint:
+    elif _enc is not None:
+        # Check if the wrapper has an encoder but the checkpoint doesn't.
         raise RuntimeError(
             "Pipeline has a QueryMemoryEncoder but the checkpoint does not "
-            "contain 'query_memory_encoder' weights. Refusing to use a "
+            "contain compatible QueryMemoryEncoder weights. Refusing to use a "
             "randomly-initialized encoder for inference."
         )
 
