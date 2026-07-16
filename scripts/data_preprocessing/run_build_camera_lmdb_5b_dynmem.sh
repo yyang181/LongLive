@@ -9,6 +9,9 @@
 #   bash scripts/data_preprocessing/run_build_camera_lmdb_5b_dynmem.sh
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_run_with_timing.sh"
+
 INPUT_JSON=${INPUT_JSON:-/nfs/yinhanzhang/DynamicMem/datasets/metadata_0710.json}
 OUTPUT_DIR=${OUTPUT_DIR:-./data/train/dynmem-data/}
 VIDEO_DIR=${VIDEO_DIR:-}
@@ -28,7 +31,11 @@ if [[ "${NO_RESUME}" == "1" ]]; then
     EXTRA_ARGS+=(--no_resume)
 fi
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+    TIMER_TOTAL_ITEMS=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d) if isinstance(d,list) else len(d.get("clips", d)))' "${INPUT_JSON}" 2>/dev/null || echo 0)
+fi
+TIMER_OUTPUT_DIR="${OUTPUT_DIR}"
+run_with_timing torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b_dynmem.py \
     --input_json   "${INPUT_JSON}" \
     --video_dir    "${VIDEO_DIR}" \

@@ -19,6 +19,9 @@
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_run_with_timing.sh"
+
 VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/MIND}
 CAMERA_DIR=${CAMERA_DIR:-/nfs/yixinyang/code/LongLive/data/MIND}
 CAPTION_CSV=${CAPTION_CSV:-""}
@@ -91,4 +94,8 @@ fi
 
 CMD+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" "${CMD[@]}"
+if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+    TIMER_TOTAL_ITEMS=$(find "${CAMERA_DIR}" -type f -name 'action.json' 2>/dev/null | wc -l)
+fi
+TIMER_OUTPUT_DIR="${OUTPUT_DIR}"
+run_with_timing torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" "${CMD[@]}"

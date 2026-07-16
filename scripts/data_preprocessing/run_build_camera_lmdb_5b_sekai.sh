@@ -17,6 +17,9 @@
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_run_with_timing.sh"
+
 VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/Sekai/video}
 CAMERA_DIR=${CAMERA_DIR:-/nfs/yixinyang/code/LongLive/data/Sekai/vggt_omega_results}
 CAPTION_CSV=${CAPTION_CSV:-"/nfs/yixinyang/code/LongLive/data/Sekai/data/train/Sekai-Game.csv /nfs/yixinyang/code/LongLive/data/Sekai/data/train/Sekai-Real-HQ.csv"}
@@ -66,7 +69,11 @@ if [[ "${USE_PARENT_AS_CLIP_ID}" == "1" ]]; then
     EXTRA_ARGS+=(--use_parent_as_clip_id)
 fi
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+    TIMER_TOTAL_ITEMS=$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)
+fi
+TIMER_OUTPUT_DIR="${OUTPUT_DIR}"
+run_with_timing torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b_sekai.py \
     --video_dir     "${VIDEO_DIR}" \
     --camera_dir    "${CAMERA_DIR}" \

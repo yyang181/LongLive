@@ -14,6 +14,9 @@
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_run_with_timing.sh"
+
 VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/Sekai/video}
 CAMERA_DIR=${CAMERA_DIR:-/nfs/yixinyang/code/LongLive/data/Sekai/vipe_results/pose}
 INTRINSICS_DIR=${INTRINSICS_DIR:-}
@@ -65,7 +68,11 @@ if [[ -n "${INTRINSICS_DIR}" ]]; then
     INTRINSICS_ARG=(--intrinsics_dir "${INTRINSICS_DIR}")
 fi
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+    TIMER_TOTAL_ITEMS=$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)
+fi
+TIMER_OUTPUT_DIR="${OUTPUT_DIR}"
+run_with_timing torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b_vipe.py \
     --video_dir     "${VIDEO_DIR}" \
     --camera_dir    "${CAMERA_DIR}" \

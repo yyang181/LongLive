@@ -6,6 +6,9 @@
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_run_with_timing.sh"
+
 VIDEO_DIR=${VIDEO_DIR:-/local-ssd/code/LongLive/data/sekai_game_train_961frames_16fps_ovl640/video}
 CAMERA_NPZ=${CAMERA_NPZ:-"/local-ssd/code/LongLive/data/sekai_game_train_961frames_16fps_ovl640/sekai_game_train_*_camera.npz"}
 CAPTION_JSON=${CAPTION_JSON:-"/local-ssd/code/LongLive/data/sekai_game_train_961frames_16fps_ovl640/sekai_game_train_*_LongSceneStaticCaption-Qwen3-VL-30B-A3B-Instruct.json"}
@@ -55,7 +58,11 @@ if [[ ${#CAPTION_JSON_LIST[@]} -eq 0 ]]; then
 fi
 shopt -u nullglob
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+    TIMER_TOTAL_ITEMS=$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)
+fi
+TIMER_OUTPUT_DIR="${OUTPUT_DIR}"
+run_with_timing torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
     scripts/data_preprocessing/build_camera_lmdb_5b_sekai_game.py \
     --video_dir     "${VIDEO_DIR}" \
     --camera_npz    "${CAMERA_NPZ_LIST[@]}" \
