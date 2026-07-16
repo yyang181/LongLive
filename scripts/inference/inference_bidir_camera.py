@@ -222,6 +222,14 @@ def main() -> None:
     parser.add_argument("--max_clips", type=int, default=-1,
                         help="Cap number of (prompt, trajectory) pairs to render.")
     parser.add_argument(
+        "--max_lmdb_frames", type=int, default=None,
+        help=(
+            "Maximum decoded video frames to use from each LMDB sample. "
+            "Only applies with --lmdb_path and must be 4*k+1 (e.g. 77 or 149), "
+            "so it exactly aligns with Wan's 4x temporal VAE stride."
+        ),
+    )
+    parser.add_argument(
         "--lmdb_path", default=None,
         help=(
             "Optional camera latent LMDB directory. When set, the first "
@@ -328,14 +336,31 @@ def main() -> None:
             raise ValueError(f"No samples found in camera LMDB: {lmdb_path}")
 
         first_sample = lmdb_dataset[0]
-        lmdb_latent_shape = tuple(int(v) for v in first_sample["clean_latent"].shape)
-        if len(lmdb_latent_shape) != 4:
+        full_lmdb_latent_shape = tuple(
+            int(v) for v in first_sample["clean_latent"].shape
+        )
+        if len(full_lmdb_latent_shape) != 4:
             raise ValueError(
                 f"LMDB clean_latent must have shape (F,C,H,W), got "
-                f"{lmdb_latent_shape} from {lmdb_path}"
+                f"{full_lmdb_latent_shape} from {lmdb_path}"
             )
         configured_shape = (F_lat, C_lat, H_lat, W_lat)
-        F_lat, C_lat, H_lat, W_lat = lmdb_latent_shape
+        full_F_lat, C_lat, H_lat, W_lat = full_lmdb_latent_shape
+        if args.max_lmdb_frames is not None:
+            if args.max_lmdb_frames < 1 or (args.max_lmdb_frames - 1) % 4 != 0:
+                raise ValueError(
+                    "--max_lmdb_frames must be a positive 4*k+1 value "
+                    f"(e.g. 77 or 149), got {args.max_lmdb_frames}"
+                )
+            requested_F_lat = (args.max_lmdb_frames - 1) // 4 + 1
+            F_lat = min(full_F_lat, requested_F_lat)
+            print(
+                f"[infer] limiting each LMDB sample to first {F_lat} latent "
+                f"frames ({4 * (F_lat - 1) + 1} decoded frames)"
+            )
+        else:
+            F_lat = full_F_lat
+        lmdb_latent_shape = (F_lat, C_lat, H_lat, W_lat)
         target_h = H_lat * 16
         target_w = W_lat * 16
         if lmdb_latent_shape != configured_shape:
@@ -349,18 +374,23 @@ def main() -> None:
         for sample_idx in range(num_lmdb_samples):
             sample = first_sample if sample_idx == 0 else lmdb_dataset[sample_idx]
             sample_shape = tuple(int(v) for v in sample["clean_latent"].shape)
-            if sample_shape != lmdb_latent_shape:
+            if sample_shape != full_lmdb_latent_shape:
                 raise ValueError(
                     f"LMDB sample {sample_idx} latent shape {sample_shape} does "
-                    f"not match first sample shape {lmdb_latent_shape}"
+                    f"not match first sample shape {full_lmdb_latent_shape}"
+                )
+            if sample["viewmats"].shape[0] < F_lat or sample["Ks"].shape[0] < F_lat:
+                raise ValueError(
+                    f"LMDB sample {sample_idx} camera length is shorter than "
+                    f"requested {F_lat} latent frames"
                 )
             prompts.append(str(sample["prompts"]))
             # Keep a human-readable placeholder for metadata files. The
             # actual camera tensors come directly from the LMDB below.
             trajectories.append(f"lmdb:{sample_idx}")
-            lmdb_clean_latents.append(sample["clean_latent"])
-            lmdb_viewmats.append(sample["viewmats"])
-            lmdb_Ks.append(sample["Ks"])
+            lmdb_clean_latents.append(sample["clean_latent"][:F_lat])
+            lmdb_viewmats.append(sample["viewmats"][:F_lat])
+            lmdb_Ks.append(sample["Ks"][:F_lat])
         image_paths = []
         print(
             f"[infer] LMDB mode enabled: {lmdb_path} "
