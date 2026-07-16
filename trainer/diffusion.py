@@ -14,6 +14,7 @@ from utils.dataset import (
 )
 from utils.config import section_get, wan_default_config
 from utils.misc import set_seed
+from utils.sampler import build_training_sampler
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
@@ -845,18 +846,18 @@ class Trainer:
 
         # SP ranks in the same SP group need the same batch because they shard
         # the sequence dimension. Use dp_rank for data parallel sampling.
-        sampler_seed = int(config.seed)
         if self.sequence_parallel_size > 1:
             dp_rank = global_rank // self.sequence_parallel_size
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset, shuffle=True, drop_last=True,
-                rank=dp_rank, num_replicas=self.data_parallel_size,
-                seed=sampler_seed,
+            sampler = build_training_sampler(
+                dataset,
+                seed=config.seed,
+                rank=dp_rank,
+                num_replicas=self.data_parallel_size,
             )
         else:
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset, shuffle=True, drop_last=True,
-                seed=sampler_seed,
+            sampler = build_training_sampler(
+                dataset,
+                seed=config.seed,
             )
         dataloader = torch.utils.data.DataLoader(
             dataset,

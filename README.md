@@ -28,6 +28,7 @@
 </p>
 
 ## News
+- 🔥 [2026.07.08] We support FP8 inference on LongLive 2.0. Please refer to [here](https://github.com/NVlabs/LongLive#fp8-ptq).
 - 🔥 [2026.06.01] We released [LongLive-RAG](https://github.com/qixinhu11/LongLive-RAG), a general retrieval-augmented framework for long video gen.
 - 🔥 [2026.05.30] LongLive2.0 now supports I2V AR teacher-forcing training and I2V DMD distillation for Wan2.2-TI2V-5B.
 - ⚡ [2026.05.25] We optimized the NVFP4 inference path with fused Triton RoPE/adaLN kernels, reduced KV-cache synchronization overhead, in-place quantized KV-cache updates, faster FP4 KV dequantization, pinned VAE transfers, and safer LoRA-before-quantization setup, improving overall throughput by **18.6%**.
@@ -49,6 +50,7 @@
   - [x] NVFP4 (or BF16) for both AR training and few-step distillation.
 - For inference, it supports
   - [x] NVFP4 inference (W4A4) and NVFP4 KV Cache.
+  - [x] TorchAO FP8 PTQ inference (W8A8) from the BF16 checkpoint.
   - [x] Multi-shot attention sink.
   - [x] Sequence parallel inference.
   - [x] Async decoding.
@@ -115,6 +117,33 @@ save_video(video[0], "videos/quickstart/sample.mp4", fps=24)
 ```
 
 `place_vae_for_streaming` is a no-op unless `inference.streaming_vae` is true and `inference.vae_device` is set, so toggling streaming-pipeline decode in your yaml is enough — the script does not need to change.
+
+#### FP8 PTQ
+
+Download `model_bf16.pt` from
+[`Efficient-Large-Model/LongLive-2.0-5B`](https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B),
+set `checkpoints.generator_ckpt` in `configs/fp8/inference_fp8.yaml`, and run:
+
+```bash
+python inference.py --config_path configs/fp8/inference_fp8.yaml
+```
+
+This loads the BF16 generator, applies TorchAO row-wise dynamic FP8 W8A8 PTQ,
+and then enables the existing `torch.compile` path. With the provided 5B model,
+300 eligible core Linear layers use FP8; six small conditioning/output
+projections stay in BF16 for stability and to avoid FP8 overhead.
+
+The validated stack is Python 3.10, PyTorch 2.8.0+cu128, and TorchAO 0.13.0 on
+H100 (SM90); compute capability 8.9 or newer is required. The supplied config
+uses `torch_compile: auto`. Its `max-autotune` warm-up can take several minutes
+while guard/shape variants are compiled, so use repeated inference and exclude
+all compile/warm-up samples when measuring steady-state performance. Set
+`torch_compile: false` for a short eager-mode smoke test.
+
+The supplied config uses the single 8-latent-frame block validated on H100.
+Longer generation introduces additional KV-cache shapes and may trigger more
+compilation or eager fallback; validate the intended frame count before
+benchmarking or deployment.
 
 #### NVFP4
 
@@ -207,6 +236,12 @@ For I2V configs, set `algorithm.i2v: true` and `algorithm.independent_first_fram
 - [KVPO](https://github.com/Richard-Zhang-AI/KVPO): Builds on LongLive and related AR video codebases to perform GRPO-style alignment through historical KV semantic exploration.
 - [LoL](https://github.com/justincui03/LoL): Builds on LongLive to study and mitigate sink-collapse for ultra-long AR streaming video generation.
 - [TriAttention](https://github.com/WeianMao/triattention/tree/main/longlive): Integrates trigonometric KV-cache compression into LongLive's causal inference pipeline, reducing KV memory inside LongLive's local-attention window.
+- [StreamEdit](https://github.com/DSL-Lab/StreamEdit): Provides a `LongLive_StreamEdit` implementation for training-free streaming video editing built on the LongLive v1.0 codebase.
+- [Streaming Autoregressive Video Generation via Diagonal Distillation](https://github.com/Sphere-AI-Lab/diagdistill): Builds on the LongLive codebase and supports direct initialization from `LongLive-1.3B` checkpoints for streaming AR video distillation.
+- [Forcing-KV](https://github.com/zju-jiyicheng/Forcing-KV): Adds hybrid KV-cache compression to LongLive, including LongLive inference and interactive-generation scripts.
+- [Dummy Forcing](https://github.com/csguoh/DummyForcing): Unifies Self-Forcing, LongLive, and Causal-Forcing pipelines with LongLive inference, VBench, and interactive-generation configs.
+- [MemRoPE](https://github.com/YoungRaeKimm/MemRoPE): Uses LongLive as a supported base model for training-free infinite video generation with evolving memory tokens.
+- [Astrolabe](https://github.com/franklinz233/Astrolabe): Supports LongLive as a distilled autoregressive video backbone with LongLive-specific RL configs and LoRA initialization.
 
 
 ## License

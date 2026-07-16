@@ -14,6 +14,7 @@ from utils.misc import (
     set_seed,
     merge_dict_list
 )
+from utils.sampler import build_training_sampler
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD
@@ -536,9 +537,7 @@ class Trainer:
         if dataset_repeat > 1:
             dataset = RepeatDataset(base_dataset, dataset_repeat)
 
-        random_seed = int(time.time()) % (2**31) * dist.get_rank()
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, shuffle=True, drop_last=True, seed=random_seed)
+        sampler = build_training_sampler(dataset, seed=config.seed)
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=config.batch_size, sampler=sampler,
             num_workers=2, prefetch_factor=1, pin_memory=False,
