@@ -4,9 +4,12 @@
 
 The full P2P dataset stores 200 recordings per ``batch_*.tar.gz``.  Every
 recording contains ``video.mp4``, ``192x192.mp4`` and a binary
-``annotation.proto``.  This script reads the archives directly and extracts
-only one temporary recording from each selected batch; the dataset does not
-need to be unpacked first.
+``annotation.proto``. This script can read the archives directly (extracting
+only one temporary recording from each selected batch), or an already
+extracted flat layout:
+
+    <p2p_path>/<game>/<uuid>.mp4
+    <p2p_path>/<game>/<uuid>.proto
 
 P2P actions are more general than MIND's ``ws/ad/ud/lr`` controls:
 
@@ -24,7 +27,7 @@ Example (from the LongLive repository root)::
         --mind_path /nfs/hongfenglai/p2p-full-data \
         --output_dir ./lmdb_vis/p2pfull \
         --min_frames 593 \
-        --num_samples 10
+        --roblox_only --one_per_game
 
 ``--mind_path`` is accepted as a compatibility alias for ``--p2p_path``.
 """
@@ -213,6 +216,67 @@ def list_archives(p2p_path: Path) -> list[Path]:
     return archives
 
 
+def list_extracted_samples(p2p_path: Path) -> list[tuple[str, Path, Path]]:
+    """List flat extracted P2P samples that have both video and annotation."""
+    samples = []
+    for video_path in sorted(p2p_path.rglob("*.mp4")):
+        annotation_path = video_path.with_suffix(".proto")
+        if annotation_path.is_file():
+            samples.append((video_path.stem, video_path, annotation_path))
+    if not samples:
+        raise RuntimeError(
+            f"No paired <uuid>.mp4 and <uuid>.proto files found under {p2p_path}"
+        )
+    return samples
+
+
+def normalize_game_name(name: str) -> str:
+    """Normalize common noisy Roblox subtype spellings for deduplication."""
+    value = "-".join(str(name).strip().lower().replace("_", "-").split())
+    value = value.replace("/", "-").replace("=", "-").replace(".", "")
+    aliases = {
+        "a-adusty-trip": "a-dusty-trip", "a-dirty-trip": "a-dusty-trip",
+        "a-dusry-trip": "a-dusty-trip", "a-dust-trip": "a-dusty-trip",
+        "a-dusty-drive": "a-dusty-trip", "a-duty-trip": "a-dusty-trip",
+        "dusty-trip": "a-dusty-trip", "blade-ball": "blade-ball",
+        "balde-ball": "blade-ball", "blade-bal": "blade-ball", "blade-ball-elemental": "blade-ball",
+        "blade-ball-training": "blade-ball", "death-ball": "death-ball",
+        "be-a-tornado": "be-a-tornado", "be-a-torando": "be-a-tornado",
+        "be-a-trex": "be-a-t-rex", "be-a-snake": "be-a-snake",
+        "be-a-skane": "be-a-snake", "be-snake": "be-a-snake", "be-a-shark": "be-a-shark", "shark": "be-a-shark",
+        "be-tornado": "be-a-tornado", "be-a-dragon": "be-a-dragon", "be-a-alligator": "be-a-alligator", "be-a-bull": "be-a-bull", "be-a-t-rex": "be-a-t-rex", "hypershoot": "hypershot",
+        "hipershot": "hypershot", "natural-disaster": "natural-disaster-survival", "atural-disaster-survival": "natural-disaster-survival",
+        "natural-disaster-survivalnatural-disaster-survival": "natural-disaster-survival",
+        "natural-disaster-sruvival": "natural-disaster-survival",
+        "natural-disaster-surival": "natural-disaster-survival",
+        "natural-disaster-surviva": "natural-disaster-survival",
+        "natural-disaster-survivala": "natural-disaster-survival",
+        "natural-disaster-survivor": "natural-disaster-survival",
+        "natural-disaster-suvival": "natural-disaster-survival",
+        "natural-disater-survival": "natural-disaster-survival",
+        "natural-survival-disaster": "natural-disaster-survival",
+        "nature-disaster-survival": "natural-disaster-survival",
+        "nataural-disaster-survival": "natural-disaster-survival",
+        "ntural-survival-disaster": "natural-disaster-survival",
+        "murder-vs-xerif": "murderers-vs-sheriffs",
+        "murderers-sheriffs": "murderers-vs-sheriffs",
+        "murderers-vs-sherrifs": "murderers-vs-sheriffs",
+        "murders-vs-sheriffs": "murderers-vs-sheriffs",
+        "murderers-vs-snakemurderers-vs-sheriffs": "murderers-vs-sheriffs", "be-a-snakemurderers-vs-sheriffs": "murderers-vs-sheriffs",
+        "rival-res-1080p": "rivals", "rivals-res-1080p": "rivals", "roblox-rivals-res-1080p": "rivals", "rivais": "rivals",
+        "roblox-rally-racing": "roblox-rally-racing",
+        "eat-the-world": "eat-a-world",
+        "slap-batte": "slap-battle", "slap-battles": "slap-battle",
+        "slapr-battle": "slap-battle", "snake-simulator": "snake-simulator",
+    }
+    return aliases.get(value, value or "unknown")
+
+
+def is_roblox_environment(name: str) -> bool:
+    value = "".join(str(name).strip().lower().split())
+    return value in {"roblox", "roblos", "rpblox"}
+
+
 def parse_annotation(data: bytes, source: str):
     annotation = VideoAnnotation()
     try:
@@ -226,7 +290,9 @@ def parse_annotation(data: bytes, source: str):
 
 def extract_first_sample(
     archive: Path, temp_dir: Path, video_name: str, min_frames: int = 0,
-) -> tuple[str, Path, object]:
+    *, roblox_only: bool = False, one_per_game: bool = False,
+    seen_games: set[str] | None = None,
+) -> tuple[str, Path, object, str]:
     """Stream the first recording with more than ``min_frames`` frames."""
     selected_id = None
     annotation = None
@@ -248,8 +314,14 @@ def extract_first_sample(
                 )
                 if len(candidate.frame_annotations) <= min_frames:
                     continue
+                if roblox_only and not is_roblox_environment(candidate.metadata.env.env):
+                    continue
+                game_key = normalize_game_name(candidate.metadata.env.env_subtype)
+                if one_per_game and seen_games is not None and game_key in seen_games:
+                    continue
                 selected_id = sample_id
                 annotation = candidate
+                selected_game = game_key
                 continue
             if selected_id == sample_id and filename == video_name:
                 output_path = temp_dir / video_name
@@ -258,12 +330,33 @@ def extract_first_sample(
                     raise RuntimeError(f"Could not read {archive.name}:{member.name}")
                 with output_path.open("wb") as output:
                     shutil.copyfileobj(fileobj, output, length=8 * 1024 * 1024)
-                return selected_id, output_path, annotation
+                return selected_id, output_path, annotation, selected_game
     if selected_id is None:
+        qualifier = f"Roblox recording not already selected" if one_per_game else "recording"
         raise RuntimeError(
-            f"No recording with more than {min_frames} frames found in {archive}"
+            f"No {qualifier} with more than {min_frames} frames found in {archive}"
         )
     raise RuntimeError(f"No {video_name} found for {selected_id} in {archive}")
+
+
+def load_extracted_sample(
+    sample_id: str, video_path: Path, annotation_path: Path, min_frames: int = 0,
+    *, roblox_only: bool = False, one_per_game: bool = False,
+    seen_games: set[str] | None = None,
+) -> tuple[object, str]:
+    """Load and filter one sample from the flat extracted P2P layout."""
+    annotation = parse_annotation(annotation_path.read_bytes(), str(annotation_path))
+    if len(annotation.frame_annotations) <= min_frames:
+        raise RuntimeError(
+            f"{sample_id} has {len(annotation.frame_annotations)} annotations; "
+            f"requires more than {min_frames}"
+        )
+    if roblox_only and not is_roblox_environment(annotation.metadata.env.env):
+        raise RuntimeError(f"{sample_id} is not a Roblox recording")
+    game_key = normalize_game_name(annotation.metadata.env.env_subtype)
+    if one_per_game and seen_games is not None and game_key in seen_games:
+        raise RuntimeError(f"{sample_id} is a duplicate game: {game_key}")
+    return annotation, game_key
 
 
 def select_action(frame_annotation):
@@ -420,7 +513,19 @@ def visualize_sample(
                     action_source=source,
                     instruction=instructions[action_index],
                 )
-            writer.append_data(np.asarray(image.convert("RGB")))
+            encoded_frame = np.asarray(image.convert("RGB"))
+            # H.264 yuv420p requires even dimensions. Some extracted P2P
+            # videos have an odd width (for example 947x480), so edge-pad
+            # only for encoding and keep overlay coordinates unchanged.
+            pad_height = encoded_frame.shape[0] % 2
+            pad_width = encoded_frame.shape[1] % 2
+            if pad_height or pad_width:
+                encoded_frame = np.pad(
+                    encoded_frame,
+                    ((0, pad_height), (0, pad_width), (0, 0)),
+                    mode="edge",
+                )
+            writer.append_data(encoded_frame)
     finally:
         capture.release()
         writer.close()
@@ -435,10 +540,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--p2p_path", "--mind_path", dest="p2p_path", type=Path,
         default=Path("/nfs/hongfenglai/p2p-full-data"),
-        help="P2P root containing data_metadata.parquet and dataset/batch_*.tar.gz.",
+        help=(
+            "P2P archive root, or extracted root containing "
+            "<game>/<uuid>.mp4 and <game>/<uuid>.proto."
+        ),
     )
     parser.add_argument("--output_dir", type=Path, default=Path("./p2p_vis"))
-    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument(
+        "--num_samples", type=int, default=None,
+        help="Maximum outputs; omitted means 1, or all available games with --one_per_game.",
+    )
+    parser.add_argument(
+        "--roblox_only", action="store_true",
+        help="Keep only Roblox/roblos/rpblox environments.",
+    )
+    parser.add_argument(
+        "--one_per_game", action="store_true",
+        help="With --roblox_only, output at most one sample per normalized env_sub_type.",
+    )
     parser.add_argument(
         "--min_frames", type=int, default=0,
         help=(
@@ -481,7 +600,7 @@ def main() -> None:
     args = parse_args()
     args.p2p_path = args.p2p_path.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
-    if args.num_samples < 1:
+    if args.num_samples is not None and args.num_samples < 1:
         raise ValueError("--num_samples must be at least 1")
     if args.max_frames < 0:
         raise ValueError("--max_frames must be non-negative")
@@ -490,35 +609,78 @@ def main() -> None:
     if args.mouse_scale <= 0:
         raise ValueError("--mouse_scale must be positive")
 
-    archives = list_archives(args.p2p_path)
+    dataset_dir = (
+        args.p2p_path / "dataset"
+        if (args.p2p_path / "dataset").is_dir()
+        else args.p2p_path
+    )
+    archives = sorted(dataset_dir.glob("batch_*.tar.gz"))
+    extracted_samples: list[tuple[str, Path, Path]] = []
+    if archives:
+        input_kind = "archives"
+        candidates: list[Path] | list[tuple[str, Path, Path]] = archives.copy()
+    else:
+        if args.video_name != "video.mp4":
+            raise ValueError(
+                "--video_name only applies to archive input; extracted samples contain <uuid>.mp4"
+            )
+        input_kind = "extracted samples"
+        extracted_samples = list_extracted_samples(args.p2p_path)
+        candidates = extracted_samples.copy()
+
+    if args.one_per_game and not args.roblox_only:
+        raise ValueError("--one_per_game requires --roblox_only")
+    target_samples = args.num_samples if args.num_samples is not None else (
+        len(candidates) if args.one_per_game else 1
+    )
     rng = random.Random(args.seed)
-    candidates = archives.copy()
     rng.shuffle(candidates)
     print(
-        f"Found {len(archives)} archives; selecting up to {args.num_samples} "
+        f"Found {len(candidates)} {input_kind}; selecting up to {target_samples} "
         f"recordings (seed={args.seed}, video={args.video_name})"
     )
     outputs = []
+    seen_games: set[str] = set()
     failures = 0
-    for archive in candidates:
-        if len(outputs) >= args.num_samples:
+    for candidate in candidates:
+        if len(outputs) >= target_samples:
             break
+        source_name = str(candidate)
         try:
-            with tempfile.TemporaryDirectory(prefix="p2p_visualize_") as tmp:
-                sample_id, video_path, annotation = extract_first_sample(
-                    archive, Path(tmp), args.video_name, args.min_frames
+            if archives:
+                archive = candidate
+                source_name = archive.name
+                with tempfile.TemporaryDirectory(prefix="p2p_visualize_") as tmp:
+                    sample_id, video_path, annotation, game_key = extract_first_sample(
+                        archive, Path(tmp), args.video_name, args.min_frames,
+                        roblox_only=args.roblox_only, one_per_game=args.one_per_game,
+                        seen_games=seen_games,
+                    )
+                    outputs.append(
+                        visualize_sample(
+                            archive, sample_id, video_path, annotation, args.output_dir, args
+                        )
+                    )
+            else:
+                sample_id, video_path, annotation_path = candidate
+                source_name = str(video_path)
+                annotation, game_key = load_extracted_sample(
+                    sample_id, video_path, annotation_path, args.min_frames,
+                    roblox_only=args.roblox_only, one_per_game=args.one_per_game,
+                    seen_games=seen_games,
                 )
                 outputs.append(
                     visualize_sample(
-                        archive, sample_id, video_path, annotation, args.output_dir, args
+                        video_path.parent, sample_id, video_path, annotation, args.output_dir, args
                     )
                 )
+            seen_games.add(game_key)
         except (OSError, tarfile.TarError, ValueError, RuntimeError) as exc:
             failures += 1
-            print(f"[WARN] Skipping {archive.name}: {exc}")
-    if len(outputs) < args.num_samples:
+            print(f"[WARN] Skipping {source_name}: {exc}")
+    if len(outputs) < target_samples and not args.one_per_game:
         raise RuntimeError(
-            f"Only produced {len(outputs)}/{args.num_samples} videos; "
+            f"Only produced {len(outputs)}/{target_samples} videos; "
             f"{failures} archive(s) failed."
         )
     print(f"Done. Wrote {len(outputs)} video(s) to {args.output_dir}")
