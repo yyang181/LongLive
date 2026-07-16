@@ -11,6 +11,7 @@ import os
 import subprocess
 import time
 import warnings
+from collections.abc import Mapping
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
 
@@ -20,6 +21,55 @@ except ModuleNotFoundError:
     decord = None
 
 DEFAULT_SCENE_CUT_PREFIX = "The scene transitions. "
+
+def normalize_dataset_paths_and_repeats(data_path, dataset_repeat=None):
+    """Normalize one-or-more dataset paths and their logical repeat factors.
+
+    ``data_path`` accepts either a string or a sequence of strings. A scalar
+    ``dataset_repeat`` applies to every path; a sequence has one entry per path.
+    """
+    if isinstance(data_path, str):
+        paths = [data_path]
+    else:
+        if isinstance(data_path, Mapping):
+            raise TypeError("data_path must be a path or a sequence of paths, not a mapping.")
+        try:
+            paths = list(data_path)
+        except TypeError as exc:
+            raise TypeError(
+                "data_path must be a path string or a sequence of path strings."
+            ) from exc
+
+    if not paths or any(not isinstance(path, str) or not path for path in paths):
+        raise ValueError("data_path must contain at least one non-empty path string.")
+
+    if dataset_repeat is None:
+        repeats = [1] * len(paths)
+    elif isinstance(dataset_repeat, Mapping):
+        raise TypeError("dataset_repeat must be an integer or a sequence of integers.")
+    elif isinstance(dataset_repeat, str):
+        repeats = [dataset_repeat] * len(paths)
+    else:
+        try:
+            repeat_values = list(dataset_repeat)
+        except TypeError:
+            repeats = [dataset_repeat] * len(paths)
+        else:
+            if len(repeat_values) != len(paths):
+                raise ValueError(
+                    "dataset_repeat must be a scalar or have the same number of "
+                    f"entries as data_path ({len(paths)}), got {len(repeat_values)}."
+                )
+            repeats = repeat_values
+
+    try:
+        repeats = [int(repeat) for repeat in repeats]
+    except (TypeError, ValueError) as exc:
+        raise TypeError("dataset_repeat entries must be integers.") from exc
+    if any(repeat < 1 for repeat in repeats):
+        raise ValueError(f"dataset_repeat entries must be >= 1, got {repeats}.")
+    return paths, repeats
+
 
 
 class RepeatDataset(Dataset):

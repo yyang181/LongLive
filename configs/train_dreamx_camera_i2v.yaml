@@ -70,8 +70,12 @@ training:
 
 data:
   data_path: data/train/minWM-data/data
+  # Multiple camera LMDBs are supported with ordered lists, for example:
+  # data_path: [data/train/MIND/data_f149_h44_w80, data/train/other/data]
+  # dataset_repeat: [100, 20]  # one logical multiplier per data_path entry
   image_or_video_shape: [1, 20, 48, 44, 80]
-  # Logical training-dataset multiplier; validation remains un-repeated.
+  # Scalar values remain supported and apply to every data_path entry.
+  # Validation remains un-repeated.
   dataset_repeat: 1
 
 logging:

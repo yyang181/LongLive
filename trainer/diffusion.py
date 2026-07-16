@@ -10,7 +10,7 @@ from model import CausalDiffusion
 from wan_5b.distributed.sp_training import SequenceParallelHelper
 from utils.dataset import (
     MultiVideoConcatDataset, MultiTextConcatDataset, RepeatDataset, cycle,
-    multi_video_collate_fn, eval_collate_fn,
+    multi_video_collate_fn, eval_collate_fn, normalize_dataset_paths_and_repeats,
 )
 from utils.config import section_get, wan_default_config
 from utils.misc import set_seed
@@ -762,28 +762,49 @@ class Trainer:
         self.fps = wan_default_config[config.model_kwargs.model_name].get("fps", 16)
 
         # Detect camera LMDB data (precomputed latents + viewmats + Ks).
-        self.use_camera_lmdb = os.path.isfile(
-            os.path.join(config.data_path, "data.mdb")
-        ) or (
-            os.path.isdir(config.data_path)
-            and any(os.path.isfile(os.path.join(config.data_path, d, "data.mdb"))
-                    for d in os.listdir(config.data_path))
-        )
+        # ``data_path`` can be one LMDB (or a shard parent) or a list of LMDBs.
+        data_paths, _ = normalize_dataset_paths_and_repeats(config.data_path, 1)
+        def _is_camera_lmdb_path(path):
+            return os.path.isfile(os.path.join(path, "data.mdb")) or (
+                os.path.isdir(path)
+                and any(os.path.isfile(os.path.join(path, d, "data.mdb"))
+                        for d in os.listdir(path))
+            )
+        camera_lmdb_flags = [_is_camera_lmdb_path(path) for path in data_paths]
+        if any(camera_lmdb_flags) and not all(camera_lmdb_flags):
+            raise ValueError(
+                "All data_path entries must be camera LMDBs when using multiple datasets; "
+                f"got {data_paths}."
+            )
+        self.use_camera_lmdb = all(camera_lmdb_flags)
 
         if self.use_camera_lmdb:
             from utils.camera_dataset import CameraLatentLMDBDataset
             configured_shape = list(config.image_or_video_shape)
-            dataset = CameraLatentLMDBDataset(
-                config.data_path,
-                max_pair=int(1e8),
-                target_num_frames=int(configured_shape[1]),
-                expected_latent_shape=tuple(int(v) for v in configured_shape[2:]),
+            component_datasets = [
+                CameraLatentLMDBDataset(
+                    data_path,
+                    max_pair=int(1e8),
+                    target_num_frames=int(configured_shape[1]),
+                    expected_latent_shape=tuple(int(v) for v in configured_shape[2:]),
+                )
+                for data_path in data_paths
+            ]
+            base_dataset = (
+                component_datasets[0] if len(component_datasets) == 1
+                else torch.utils.data.ConcatDataset(component_datasets)
             )
+            dataset = base_dataset
             camera_collate_fn = _camera_latent_collate_fn
             if self.is_main_process:
-                print(f"[DiffusionTrainer] using CameraLatentLMDBDataset, "
-                      f"size={len(dataset)}, target_frames={configured_shape[1]}")
+                print(f"[DiffusionTrainer] using {len(component_datasets)} CameraLatentLMDBDataset "
+                      f"source(s), base_size={len(base_dataset)}, "
+                      f"target_frames={configured_shape[1]}")
         else:
+            if len(data_paths) != 1:
+                raise ValueError(
+                    "Multiple data_path entries are currently supported for camera LMDB datasets only."
+                )
             allow_padding = getattr(config, "allow_padding", False)
             min_latent_frames = getattr(config, "min_latent_frames", 0)
             single_video_only = getattr(config, "uniform_prompt", False)
@@ -793,7 +814,7 @@ class Trainer:
                 config, "dataset_sample_warning_interval_seconds", 60.0
             )
             dataset = MultiVideoConcatDataset(
-                data_dir=config.data_path,
+                data_dir=data_paths[0],
                 video_size=(frame_raw_height, frame_raw_width),
                 total_frames=total_frames,
                 deterministic=False,
@@ -816,33 +837,44 @@ class Trainer:
             if single_video_only and self.is_main_process:
                 print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
 
-        # Repeat only the training view of the dataset.  The validation loader
-        # below reuses the original LMDB object, so validation is not inflated
-        # by the training repeat factor.
-        base_dataset = dataset
+        # Repeat only the training view. For multiple LMDB sources each repeat
+        # applies before concatenation, so source sampling ratios stay explicit.
+        if not self.use_camera_lmdb:
+            base_dataset = dataset
         dataset_repeat = getattr(config, "dataset_repeat", None)
-        # ``repeat``/``repeat_dataset`` are compatibility aliases.  They must
-        # override the config default (dataset_repeat=1) when supplied via CLI.
+        # ``repeat``/``repeat_dataset`` are compatibility aliases. They retain
+        # their old precedence, including for per-source repeat lists.
         alias_repeat = getattr(config, "repeat_dataset", None)
         if alias_repeat is None:
             alias_repeat = getattr(config, "repeat", None)
         if alias_repeat is not None:
-            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+            _, configured_repeats = normalize_dataset_paths_and_repeats(
+                data_paths, dataset_repeat
+            )
+            _, alias_repeats = normalize_dataset_paths_and_repeats(data_paths, alias_repeat)
+            if any(repeat != 1 for repeat in configured_repeats) and configured_repeats != alias_repeats:
                 raise ValueError(
                     "Conflicting dataset repeat values: "
                     f"dataset_repeat={dataset_repeat}, alias={alias_repeat}."
                 )
             dataset_repeat = alias_repeat
-        if dataset_repeat is None:
-            dataset_repeat = 1
-        dataset_repeat = int(dataset_repeat)
-        if dataset_repeat < 1:
-            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
-        if dataset_repeat > 1:
-            dataset = RepeatDataset(base_dataset, dataset_repeat)
-            if self.is_main_process:
-                print(f"[DatasetRepeat] base_size={len(base_dataset)}, "
-                      f"repeat={dataset_repeat}, train_size={len(dataset)}")
+        _, dataset_repeats = normalize_dataset_paths_and_repeats(data_paths, dataset_repeat)
+        if self.use_camera_lmdb:
+            train_components = [
+                RepeatDataset(component, repeat) if repeat > 1 else component
+                for component, repeat in zip(component_datasets, dataset_repeats)
+            ]
+            dataset = (
+                train_components[0] if len(train_components) == 1
+                else torch.utils.data.ConcatDataset(train_components)
+            )
+        else:
+            dataset_repeat = dataset_repeats[0]
+            if dataset_repeat > 1:
+                dataset = RepeatDataset(base_dataset, dataset_repeat)
+        if self.is_main_process and any(repeat > 1 for repeat in dataset_repeats):
+            print(f"[DatasetRepeat] paths={data_paths}, base_size={len(base_dataset)}, "
+                  f"repeats={dataset_repeats}, train_size={len(dataset)}")
 
         # SP ranks in the same SP group need the same batch because they shard
         # the sequence dimension. Use dp_rank for data parallel sampling.

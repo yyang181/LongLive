@@ -14,9 +14,9 @@ extracted flat layout:
 P2P actions are more general than MIND's ``ws/ad/ud/lr`` controls:
 
 * held keyboard keys include W/A/S/D (plus jump, sprint, weapon keys, etc.);
-* ``mouse_delta_px.x`` is analogous to MIND ``lr``;
-* ``mouse_delta_px.y`` is analogous to MIND ``ud``;
-* mouse buttons and scroll are also available.
+* keyboard ``LeftArrow``/``RightArrow`` correspond to MIND ``lr``;
+* keyboard ``UpArrow``/``DownArrow`` correspond to MIND ``ud``;
+* mouse movement, buttons and scroll are separate action metadata.
 
 The official P2P behavior-cloning loader prioritizes ``system_action`` when
 known and otherwise uses ``user_action``.  The visualizer follows that rule.
@@ -368,13 +368,19 @@ def select_action(frame_annotation):
     return frame_annotation.user_action, "unknown"
 
 
-def action_inputs(action, mouse_scale: float) -> tuple[list[str], float, float]:
-    keys = [key.upper() for key in action.keyboard.keys]
-    pressed_keys = [key for key in keys if key in {"W", "A", "S", "D"}]
-    dx = int(action.mouse.mouse_delta_px.x)
-    dy = int(action.mouse.mouse_delta_px.y)
-    yaw = float(np.clip(dx / mouse_scale, -1.0, 1.0))
-    pitch = float(np.clip(dy / mouse_scale, -1.0, 1.0))
+def action_inputs(action) -> tuple[list[str], float, float]:
+    """Convert P2P keyboard actions to the movement/rotation overlay.
+
+    P2P stores MIND-style camera directions as arrow keys, not as mouse
+    deltas. Mouse delta remains metadata and does not drive lr/ud.
+    """
+    keys = {
+        str(key).replace("_", "").replace("-", "").lower()
+        for key in action.keyboard.keys
+    }
+    pressed_keys = [key for key in ("W", "A", "S", "D") if key.lower() in keys]
+    yaw = float(("rightarrow" in keys) - ("leftarrow" in keys))
+    pitch = float(("downarrow" in keys) - ("uparrow" in keys))
     return pressed_keys, yaw, pitch
 
 
@@ -495,7 +501,7 @@ def visualize_sample(
             video_index = start + local_index
             action_index = first_action + local_index
             action, source = select_action(action_frames[action_index])
-            pressed_keys, yaw, pitch = action_inputs(action, args.mouse_scale)
+            pressed_keys, yaw, pitch = action_inputs(action)
             image = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
             if not args.no_overlay:
                 panel = renderer.render_panel(
@@ -583,7 +589,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mouse_scale", type=float, default=20.0,
-        help="Mouse pixels mapped to full joystick deflection (default: 20).",
+        help=argparse.SUPPRESS,  # Deprecated: arrow keys now drive lr/ud.
     )
     parser.add_argument("--fps", type=float, default=0.0,
                         help="Output FPS (default: preserve source FPS).")
@@ -606,8 +612,6 @@ def main() -> None:
         raise ValueError("--max_frames must be non-negative")
     if args.min_frames < 0:
         raise ValueError("--min_frames must be non-negative")
-    if args.mouse_scale <= 0:
-        raise ValueError("--mouse_scale must be positive")
 
     dataset_dir = (
         args.p2p_path / "dataset"
@@ -630,59 +634,53 @@ def main() -> None:
 
     if args.one_per_game and not args.roblox_only:
         raise ValueError("--one_per_game requires --roblox_only")
-    target_samples = args.num_samples if args.num_samples is not None else (
-        len(candidates) if args.one_per_game else 1
-    )
+    if input_kind == "extracted samples":
+        groups = {}
+        for item in candidates:
+            groups.setdefault(item[1].parent, []).append(item)
+    else:
+        groups = {dataset_dir: candidates}
     rng = random.Random(args.seed)
-    rng.shuffle(candidates)
-    print(
-        f"Found {len(candidates)} {input_kind}; selecting up to {target_samples} "
-        f"recordings (seed={args.seed}, video={args.video_name})"
-    )
+    for group in groups.values():
+        rng.shuffle(group)
+    per_folder = args.num_samples if args.num_samples is not None else 1
+    print(f"Found {len(candidates)} {input_kind} in {len(groups)} folder(s); selecting up to {per_folder} recording(s) per folder (seed={args.seed}, video={args.video_name})")
     outputs = []
-    seen_games: set[str] = set()
     failures = 0
-    for candidate in candidates:
-        if len(outputs) >= target_samples:
-            break
-        source_name = str(candidate)
-        try:
-            if archives:
-                archive = candidate
-                source_name = archive.name
-                with tempfile.TemporaryDirectory(prefix="p2p_visualize_") as tmp:
-                    sample_id, video_path, annotation, game_key = extract_first_sample(
-                        archive, Path(tmp), args.video_name, args.min_frames,
+    for group_dir, group_candidates in groups.items():
+        target_samples = args.num_samples if args.num_samples is not None else (len(group_candidates) if args.one_per_game else 1)
+        group_outputs = 0
+        seen_games: set[str] = set()
+        save_dir = args.output_dir / group_dir.name if input_kind == "extracted samples" else args.output_dir
+        for candidate in group_candidates:
+            if group_outputs >= target_samples:
+                break
+            source_name = str(candidate)
+            try:
+                if archives:
+                    archive = candidate
+                    source_name = archive.name
+                    with tempfile.TemporaryDirectory(prefix="p2p_visualize_") as tmp:
+                        sample_id, video_path, annotation, game_key = extract_first_sample(
+                            archive, Path(tmp), args.video_name, args.min_frames,
+                            roblox_only=args.roblox_only, one_per_game=args.one_per_game,
+                            seen_games=seen_games)
+                        outputs.append(visualize_sample(archive, sample_id, video_path, annotation, save_dir, args))
+                else:
+                    sample_id, video_path, annotation_path = candidate
+                    source_name = str(video_path)
+                    annotation, game_key = load_extracted_sample(
+                        sample_id, video_path, annotation_path, args.min_frames,
                         roblox_only=args.roblox_only, one_per_game=args.one_per_game,
-                        seen_games=seen_games,
-                    )
-                    outputs.append(
-                        visualize_sample(
-                            archive, sample_id, video_path, annotation, args.output_dir, args
-                        )
-                    )
-            else:
-                sample_id, video_path, annotation_path = candidate
-                source_name = str(video_path)
-                annotation, game_key = load_extracted_sample(
-                    sample_id, video_path, annotation_path, args.min_frames,
-                    roblox_only=args.roblox_only, one_per_game=args.one_per_game,
-                    seen_games=seen_games,
-                )
-                outputs.append(
-                    visualize_sample(
-                        video_path.parent, sample_id, video_path, annotation, args.output_dir, args
-                    )
-                )
-            seen_games.add(game_key)
-        except (OSError, tarfile.TarError, ValueError, RuntimeError) as exc:
-            failures += 1
-            print(f"[WARN] Skipping {source_name}: {exc}")
-    if len(outputs) < target_samples and not args.one_per_game:
-        raise RuntimeError(
-            f"Only produced {len(outputs)}/{target_samples} videos; "
-            f"{failures} archive(s) failed."
-        )
+                        seen_games=seen_games)
+                    outputs.append(visualize_sample(video_path.parent, sample_id, video_path, annotation, save_dir, args))
+                seen_games.add(game_key)
+                group_outputs += 1
+            except (OSError, tarfile.TarError, ValueError, RuntimeError) as exc:
+                failures += 1
+                print(f"[WARN] Skipping {source_name}: {exc}")
+        if group_outputs < target_samples and not args.one_per_game:
+            print(f"[WARN] Folder {group_dir}: produced {group_outputs}/{target_samples}")
     print(f"Done. Wrote {len(outputs)} video(s) to {args.output_dir}")
 
 

@@ -19,7 +19,9 @@ Run:
 
 For camera-training LMDB evaluation, pass --lmdb_path and optionally
 --max_clips N. The first N records supply the prompt, camera tensors and
-I2V context latent; the configured text/image files are ignored.
+I2V context latent; the configured text/image files are ignored. Passing the
+raw MIND root instead discovers both test/action_space_test trees and uses
+their action.json controls plus video frame zero on demand.
 """
 
 from __future__ import annotations
@@ -45,6 +47,12 @@ from scripts.data_preprocessing.build_camera_lmdb_5b import (  # noqa: E402
     _generate_camera_trajectory_local,
     _parse_pose_string,
     poses_from_pose_str,
+)
+from scripts.data_preprocessing.build_camera_lmdb_5b_mind import (  # noqa: E402
+    default_intrinsics_from_fov,
+    load_video_frames,
+    poses_from_c2w_array,
+    poses_from_mind_actions,
 )
 import utils.tv_io_patch  # noqa: E402, F401 — patch torchvision.io before anything imports it
 from utils.action_overlay import apply_overlay  # noqa: E402
@@ -208,6 +216,97 @@ def _resample_c2w_for_overlay(
     return result
 
 
+def _is_camera_lmdb_path(path: str) -> bool:
+    """Return whether *path* is an encoded camera LMDB (or its shard parent)."""
+    root = Path(path)
+    if (root / "data.mdb").is_file():
+        return True
+    try:
+        return any(
+            (child / "data.mdb").is_file()
+            for child in root.iterdir()
+            if child.is_dir()
+        )
+    except OSError:
+        return False
+
+
+def _discover_mind_action_space_samples(root: str):
+    """Discover held-out MIND action-space clips under a dataset root.
+
+    The test tree stays as raw video.mp4 + action.json files, unlike the train
+    tree which is VAE-encoded into LMDB. This lets --lmdb_path /.../MIND use
+    the same camera convention as build_camera_lmdb_5b_mind.py without a
+    second large preprocessing run. Results are interleaved by perspective so
+    --max_clips exercises both first- and third-person data.
+    """
+    import json
+
+    root_path = Path(root).expanduser().resolve()
+    groups = []
+    for perspective in ("1st_data", "3rd_data"):
+        action_dir = root_path / perspective / "test" / "action_space_test"
+
+        def sort_key(path):
+            match = re.match(r"data-(\d+)", path.parent.name)
+            return (int(match.group(1)) if match else 10**9, path.parent.name)
+
+        group = []
+        for action_path in sorted(action_dir.glob("*/action.json"), key=sort_key):
+            sample_dir = action_path.parent
+            video_path = sample_dir / "video.mp4"
+            if not video_path.is_file():
+                continue
+            try:
+                with action_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                frames = meta.get("data", [])
+                if not frames:
+                    raise ValueError("empty data array")
+                for frame_idx, frame in enumerate(frames):
+                    missing = {"ws", "ad", "ud", "lr"}.difference(frame)
+                    if missing:
+                        raise ValueError(
+                            f"frame {frame_idx} missing {sorted(missing)}"
+                        )
+            except (OSError, ValueError, TypeError) as exc:
+                print(
+                    f"[infer] skip malformed MIND test sample "
+                    f"{action_path}: {exc}"
+                )
+                continue
+            group.append({
+                "video_path": str(video_path),
+                "action_path": str(action_path),
+                "sample_id": f"{perspective}_{sample_dir.name}",
+                "frames": frames,
+                "caption": meta.get("caption", ""),
+            })
+        groups.append(group)
+
+    samples = []
+    for idx in range(max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if idx < len(group):
+                samples.append(group[idx])
+    return samples
+
+
+def _load_video_first_frame_as_pixel(
+    video_path: str,
+    target_h: int,
+    target_w: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Decode frame zero with the LMDB builder's resize and normalization."""
+    frames = load_video_frames(video_path, 1, target_h, target_w)
+    if frames is None:
+        raise ValueError(f"Could not decode first frame from {video_path}")
+    # load_video_frames returns (C,F,H,W); WanVAE expects (B,C,F,H,W).
+    return frames.unsqueeze(0).to(device=device, dtype=dtype)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -224,7 +323,7 @@ def main() -> None:
     parser.add_argument(
         "--max_lmdb_frames", type=int, default=None,
         help=(
-            "Maximum decoded video frames to use from each LMDB sample. "
+            "Maximum decoded video frames to use from each LMDB/MIND sample. "
             "Only applies with --lmdb_path and must be 4*k+1 (e.g. 77 or 149), "
             "so it exactly aligns with Wan's 4x temporal VAE stride."
         ),
@@ -232,10 +331,10 @@ def main() -> None:
     parser.add_argument(
         "--lmdb_path", default=None,
         help=(
-            "Optional camera latent LMDB directory. When set, the first "
+            "Optional camera LMDB or raw MIND root. When set, the first "
             "--max_clips samples (or all samples when --max_clips <= 0) are "
             "used directly; inference.prompt_path, trajectory_path and "
-            "image_path are ignored."
+            "image_path are ignored for camera inputs."
         ),
     )
     args = parser.parse_args()
@@ -311,22 +410,36 @@ def main() -> None:
     target_w = W_lat * 16
     fps = int(inf_cfg.get("fps", 24))
 
-    # ---------- prompts and trajectories / optional LMDB ----------------
-    # A camera training LMDB already contains the caption, camera poses and
-    # source latent. In this mode these records replace all three legacy
-    # line-aligned text files. --max_clips means "first N" here because
-    # the LMDB dataset is indexed deterministically, without shuffling.
+    # ---------- prompts and trajectories / camera dataset input ---------
+    # --lmdb_path accepts either an encoded camera LMDB or the raw MIND root.
+    # The latter discovers only 1st_data/3rd_data test/action_space_test and
+    # encodes the source frame on demand; camera controls still follow the
+    # exact action -> local c2w -> latent-stride path used by the LMDB builder.
     lmdb_path = args.lmdb_path or inf_cfg.get("lmdb_path", None)
-    use_lmdb = bool(lmdb_path)
+    use_camera_input = bool(lmdb_path)
+    use_lmdb = bool(lmdb_path) and _is_camera_lmdb_path(str(lmdb_path))
+    use_mind_test = bool(lmdb_path) and not use_lmdb
     lmdb_dataset = None
     lmdb_clean_latents = []
     lmdb_viewmats = []
     lmdb_Ks = []
+    mind_raw_c2w = []
+    mind_video_paths = []
+    mind_output_relpaths = []
+
+    requested_F_lat = None
+    if args.max_lmdb_frames is not None:
+        if args.max_lmdb_frames < 1 or (args.max_lmdb_frames - 1) % 4 != 0:
+            raise ValueError(
+                "--max_lmdb_frames must be a positive 4*k+1 value "
+                f"(e.g. 77 or 149), got {args.max_lmdb_frames}"
+            )
+        requested_F_lat = (args.max_lmdb_frames - 1) // 4 + 1
 
     if use_lmdb:
         lmdb_limit = int(args.max_clips) if args.max_clips > 0 else int(1e8)
         # Do not crop or validate against YAML dimensions: the stored latent
-        # is the source of truth for LMDB inference.
+        # is the source of truth for encoded LMDB inference.
         lmdb_dataset = CameraLatentLMDBDataset(
             str(lmdb_path),
             max_pair=lmdb_limit,
@@ -346,13 +459,7 @@ def main() -> None:
             )
         configured_shape = (F_lat, C_lat, H_lat, W_lat)
         full_F_lat, C_lat, H_lat, W_lat = full_lmdb_latent_shape
-        if args.max_lmdb_frames is not None:
-            if args.max_lmdb_frames < 1 or (args.max_lmdb_frames - 1) % 4 != 0:
-                raise ValueError(
-                    "--max_lmdb_frames must be a positive 4*k+1 value "
-                    f"(e.g. 77 or 149), got {args.max_lmdb_frames}"
-                )
-            requested_F_lat = (args.max_lmdb_frames - 1) // 4 + 1
+        if requested_F_lat is not None:
             F_lat = min(full_F_lat, requested_F_lat)
             print(
                 f"[infer] limiting each LMDB sample to first {F_lat} latent "
@@ -385,23 +492,88 @@ def main() -> None:
                     f"requested {F_lat} latent frames"
                 )
             prompts.append(str(sample["prompts"]))
-            # Keep a human-readable placeholder for metadata files. The
-            # actual camera tensors come directly from the LMDB below.
             trajectories.append(f"lmdb:{sample_idx}")
             lmdb_clean_latents.append(sample["clean_latent"][:F_lat])
             lmdb_viewmats.append(sample["viewmats"][:F_lat])
             lmdb_Ks.append(sample["Ks"][:F_lat])
-        image_paths = []
         print(
             f"[infer] LMDB mode enabled: {lmdb_path} "
             f"(using first {num_lmdb_samples} samples, latent shape "
             f"{lmdb_latent_shape}; prompt/trajectory/image files are ignored)"
         )
+    elif use_mind_test:
+        if not Path(lmdb_path).is_dir():
+            raise ValueError(f"--lmdb_path does not exist or is not a directory: {lmdb_path}")
+        discovered = _discover_mind_action_space_samples(str(lmdb_path))
+        if not discovered:
+            raise ValueError(
+                f"{lmdb_path} is neither a camera LMDB nor a MIND root with "
+                "1st_data/3rd_data/test/action_space_test clips"
+            )
+        limit = int(args.max_clips) if args.max_clips > 0 else len(discovered)
+        discovered = discovered[:limit]
+        if requested_F_lat is not None:
+            F_lat = min(F_lat, requested_F_lat)
+        raw_frames_needed = 4 * (F_lat - 1) + 1
+        intrinsics_default = default_intrinsics_from_fov(
+            float(inf_cfg.get("mind_camera_fov", 90.0)),
+            int(inf_cfg.get("mind_orig_w", 1920)),
+            int(inf_cfg.get("mind_orig_h", 1080)),
+        )
+        default_caption = str(inf_cfg.get(
+            "mind_default_caption",
+            "A high-quality gameplay video with detailed 3D environments, "
+            "smooth character animation, and dynamic camera movement.",
+        ))
+        prompts = []
+        trajectories = []
+        for item in discovered:
+            if len(item["frames"]) < raw_frames_needed:
+                print(
+                    f"[infer] skip short MIND test sample {item['sample_id']}: "
+                    f"{len(item['frames'])} < {raw_frames_needed} frames"
+                )
+                continue
+            raw_c2w = poses_from_mind_actions(
+                item["frames"][:raw_frames_needed],
+                forward_speed=float(inf_cfg.get("mind_forward_speed", 0.08)),
+                yaw_speed_deg=float(inf_cfg.get("mind_yaw_speed_deg", 3.0)),
+                pitch_speed_deg=float(inf_cfg.get("mind_pitch_speed_deg", 3.0)),
+            )
+            intrinsics, poses = poses_from_c2w_array(
+                raw_c2w,
+                F_lat,
+                intrinsics_default,
+                vae_time_stride=4,
+                cam_sample_strategy=str(
+                    inf_cfg.get("mind_cam_sample_strategy", "last")
+                ),
+            )
+            viewmats_np, Ks_np = build_viewmats_and_Ks(intrinsics, poses)
+            prompts.append(str(item["caption"] or default_caption))
+            trajectories.append(f"mind:{item['sample_id']}")
+            lmdb_viewmats.append(torch.from_numpy(viewmats_np))
+            lmdb_Ks.append(torch.from_numpy(Ks_np))
+            mind_raw_c2w.append(raw_c2w)
+            mind_video_paths.append(item["video_path"])
+            mind_output_relpaths.append(
+                Path(item["video_path"]).resolve().relative_to(
+                    Path(lmdb_path).expanduser().resolve()
+                )
+            )
+        if not prompts:
+            raise ValueError(
+                f"No MIND action-space samples in {lmdb_path} have the "
+                f"required {raw_frames_needed} frames"
+            )
+        print(
+            f"[infer] raw MIND test mode enabled: {lmdb_path} "
+            f"({len(prompts)} clips from 1st_data/3rd_data action_space_test, "
+            f"{F_lat} latent / {raw_frames_needed} decoded frames, "
+            f"source frame encoded on demand)"
+        )
     else:
-        # Single line-aligned input format for all trajectory dialects:
-        #   inference.prompt_path     -> one prompt per line
-        #   inference.trajectory_path -> one trajectory string per line
-        #   inference.image_path      -> one image path per line (I2V only)
+        # Single line-aligned input format for all trajectory dialects.
         with open(inf_cfg["prompt_path"]) as f:
             prompts = [ln.strip() for ln in f if ln.strip()]
         with open(inf_cfg["trajectory_path"]) as f:
@@ -411,12 +583,9 @@ def main() -> None:
         )
 
     # ---------- I2V switch -----------------------------------------------
-    # ``algorithm.i2v: true`` (or top-level ``i2v: true`` after
-    # normalize_config flattens it) turns this into image-to-video inference:
-    # the source image is VAE-encoded into the first latent frame, that
-    # frame is pinned across all denoising steps, and only frames >=1 are
-    # sampled.  When False (default), behaves exactly like the original T2V
-    # bidirectional + camera (PRoPE) inference.
+    # algorithm.i2v (or top-level i2v after normalize_config) turns this
+    # into image-to-video inference. The source frame is pinned throughout
+    # denoising; when false, this remains T2V inference.
     is_i2v = bool(
         config.get("i2v", False)
         or (config.get("algorithm", {}) or {}).get("i2v", False)
@@ -426,6 +595,8 @@ def main() -> None:
         img_path_cfg = inf_cfg.get("image_path", None)
         if use_lmdb:
             print("[infer] I2V mode enabled; source latents are loaded from LMDB")
+        elif use_mind_test:
+            print("[infer] I2V mode enabled; source frames are decoded from MIND videos")
         else:
             assert img_path_cfg, (
                 "I2V inference requires inference.image_path to point to a "
@@ -438,9 +609,11 @@ def main() -> None:
                 f"image_paths ({len(image_paths)}) must align with prompts "
                 f"({len(prompts)}) for I2V inference."
             )
-            print(f"[infer] I2V mode enabled, {len(image_paths)} source images "
-                  f"loaded from {img_path_cfg}")
-    if args.max_clips > 0:
+            print(
+                f"[infer] I2V mode enabled, {len(image_paths)} source images "
+                f"loaded from {img_path_cfg}"
+            )
+    if args.max_clips > 0 and not use_camera_input:
         prompts = prompts[: args.max_clips]
         trajectories = trajectories[: args.max_clips]
         if is_i2v:
@@ -476,9 +649,9 @@ def main() -> None:
     # convention (W/S = forward/back, A/D = strafe, joystick = yaw/pitch),
     # regardless of which DSL produced the trajectory.
     action_overlay = bool(inf_cfg.get("action_overlay", False))
-    if use_lmdb and not action_overlay:
+    if use_camera_input and not action_overlay:
         action_overlay = True
-        print("[infer] LMDB mode forces action_overlay=true")
+        print("[infer] camera-input mode forces action_overlay=true")
     overlay_corner = str(inf_cfg.get("overlay_corner", "bottom-left")).lower()
     if action_overlay and overlay_corner not in {
         "bottom-left", "bottom-right", "top-left", "top-right",
@@ -585,7 +758,14 @@ def main() -> None:
 
     # ---------- generate ----------
     for clip_idx, (prompt, traj) in enumerate(zip(prompts, trajectories)):
-        out_path = out_dir / f"clip_{clip_idx:03d}.mp4"
+        if use_mind_test:
+            # All raw MIND inputs are named video.mp4. Mirror their relative
+            # directory tree so the basename stays identical without clips
+            # overwriting one another.
+            out_path = out_dir / mind_output_relpaths[clip_idx]
+        else:
+            out_path = out_dir / f"clip_{clip_idx:03d}.mp4"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         if out_path.exists() and out_path.stat().st_size > 0:
             print(f"[clip {clip_idx}] skip (already exists -> {out_path})")
             continue
@@ -599,9 +779,9 @@ def main() -> None:
         # first source image (only opened here once, then re-loaded by
         # ``_load_image_as_pixel`` below — Pi3X frees its weights after
         # estimation so the peak VRAM impact is small).
-        if use_lmdb:
-            # LMDB stores the camera tensors already; explicit YAML/Pi3X
-            # intrinsics must not override the training camera stream.
+        if use_camera_input:
+            # Both encoded LMDB and raw MIND test metadata already carry the
+            # training-aligned camera intrinsics; YAML/Pi3X must not override.
             intrinsics_norm_clip = None
         elif intrinsics_norm is None and estimate_intrinsics:
             from utils.intrinsics_estimation import (
@@ -654,6 +834,17 @@ def main() -> None:
                 raw_c2w_full = np.linalg.inv(
                     viewmats[0].detach().cpu().numpy()
                 ).astype(np.float32)
+        elif use_mind_test:
+            # Raw MIND action-space cameras are prepared above with the same
+            # pose7 -> normalized viewmats/Ks conversion as encoded LMDB data.
+            viewmats = torch.as_tensor(
+                lmdb_viewmats[clip_idx], dtype=torch.float32, device=device
+            )[None]
+            Ks = torch.as_tensor(
+                lmdb_Ks[clip_idx], dtype=torch.float32, device=device
+            )[None]
+            if action_overlay:
+                raw_c2w_full = mind_raw_c2w[clip_idx]
         elif trajectory_format == "dreamx_action_dsl":
             # DreamX-World path: parse the trajectory line ("w-4,a-4,w-4,d-4")
             # into (action_seq, action_speed_list) and convert directly to
@@ -768,6 +959,13 @@ def main() -> None:
                     lmdb_clean_latents[clip_idx], device=device,
                     dtype=torch.bfloat16,
                 )[None, :1]
+            elif use_mind_test:
+                img_pixel = _load_video_first_frame_as_pixel(
+                    mind_video_paths[clip_idx],
+                    target_h=target_h, target_w=target_w,
+                    device=device, dtype=torch.bfloat16,
+                )
+                image_latent = vae.encode_to_latent(img_pixel)
             else:
                 img_pixel = _load_image_as_pixel(
                     image_paths[clip_idx],
@@ -892,7 +1090,6 @@ def main() -> None:
             video = (torch.from_numpy(video_thwc).to(video.device)
                      .permute(0, 3, 1, 2).float() / 255.0)
 
-        out_path = out_dir / f"clip_{clip_idx:03d}.mp4"
         save_video(video, str(out_path), fps=fps)
         print(f"[clip {clip_idx}] saved -> {out_path}")
 
@@ -903,6 +1100,8 @@ def main() -> None:
             if is_i2v:
                 if use_lmdb:
                     f.write(f"image:      lmdb:{lmdb_path} (sample {clip_idx})\n")
+                elif use_mind_test:
+                    f.write(f"image:      {mind_video_paths[clip_idx]} (frame 0)\n")
                 else:
                     f.write(f"image:      {image_paths[clip_idx]}\n")
 

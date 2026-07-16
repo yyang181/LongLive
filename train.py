@@ -23,9 +23,10 @@ def _is_rank0():
 def _validate_no_placeholder_paths(config, config_path):
     for key in ("data_path", "eval_data_path"):
         value = config.get(key, None)
-        if isinstance(value, str) and "/path/to/longlive2" in value:
+        values = [value] if isinstance(value, str) else (list(value) if value is not None else [])
+        if any(isinstance(item, str) and "/path/to/longlive2" in item for item in values):
             raise ValueError(
-                f"{config_path} still contains placeholder {key}={value!r}. "
+                f"{config_path} still contains a placeholder {key}={value!r}. "
                 "Point it at a real dataset path, or use "
                 "configs/train_bidir_camera.yaml / configs/train_bidir_sft.yaml "
                 "for LMDB-based bidirectional SFT."
@@ -43,12 +44,14 @@ def _resolve_relative_paths(config, config_path):
     repo_root = os.path.dirname(os.path.abspath(__file__))
     for key in ("data_path", "eval_data_path"):
         value = config.get(key, None)
-        if not isinstance(value, str) or not value:
+        if value is None:
             continue
-        if os.path.isabs(value):
-            continue
-        resolved = os.path.normpath(os.path.join(repo_root, value))
-        config[key] = resolved
+        values = [value] if isinstance(value, str) else list(value)
+        resolved_values = [
+            item if os.path.isabs(item) else os.path.normpath(os.path.join(repo_root, item))
+            for item in values
+        ]
+        config[key] = resolved_values[0] if isinstance(value, str) else resolved_values
 
 
 def main():

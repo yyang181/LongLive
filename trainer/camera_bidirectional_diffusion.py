@@ -29,7 +29,7 @@ import wandb
 
 from model.camera_bidirectional_diffusion import CameraBidirectionalDiffusion
 from utils.camera_dataset import CameraLatentLMDBDataset
-from utils.dataset import RepeatDataset, cycle
+from utils.dataset import RepeatDataset, cycle, normalize_dataset_paths_and_repeats
 from utils.config import wan_default_config
 from utils.distributed import (
     EMA_FSDP, barrier, fsdp_state_dict, fsdp_wrap, launch_distributed_job,
@@ -235,33 +235,45 @@ class Trainer:
         configured_shape = list(config.image_or_video_shape)
         target_num_frames = int(configured_shape[1])
         expected_latent_shape = tuple(int(v) for v in configured_shape[2:])
-        base_dataset = CameraLatentLMDBDataset(
-            config.data_path,
-            max_pair=int(1e8),
-            target_num_frames=target_num_frames,
-            expected_latent_shape=expected_latent_shape,
+        data_paths, _ = normalize_dataset_paths_and_repeats(config.data_path, 1)
+        component_datasets = [
+            CameraLatentLMDBDataset(
+                data_path,
+                max_pair=int(1e8),
+                target_num_frames=target_num_frames,
+                expected_latent_shape=expected_latent_shape,
+            )
+            for data_path in data_paths
+        ]
+        base_dataset = (
+            component_datasets[0] if len(component_datasets) == 1
+            else torch.utils.data.ConcatDataset(component_datasets)
         )
         dataset_repeat = getattr(config, "dataset_repeat", None)
-        # ``repeat``/``repeat_dataset`` are compatibility aliases.  They must
-        # override the config default (dataset_repeat=1) when supplied via CLI.
+        # ``repeat``/``repeat_dataset`` are compatibility aliases. They retain
+        # their old precedence, including for per-source repeat lists.
         alias_repeat = getattr(config, "repeat_dataset", None)
         if alias_repeat is None:
             alias_repeat = getattr(config, "repeat", None)
         if alias_repeat is not None:
-            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+            _, configured_repeats = normalize_dataset_paths_and_repeats(
+                data_paths, dataset_repeat
+            )
+            _, alias_repeats = normalize_dataset_paths_and_repeats(data_paths, alias_repeat)
+            if any(repeat != 1 for repeat in configured_repeats) and configured_repeats != alias_repeats:
                 raise ValueError(
                     "Conflicting dataset repeat values: "
                     f"dataset_repeat={dataset_repeat}, alias={alias_repeat}."
                 )
             dataset_repeat = alias_repeat
-        if dataset_repeat is None:
-            dataset_repeat = 1
-        dataset_repeat = int(dataset_repeat)
-        if dataset_repeat < 1:
-            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
+        _, dataset_repeats = normalize_dataset_paths_and_repeats(data_paths, dataset_repeat)
+        train_components = [
+            RepeatDataset(component, repeat) if repeat > 1 else component
+            for component, repeat in zip(component_datasets, dataset_repeats)
+        ]
         dataset = (
-            RepeatDataset(base_dataset, dataset_repeat)
-            if dataset_repeat > 1 else base_dataset
+            train_components[0] if len(train_components) == 1
+            else torch.utils.data.ConcatDataset(train_components)
         )
         sampler = DistributedSampler(dataset, num_replicas=self.data_parallel_size,
                                      rank=self.dp_rank, shuffle=True, drop_last=True)
@@ -275,13 +287,13 @@ class Trainer:
             drop_last=True,
         )
         if self.is_main_process:
-            if dataset_repeat > 1:
+            if any(repeat > 1 for repeat in dataset_repeats):
                 print(f"[CameraBiDiff] dataset size = {len(dataset)} "
-                      f"(base_size={len(base_dataset)}, repeat={dataset_repeat}, "
-                      f"target_frames={target_num_frames})")
+                      f"(base_size={len(base_dataset)}, paths={data_paths}, "
+                      f"repeats={dataset_repeats}, target_frames={target_num_frames})")
             else:
                 print(f"[CameraBiDiff] dataset size = {len(dataset)} "
-                      f"(target_frames={target_num_frames})")
+                      f"(paths={data_paths}, target_frames={target_num_frames})")
         self.dataloader = cycle(loader)
 
         # ---- Optional resume / initialization ----
