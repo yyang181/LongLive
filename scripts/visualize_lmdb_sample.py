@@ -107,6 +107,70 @@ def get_lmdb_count(lmdb_path: str) -> int:
     return shape[0]
 
 
+def write_selected_paths(output_dir: str, selected_paths: list[tuple[int, str]]) -> str:
+    """Write selected LMDB sample indices and source video paths to a manifest."""
+    os.makedirs(output_dir, exist_ok=True)
+    manifest_path = os.path.join(output_dir, "selected_video_paths.txt")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.write("sample_idx\tvideo_name\tvideo_path\n")
+        for idx, video_path in selected_paths:
+            f.write(f"{idx}\t{os.path.basename(video_path)}\t{video_path}\n")
+    print(f"Video-path manifest: {manifest_path}")
+    return manifest_path
+
+
+def read_video_paths_manifest(manifest_path: str) -> list[tuple[str, str]]:
+    """Read ``sample_idx, video_name, video_path`` rows written by this script."""
+    requested = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            fields = line.rstrip("\n").split("\t")
+            if line_no == 1 and fields[:2] == ["sample_idx", "video_name"]:
+                continue
+            if len(fields) < 2 or not fields[0] or not fields[1]:
+                print(f"[WARN] ignoring malformed manifest row {line_no}: {line!r}")
+                continue
+            requested.append((fields[0], os.path.basename(fields[1])))
+    if not requested:
+        raise ValueError(f"No valid video rows found in manifest: {manifest_path}")
+    return requested
+
+
+def find_lmdb_samples_by_video_name(lmdb_path: str, count: int,
+                                     requested: list[tuple[str, str]]) -> list[tuple[int, str]]:
+    """Match manifest names against any portion of each stored LMDB path.
+
+    Some LMDBs retain ``<clip_id>/gen.mp4`` while a manifest may contain the
+    flattened ``<clip_id>.mp4``.  Therefore both the supplied filename and
+    its extension-free stem are matched against the complete stored path.
+    """
+    env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                    readahead=False, meminit=False)
+    lmdb_paths = []
+    with env.begin() as txn:
+        for idx in range(count):
+            raw = txn.get(f"paths_{idx}_data".encode())
+            if raw is not None:
+                lmdb_paths.append((idx, raw.decode("utf-8")))
+    env.close()
+
+    selected, missing = [], []
+    for output_id, name in requested:
+        stem = os.path.splitext(name)[0]
+        matches = [(idx, path) for idx, path in lmdb_paths
+                   if name in path or (stem and stem in path)]
+        if not matches:
+            missing.append(name)
+            continue
+        if len(matches) > 1:
+            print(f"[WARN] {name} matches {len(matches)} LMDB paths; using index {matches[0][0]}")
+        selected.append((matches[0][0], output_id))
+    if missing:
+        print(f"[WARN] {len(missing)} manifest video(s) are absent from this LMDB; "
+              f"skipping them (first: {missing[:5]}).")
+    return selected
+
+
 # ---------------------------------------------------------------------------
 # ViPE results directory reading
 # ---------------------------------------------------------------------------
@@ -387,6 +451,10 @@ def parse_args():
                         "When > 1 and --sample_idx is set, visualizes "
                         "[sample_idx, sample_idx+1, ...]. When > 1 and "
                         "--sample_idx is unset, picks that many random indices.")
+    p.add_argument("--video_paths_txt", type=str, default=None,
+                   help="Path to selected_video_paths.txt. In LMDB mode, selects "
+                        "only videos with matching video_name; output files are "
+                        "named <manifest sample_idx>.mp4. Overrides sample selection.")
     p.add_argument("--fps", type=int, default=24,
                    help="FPS for output video (default: 24)")
     p.add_argument("--max_frames", type=int, default=0,
@@ -412,7 +480,8 @@ def parse_args():
 
 
 def visualize_one_sample(
-    lmdb_path: str, output_dir: str, idx: int, args, device, dtype
+    lmdb_path: str, output_dir: str, idx: int, args, device, dtype,
+    output_id: str | None = None,
 ) -> str:
     """Visualize a single LMDB sample and return the output video path."""
     print(f"\n{'='*60}")
@@ -465,7 +534,8 @@ def visualize_one_sample(
 
     # ---- Save ----
     os.makedirs(output_dir, exist_ok=True)
-    out_name = f"lmdb_sample_{idx}.mp4"
+    out_name = (f"lmdb_sample_{os.path.basename(str(output_id))}.mp4"
+                if output_id is not None else f"lmdb_sample_{idx}.mp4")
     out_path = os.path.join(output_dir, out_name)
     print(f"Writing video to {out_path} ...")
     video_tensor = torch.from_numpy(np.ascontiguousarray(video_hwc))
@@ -577,25 +647,42 @@ def main():
 
     # ---- Select sample indices ----
     count = get_lmdb_count(input_path)
-    n = min(args.num_samples, count)
-    if args.sample_idx is not None:
-        indices = [args.sample_idx + i for i in range(n)
-                   if args.sample_idx + i < count]
+    if args.video_paths_txt:
+        manifest_path = os.path.abspath(args.video_paths_txt)
+        requested = read_video_paths_manifest(manifest_path)
+        selected_samples = find_lmdb_samples_by_video_name(input_path, count, requested)
+        if not selected_samples:
+            raise ValueError("None of the videos in --video_paths_txt were found in this LMDB")
+        print(f"Total samples: {count}")
+        print(f"Manifest: {manifest_path}")
+        print(f"Visualizing {len(selected_samples)} matching sample(s).")
     else:
-        indices = random.sample(range(count), n)
-    print(f"Total samples: {count}")
-    print(f"Visualizing {len(indices)} sample(s): {indices}")
+        n = min(args.num_samples, count)
+        if args.sample_idx is not None:
+            indices = [args.sample_idx + i for i in range(n)
+                       if args.sample_idx + i < count]
+        else:
+            indices = random.sample(range(count), n)
+        selected_samples = [(idx, None) for idx in indices]
+        print(f"Total samples: {count}")
+        print(f"Visualizing {len(selected_samples)} sample(s): {indices}")
 
     # ---- Shared VAE device/dtype ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     output_paths = []
-    for idx in indices:
+    selected_paths = []
+    for idx, output_id in selected_samples:
         out_path = visualize_one_sample(
-            input_path, output_dir, idx, args, device, dtype)
+            input_path, output_dir, idx, args, device, dtype, output_id=output_id)
         output_paths.append(out_path)
+        # Record only successfully visualized samples.
+        manifest_id = output_id if output_id is not None else str(idx)
+        selected_paths.append((manifest_id, read_lmdb_sample(input_path, idx)["path"]))
         torch.cuda.empty_cache()
+
+    write_selected_paths(output_dir, selected_paths)
 
     print(f"\n{'='*60}")
     print(f"Done! {len(output_paths)} video(s) written to {output_dir}:")

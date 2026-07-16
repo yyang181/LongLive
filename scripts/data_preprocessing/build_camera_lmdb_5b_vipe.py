@@ -184,49 +184,46 @@ def poses_from_vipe_c2w(c2w_seq, n_latent, intrinsics_row,
 # Caption loading (CSV or JSON)
 # --------------------------------------------------------------------------
 def load_caption_csvs(csv_paths, use_parent_as_clip_id=False):
-    """Merge caption data from one or more CSV or JSON files.
-
-    **CSV files** must have ``videoFile`` and ``caption`` columns.
-    clip_id = stem of videoFile (e.g. ``clip_001.mp4`` -> ``clip_001``).
-
-    **JSON files** can be a list of ``{video_path, caption}`` objects.
-    """
+    """Load captions from CSV/JSON files with flexible dataset schemas."""
+    def text(value):
+        if value is None: return ""
+        if isinstance(value, (list, tuple)): value = " ".join(str(x) for x in value if x is not None)
+        return str(value).strip()
+    def clip_id(value):
+        value = text(value).replace("\\", "/")
+        if not value: return ""
+        base = os.path.basename(value.rstrip("/"))
+        # minWM captions point to <clip_id>/gen.mp4 even when the processed
+        # videos are flattened to <clip_id>.mp4; recognize that convention
+        # independently of the video directory layout.
+        if (use_parent_as_clip_id or os.path.splitext(base)[0].lower() == "gen") and os.path.splitext(base)[1]:
+            return os.path.basename(os.path.dirname(value.rstrip("/")))
+        return os.path.splitext(base)[0]
     out = {}
+    def consume(entry, key_hint=""):
+        if not isinstance(entry, dict): return
+        path = (entry.get("video_path") or entry.get("videoFile") or entry.get("video") or entry.get("path") or entry.get("file") or entry.get("filename") or key_hint)
+        cap = entry.get("caption") if "caption" in entry else entry.get("text", entry.get("prompt", entry.get("description", "")))
+        cid, cap = clip_id(path), text(cap)
+        if cid and cap: out[cid] = cap
     for path in csv_paths:
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".json":
-            with open(path, "r") as f:
-                data = json.load(f)
+        if os.path.splitext(path)[1].lower() == ".json":
+            with open(path, "r") as f: data = json.load(f)
             if isinstance(data, list):
-                for entry in data:
-                    vp = entry.get("video_path", "")
-                    if use_parent_as_clip_id:
-                        clip_id = os.path.basename(os.path.dirname(vp))
-                    else:
-                        clip_id = os.path.splitext(os.path.basename(vp))[0]
-                    cap = entry.get("caption", "").strip()
-                    if clip_id and cap:
-                        out[clip_id] = cap
+                for entry in data: consume(entry)
             elif isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, dict):
-                        cap = v.get("caption", "").strip()
-                    else:
-                        cap = str(v).strip()
-                    if k and cap:
-                        out[k] = cap
+                wrapped = next((data[k] for k in ("data", "items", "annotations", "clips") if isinstance(data.get(k), list)), None)
+                if wrapped is not None:
+                    for entry in wrapped: consume(entry)
+                else:
+                    for key, value in data.items():
+                        if isinstance(value, dict): consume(value, key)
+                        else:
+                            cid, cap = clip_id(key), text(value)
+                            if cid and cap: out[cid] = cap
         else:
             with open(path, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    vf = row.get("videoFile", "").strip()
-                    if not vf:
-                        continue
-                    clip_id = os.path.splitext(vf)[0]
-                    cap = row.get("caption", "").strip()
-                    if not cap:
-                        continue
-                    out[clip_id] = cap
+                for row in csv.DictReader(f): consume(row, row.get("videoFile", ""))
     return out
 
 

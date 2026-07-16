@@ -48,15 +48,12 @@ for f in "${CAPTION_CSV_LIST[@]}"; do
     fi
 done
 
-# Auto-detect minWM-data JSON format: use parent dir as clip_id.
+# Use parent directory IDs only for nested layouts such as <clip_id>/gen.mp4.
 if [[ -z "${USE_PARENT_AS_CLIP_ID:-}" ]]; then
     USE_PARENT_AS_CLIP_ID=0
-    for f in "${CAPTION_CSV_LIST[@]}"; do
-        if [[ "${f}" == *.json ]]; then
-            USE_PARENT_AS_CLIP_ID=1
-            break
-        fi
-    done
+    if find "${VIDEO_DIR}" -mindepth 2 -maxdepth 2 -type f -name '*.mp4' -print -quit | grep -q .; then
+        USE_PARENT_AS_CLIP_ID=1
+    fi
 fi
 if [[ "${USE_PARENT_AS_CLIP_ID}" == "1" ]]; then
     EXTRA_ARGS+=(--use_parent_as_clip_id)
