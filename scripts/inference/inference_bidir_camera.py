@@ -16,6 +16,10 @@ Run:
         --config_path  configs/infer_bidir_camera.yaml \
         --generator_ckpt logs/train_bidir_camera/checkpoint_model_005000/model.pt \
         --output_dir videos/camera_bidir
+
+For camera-training LMDB evaluation, pass --lmdb_path and optionally
+--max_clips N. The first N records supply the prompt, camera tensors and
+I2V context latent; the configured text/image files are ignored.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from scipy.spatial.transform import Rotation, Slerp
 
 # Ensure repository root is importable when run directly.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -43,7 +48,10 @@ from scripts.data_preprocessing.build_camera_lmdb_5b import (  # noqa: E402
 )
 import utils.tv_io_patch  # noqa: E402, F401 — patch torchvision.io before anything imports it
 from utils.action_overlay import apply_overlay  # noqa: E402
-from utils.camera_dataset import build_viewmats_and_Ks  # noqa: E402
+from utils.camera_dataset import (  # noqa: E402
+    CameraLatentLMDBDataset,
+    build_viewmats_and_Ks,
+)
 from utils.config import normalize_config  # noqa: E402
 from utils.inference_utils import save_video  # noqa: E402
 from utils.sana_camera_control import (  # noqa: E402
@@ -162,6 +170,44 @@ def _load_image_as_pixel(
     return pixel.to(device=device, dtype=dtype)
 
 
+def _resample_c2w_for_overlay(
+    c2w: np.ndarray,
+    target_frames: int,
+) -> np.ndarray:
+    """Resample a c2w trajectory to exactly one pose per output-video frame.
+
+    LMDB cameras live on the VAE latent-frame grid, while decoded Wan videos
+    live on the raw-frame grid. Translation is linearly interpolated and
+    rotation uses quaternion SLERP, preventing the action overlay from only
+    reacting once every four frames or freezing after the latent sequence.
+    """
+    poses = np.asarray(c2w, dtype=np.float32)
+    target_frames = int(target_frames)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError(f"Expected c2w shape (T,4,4), got {poses.shape}")
+    if target_frames <= 0:
+        raise ValueError(f"target_frames must be positive, got {target_frames}")
+    if len(poses) == target_frames:
+        return poses
+    if len(poses) == 1:
+        return np.repeat(poses, target_frames, axis=0)
+
+    source_t = np.arange(len(poses), dtype=np.float64)
+    target_t = np.linspace(0.0, float(len(poses) - 1), target_frames)
+    translations = np.stack([
+        np.interp(target_t, source_t, poses[:, axis, 3])
+        for axis in range(3)
+    ], axis=1)
+    rotations = Slerp(
+        source_t, Rotation.from_matrix(poses[:, :3, :3])
+    )(target_t).as_matrix()
+
+    result = np.tile(np.eye(4, dtype=np.float32), (target_frames, 1, 1))
+    result[:, :3, :3] = rotations.astype(np.float32)
+    result[:, :3, 3] = translations.astype(np.float32)
+    return result
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -175,6 +221,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_clips", type=int, default=-1,
                         help="Cap number of (prompt, trajectory) pairs to render.")
+    parser.add_argument(
+        "--lmdb_path", default=None,
+        help=(
+            "Optional camera latent LMDB directory. When set, the first "
+            "--max_clips samples (or all samples when --max_clips <= 0) are "
+            "used directly; inference.prompt_path, trajectory_path and "
+            "image_path are ignored."
+        ),
+    )
     args = parser.parse_args()
 
     config = normalize_config(OmegaConf.load(args.config_path))
@@ -239,21 +294,91 @@ def main() -> None:
                 n_disabled += 1
         print(f"[infer] NO_PROPE=1: disabled PRoPE branch on {n_disabled} blocks")
 
-    # ---------- prompts and trajectories ----------
-    # Single line-aligned input format for *all* trajectory dialects:
-    #   inference.prompt_path     -> one prompt per line
-    #   inference.trajectory_path -> one trajectory string per line; the
-    #       grammar is selected by ``inference.trajectory_format``:
-    #         * worldplaygen      : ``"dw-40,aw-40"``       (build_camera_lmdb_5b)
-    #         * sana_dsl          : ``"w-10,iw-5,none-3"``   (sana_camera_control)
-    #         * dreamx_action_dsl : ``"w-4,a-4,w-4,d-4"``   (utils.dreamx_trajectory)
-    #   inference.image_path      -> one image path per line   (I2V only)
-    with open(inf_cfg["prompt_path"]) as f:
-        prompts = [ln.strip() for ln in f if ln.strip()]
-    with open(inf_cfg["trajectory_path"]) as f:
-        trajectories = [ln.strip() for ln in f if ln.strip()]
-    assert len(prompts) == len(trajectories), \
-        f"prompts ({len(prompts)}) and trajectories ({len(trajectories)}) must align"
+    # ---------- shapes (also needed to validate LMDB records) ------------
+    F_lat = int(inf_cfg["num_latent_frames"])
+    H_lat = int(inf_cfg["height_latent"])
+    W_lat = int(inf_cfg["width_latent"])
+    C_lat = int(inf_cfg.get("num_channels", 48))
+    target_h = H_lat * 16
+    target_w = W_lat * 16
+    fps = int(inf_cfg.get("fps", 24))
+
+    # ---------- prompts and trajectories / optional LMDB ----------------
+    # A camera training LMDB already contains the caption, camera poses and
+    # source latent. In this mode these records replace all three legacy
+    # line-aligned text files. --max_clips means "first N" here because
+    # the LMDB dataset is indexed deterministically, without shuffling.
+    lmdb_path = args.lmdb_path or inf_cfg.get("lmdb_path", None)
+    use_lmdb = bool(lmdb_path)
+    lmdb_dataset = None
+    lmdb_clean_latents = []
+    lmdb_viewmats = []
+    lmdb_Ks = []
+
+    if use_lmdb:
+        lmdb_limit = int(args.max_clips) if args.max_clips > 0 else int(1e8)
+        # Do not crop or validate against YAML dimensions: the stored latent
+        # is the source of truth for LMDB inference.
+        lmdb_dataset = CameraLatentLMDBDataset(
+            str(lmdb_path),
+            max_pair=lmdb_limit,
+        )
+        num_lmdb_samples = min(len(lmdb_dataset), lmdb_limit)
+        if num_lmdb_samples <= 0:
+            raise ValueError(f"No samples found in camera LMDB: {lmdb_path}")
+
+        first_sample = lmdb_dataset[0]
+        lmdb_latent_shape = tuple(int(v) for v in first_sample["clean_latent"].shape)
+        if len(lmdb_latent_shape) != 4:
+            raise ValueError(
+                f"LMDB clean_latent must have shape (F,C,H,W), got "
+                f"{lmdb_latent_shape} from {lmdb_path}"
+            )
+        configured_shape = (F_lat, C_lat, H_lat, W_lat)
+        F_lat, C_lat, H_lat, W_lat = lmdb_latent_shape
+        target_h = H_lat * 16
+        target_w = W_lat * 16
+        if lmdb_latent_shape != configured_shape:
+            print(
+                f"[infer] LMDB latent shape {lmdb_latent_shape} overrides "
+                f"YAML latent shape {configured_shape}"
+            )
+
+        prompts = []
+        trajectories = []
+        for sample_idx in range(num_lmdb_samples):
+            sample = first_sample if sample_idx == 0 else lmdb_dataset[sample_idx]
+            sample_shape = tuple(int(v) for v in sample["clean_latent"].shape)
+            if sample_shape != lmdb_latent_shape:
+                raise ValueError(
+                    f"LMDB sample {sample_idx} latent shape {sample_shape} does "
+                    f"not match first sample shape {lmdb_latent_shape}"
+                )
+            prompts.append(str(sample["prompts"]))
+            # Keep a human-readable placeholder for metadata files. The
+            # actual camera tensors come directly from the LMDB below.
+            trajectories.append(f"lmdb:{sample_idx}")
+            lmdb_clean_latents.append(sample["clean_latent"])
+            lmdb_viewmats.append(sample["viewmats"])
+            lmdb_Ks.append(sample["Ks"])
+        image_paths = []
+        print(
+            f"[infer] LMDB mode enabled: {lmdb_path} "
+            f"(using first {num_lmdb_samples} samples, latent shape "
+            f"{lmdb_latent_shape}; prompt/trajectory/image files are ignored)"
+        )
+    else:
+        # Single line-aligned input format for all trajectory dialects:
+        #   inference.prompt_path     -> one prompt per line
+        #   inference.trajectory_path -> one trajectory string per line
+        #   inference.image_path      -> one image path per line (I2V only)
+        with open(inf_cfg["prompt_path"]) as f:
+            prompts = [ln.strip() for ln in f if ln.strip()]
+        with open(inf_cfg["trajectory_path"]) as f:
+            trajectories = [ln.strip() for ln in f if ln.strip()]
+        assert len(prompts) == len(trajectories), (
+            f"prompts ({len(prompts)}) and trajectories ({len(trajectories)}) must align"
+        )
 
     # ---------- I2V switch -----------------------------------------------
     # ``algorithm.i2v: true`` (or top-level ``i2v: true`` after
@@ -269,33 +394,27 @@ def main() -> None:
     image_paths: list[str] = []
     if is_i2v:
         img_path_cfg = inf_cfg.get("image_path", None)
-        assert img_path_cfg, (
-            "I2V inference requires inference.image_path to point to a "
-            "text file containing one source image path per line "
-            "(aligned with prompts/trajectories)."
-        )
-        with open(img_path_cfg) as f:
-            image_paths = [ln.strip() for ln in f if ln.strip()]
-        assert len(image_paths) == len(prompts), (
-            f"image_paths ({len(image_paths)}) must align with prompts "
-            f"({len(prompts)}) for I2V inference."
-        )
-        print(f"[infer] I2V mode enabled, {len(image_paths)} source images "
-              f"loaded from {img_path_cfg}")
+        if use_lmdb:
+            print("[infer] I2V mode enabled; source latents are loaded from LMDB")
+        else:
+            assert img_path_cfg, (
+                "I2V inference requires inference.image_path to point to a "
+                "text file containing one source image path per line "
+                "(aligned with prompts/trajectories)."
+            )
+            with open(img_path_cfg) as f:
+                image_paths = [ln.strip() for ln in f if ln.strip()]
+            assert len(image_paths) == len(prompts), (
+                f"image_paths ({len(image_paths)}) must align with prompts "
+                f"({len(prompts)}) for I2V inference."
+            )
+            print(f"[infer] I2V mode enabled, {len(image_paths)} source images "
+                  f"loaded from {img_path_cfg}")
     if args.max_clips > 0:
         prompts = prompts[: args.max_clips]
         trajectories = trajectories[: args.max_clips]
         if is_i2v:
             image_paths = image_paths[: args.max_clips]
-
-    # ---------- shapes ----------
-    F_lat = int(inf_cfg["num_latent_frames"])
-    H_lat = int(inf_cfg["height_latent"])
-    W_lat = int(inf_cfg["width_latent"])
-    C_lat = int(inf_cfg.get("num_channels", 48))
-    target_h = H_lat * 16
-    target_w = W_lat * 16
-    fps = int(inf_cfg.get("fps", 24))
 
     # ---------- trajectory format ----------
     # ``trajectory_format``:
@@ -327,6 +446,9 @@ def main() -> None:
     # convention (W/S = forward/back, A/D = strafe, joystick = yaw/pitch),
     # regardless of which DSL produced the trajectory.
     action_overlay = bool(inf_cfg.get("action_overlay", False))
+    if use_lmdb and not action_overlay:
+        action_overlay = True
+        print("[infer] LMDB mode forces action_overlay=true")
     overlay_corner = str(inf_cfg.get("overlay_corner", "bottom-left")).lower()
     if action_overlay and overlay_corner not in {
         "bottom-left", "bottom-right", "top-left", "top-right",
@@ -447,7 +569,11 @@ def main() -> None:
         # first source image (only opened here once, then re-loaded by
         # ``_load_image_as_pixel`` below — Pi3X frees its weights after
         # estimation so the peak VRAM impact is small).
-        if intrinsics_norm is None and estimate_intrinsics:
+        if use_lmdb:
+            # LMDB stores the camera tensors already; explicit YAML/Pi3X
+            # intrinsics must not override the training camera stream.
+            intrinsics_norm_clip = None
+        elif intrinsics_norm is None and estimate_intrinsics:
             from utils.intrinsics_estimation import (
                 estimate_intrinsics_with_pi3x,
                 normalize_intrinsics,
@@ -481,7 +607,24 @@ def main() -> None:
         # native frame rate (the latent-stride-4 sub-sampled poses would
         # under-sample fast key presses and produce a flickery overlay).
         raw_c2w_full: np.ndarray | None = None
-        if trajectory_format == "dreamx_action_dsl":
+        if use_lmdb:
+            # CameraLatentLMDBDataset has already normalized the stored w2c
+            # poses against frame 0 and constructed the matching Ks matrix.
+            viewmats = torch.as_tensor(
+                lmdb_viewmats[clip_idx], dtype=torch.float32,
+                device=device,
+            )[None]
+            Ks = torch.as_tensor(
+                lmdb_Ks[clip_idx], dtype=torch.float32,
+                device=device,
+            )[None]
+            if action_overlay:
+                # LMDB cameras are sampled on the latent-frame grid; the
+                # trajectory is interpolated to decoded frames before drawing.
+                raw_c2w_full = np.linalg.inv(
+                    viewmats[0].detach().cpu().numpy()
+                ).astype(np.float32)
+        elif trajectory_format == "dreamx_action_dsl":
             # DreamX-World path: parse the trajectory line ("w-4,a-4,w-4,d-4")
             # into (action_seq, action_speed_list) and convert directly to
             # (viewmats, Ks). The output is already shaped (T_lat, ...) — no
@@ -585,15 +728,25 @@ def main() -> None:
                           f"|v|.mean={v.float().abs().mean().item():.3e} "
                           f"|v|.max={v.float().abs().max().item():.3e}")
 
-        # ---- I2V: encode source image and pin its latent into x[:, :1] ----
+        # ---- I2V: pin the source latent into x[:, :1] ------------------
         image_latent = None
         if is_i2v:
-            img_pixel = _load_image_as_pixel(
-                image_paths[clip_idx],
-                target_h=target_h, target_w=target_w,
-                device=device, dtype=torch.bfloat16,
-            )
-            image_latent = vae.encode_to_latent(img_pixel)  # [1, 1, C, H_lat, W_lat]
+            if use_lmdb:
+                # LMDB latents are already VAE-encoded and normalized exactly
+                # as in training; only the first context frame is pinned.
+                image_latent = torch.as_tensor(
+                    lmdb_clean_latents[clip_idx], device=device,
+                    dtype=torch.bfloat16,
+                )[None, :1]
+            else:
+                img_pixel = _load_image_as_pixel(
+                    image_paths[clip_idx],
+                    target_h=target_h, target_w=target_w,
+                    device=device, dtype=torch.bfloat16,
+                )
+                image_latent = vae.encode_to_latent(
+                    img_pixel
+                )  # [1, 1, C, H_lat, W_lat]
             assert image_latent.shape[1] == 1, (
                 f"expected single-frame image latent, got "
                 f"shape={tuple(image_latent.shape)}"
@@ -697,9 +850,14 @@ def main() -> None:
         # in [0,1], so save_video / video_to_uint8 produce identical bytes
         # to a no-overlay run apart from the painted panel.
         if action_overlay and raw_c2w_full is not None:
+            # Always provide one interpolated camera pose per decoded frame so
+            # the panel and its action state cover the entire output video.
+            overlay_c2w = _resample_c2w_for_overlay(
+                raw_c2w_full, target_frames=int(video.shape[0])
+            )
             video_thwc = (video.permute(0, 2, 3, 1).cpu().numpy()
                           * 255.0).clip(0, 255).astype(np.uint8)
-            video_thwc = apply_overlay(video_thwc, raw_c2w_full,
+            video_thwc = apply_overlay(video_thwc, overlay_c2w,
                                         corner=overlay_corner)
             video = (torch.from_numpy(video_thwc).to(video.device)
                      .permute(0, 3, 1, 2).float() / 255.0)
@@ -713,7 +871,10 @@ def main() -> None:
             f.write(f"prompt:     {prompt}\n")
             f.write(f"trajectory: {traj}\n")
             if is_i2v:
-                f.write(f"image:      {image_paths[clip_idx]}\n")
+                if use_lmdb:
+                    f.write(f"image:      lmdb:{lmdb_path} (sample {clip_idx})\n")
+                else:
+                    f.write(f"image:      {image_paths[clip_idx]}\n")
 
     print(f"\nAll clips written to: {out_dir}")
 

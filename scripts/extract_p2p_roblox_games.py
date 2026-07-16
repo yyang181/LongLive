@@ -17,6 +17,12 @@ entirety. The auxiliary ``192x192.mp4`` is deliberately not extracted.
     python scripts/extract_p2p_roblox_games.py \
         --p2p_path /nfs/hongfenglai/p2p-full-data \
         --output_dir /nfs/yixinyang/code/LongLive/data/p2pfull
+
+    # Extract only one game (the ``Roblox:`` prefix is optional):
+    python scripts/extract_p2p_roblox_games.py \
+        --p2p_path /nfs/hongfenglai/p2p-full-data \
+        --output_dir /nfs/yixinyang/code/LongLive/data/p2pfull \
+        --game "Roblox: Evade"
 """
 
 from __future__ import annotations
@@ -45,6 +51,22 @@ from visualize_p2p_sample import (  # noqa: E402
 
 DEFAULT_GAMES = ("be-a-tornado", "be-a-shark", "be-a-snake")
 REQUIRED_SUFFIXES = (".mp4", ".proto")
+
+
+def normalize_requested_game(name: str) -> str:
+    """Normalize a CLI game name, accepting labels such as ``Roblox: Evade``.
+
+    ``metadata.env.env_subtype`` stores only the game subtype (for example,
+    ``Evade``), while tools that display the metadata often show it as
+    ``Roblox: Evade``.  Accept both forms so users can copy the displayed
+    label directly into the extraction command.
+    """
+    value = str(name).strip()
+    if ":" in value:
+        environment, subtype = value.split(":", 1)
+        if is_roblox_environment(environment):
+            value = subtype.strip()
+    return normalize_game_name(value)
 
 
 def list_archives(p2p_path: Path) -> list[Path]:
@@ -145,8 +167,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory receiving <game>/<uuid>.{mp4,proto}.",
     )
     parser.add_argument(
-        "--games", nargs="+", default=list(DEFAULT_GAMES),
-        help="Normalized Roblox game names to extract.",
+        "--games", nargs="+", metavar="GAME",
+        help="Roblox game names to extract (may be specified more than once).",
+    )
+    parser.add_argument(
+        "--game", "--game_name",
+        dest="game_names", action="append", metavar="GAME",
+        help=(
+            "Extract one game, optionally using a displayed label such as "
+            "'Roblox: Evade'. Repeat this option to select multiple games."
+        ),
     )
     parser.add_argument(
         "--max_archives", type=int, default=0,
@@ -165,7 +195,10 @@ def main() -> None:
         raise ValueError("--max_archives must be non-negative")
     args.p2p_path = args.p2p_path.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
-    games = {normalize_game_name(name) for name in args.games}
+    requested_games = list(args.games or []) + list(args.game_names or [])
+    if not requested_games:
+        requested_games = list(DEFAULT_GAMES)
+    games = {normalize_requested_game(name) for name in requested_games}
     archives = list_archives(args.p2p_path)
     if args.max_archives:
         archives = archives[: args.max_archives]
