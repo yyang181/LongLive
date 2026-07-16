@@ -83,7 +83,7 @@ training:
   infmem_streaming_training: true
   # Freeze the full Wan/DreamX generator. Only the external
   # QueryMemoryEncoder and its K/V projections are optimized.
-  train_memory_only: true
+  train_memory_only: false
   # Match Echo-Infinity: clean/context cache-memory update is a state update,
   # not a supervised prediction graph, so keep it under no_grad.
   infmem_clean_update_no_grad: true
