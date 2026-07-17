@@ -56,7 +56,7 @@ for f in "${CAPTION_CSV_LIST[@]}"; do
     fi
 done
 
-if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+if ! [[ "${TIMER_TOTAL_ITEMS:-}" =~ ^[1-9][0-9]*$ ]]; then
     TIMER_TOTAL_ITEMS=$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)
 fi
 TIMER_OUTPUT_DIR="${OUTPUT_DIR}"

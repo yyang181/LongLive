@@ -3,7 +3,9 @@
 # P2P stores <game>/<uuid>.mp4 + <uuid>.proto; the MIND builder expects
 # <sample>/video.mp4 + action.json.  Convert first, then reuse the standard
 # builder so the final LMDB contract remains unchanged.
-set -euxo pipefail
+# Keep normal runs concise. Set DEBUG_SHELL_TRACE=1 to print each shell command.
+set -euo pipefail
+[[ "${DEBUG_SHELL_TRACE:-0}" == "1" ]] && set -x
 
 VIDEO_DIR=${VIDEO_DIR:-/nfs/yixinyang/code/LongLive/data/p2pfull}
 OUTPUT_DIR=${OUTPUT_DIR:-./data/train/p2pfull/}
@@ -28,6 +30,6 @@ CAPTION_CSV="" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 TARGET_H="${TARGET_H}" TARGET_W="${TARGET_W}" \
 MAX_FRAMES="${MAX_FRAMES}" NPROC="${NPROC}" \
-TIMER_TOTAL_ITEMS="${TIMER_TOTAL_ITEMS:-$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)}" \
+TIMER_TOTAL_ITEMS="$(if [[ "${TIMER_TOTAL_ITEMS:-0}" =~ ^[1-9][0-9]*$ ]]; then echo "${TIMER_TOTAL_ITEMS}"; else find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l; fi)" \
 TIMER_OUTPUT_DIR="${OUTPUT_DIR}" \
 bash "${SCRIPT_DIR}/run_build_camera_lmdb_5b_mind.sh"

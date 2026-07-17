@@ -17,7 +17,9 @@
 #     prompt is used unless optional caption files are provided.
 #
 # Produces: $OUTPUT_DIR/data/  (LMDB consumed by CameraLatentLMDBDataset)
-set -euxo pipefail
+# Keep normal runs concise. Set DEBUG_SHELL_TRACE=1 to print each shell command.
+set -euo pipefail
+[[ "${DEBUG_SHELL_TRACE:-0}" == "1" ]] && set -x
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/_run_with_timing.sh"
@@ -94,7 +96,7 @@ fi
 
 CMD+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
 
-if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+if ! [[ "${TIMER_TOTAL_ITEMS:-}" =~ ^[1-9][0-9]*$ ]]; then
     TIMER_TOTAL_ITEMS=$(find "${CAMERA_DIR}" -type f -name 'action.json' 2>/dev/null | wc -l)
 fi
 TIMER_OUTPUT_DIR="${OUTPUT_DIR}"

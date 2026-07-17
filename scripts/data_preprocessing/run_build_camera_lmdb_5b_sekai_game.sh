@@ -58,7 +58,7 @@ if [[ ${#CAPTION_JSON_LIST[@]} -eq 0 ]]; then
 fi
 shopt -u nullglob
 
-if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+if ! [[ "${TIMER_TOTAL_ITEMS:-}" =~ ^[1-9][0-9]*$ ]]; then
     TIMER_TOTAL_ITEMS=$(find "${VIDEO_DIR}" -type f -name '*.mp4' 2>/dev/null | wc -l)
 fi
 TIMER_OUTPUT_DIR="${OUTPUT_DIR}"

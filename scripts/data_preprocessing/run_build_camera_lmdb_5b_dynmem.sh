@@ -31,7 +31,7 @@ if [[ "${NO_RESUME}" == "1" ]]; then
     EXTRA_ARGS+=(--no_resume)
 fi
 
-if [[ -z "${TIMER_TOTAL_ITEMS:-}" ]]; then
+if ! [[ "${TIMER_TOTAL_ITEMS:-}" =~ ^[1-9][0-9]*$ ]]; then
     TIMER_TOTAL_ITEMS=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d) if isinstance(d,list) else len(d.get("clips", d)))' "${INPUT_JSON}" 2>/dev/null || echo 0)
 fi
 TIMER_OUTPUT_DIR="${OUTPUT_DIR}"

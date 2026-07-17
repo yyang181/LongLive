@@ -21,24 +21,36 @@ except Exception:
     print(0)
     raise SystemExit
 
+import os
 root = sys.argv[1]
-paths = []
 final = f"{root}/data"
-if __import__("os").path.isdir(final):
-    paths.append(final)
-paths.extend(sorted(glob.glob(f"{root}/.rank_*")))
-total = 0
-for path in paths:
+rank_paths = sorted(glob.glob(f"{root}/.rank_*"))
+
+def read_count(path):
     try:
         env = lmdb.open(path, readonly=True, lock=False, readahead=False)
         with env.begin() as txn:
             value = txn.get(b"__count__")
-            if value is not None:
-                total += int(value.decode())
         env.close()
+        return int(value.decode()) if value is not None else 0
+    except Exception:
+        return 0
+
+final_count = read_count(final) if os.path.isdir(final) else 0
+rank_count = 0
+newest_rank_mtime = 0.0
+for path in rank_paths:
+    rank_count += read_count(path)
+    try:
+        newest_rank_mtime = max(newest_rank_mtime, os.path.getmtime(path))
     except Exception:
         pass
-print(total)
+
+# Before pre-merge, final_count is the old merged total and rank_count is new
+# work. During pre-merge, final_count has just been updated while rank shards
+# still exist; use the newer final LMDB to avoid counting those records twice.
+final_mtime = os.path.getmtime(final) if os.path.isdir(final) else 0.0
+print(final_count if final_mtime >= newest_rank_mtime else final_count + rank_count)
 PY
 }
 
