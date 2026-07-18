@@ -1,0 +1,145 @@
+# DreamX Camera I2V causal AR SFT + persistent Echo-Infinity memory.
+#
+# This is the supervised long-video stage. It intentionally does NOT enable
+# DMD/score distillation: every causal block is trained against the matching
+# GT latent flow target. The persistent cache is nevertheless advanced only
+# with x0_pred, so later blocks see the same self-fed history used at inference.
+
+infra:
+  sequence_parallel_size: 1
+  sharding_strategy: hybrid_full
+  mixed_precision: true
+  # Mutable KV/memory state is checkpointed explicitly inside the specialized
+  # streaming trainer; keep the generic model checkpoint path disabled.
+  gradient_checkpointing: false
+  vae_halo_latents: 28
+  generator_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+
+model_kwargs:
+  wrapper_cls: utils.dreamx_infmem_wrapper.DreamXInfMemWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+
+  # Physical persistent KV cache: four stable sink frames plus the rolling
+  # local region. A 240-frame rollout therefore starts evicting after frame 12.
+  local_attn_size: 12
+  sink_size: 4
+
+  # DreamX camera action branch.
+  attn_compress: 1
+  qk_norm: true
+
+  # Echo-Infinity memory branch.
+  enable_relative_rope: true
+  relative_rope_pmax: 24
+  memory_kwargs:
+    hidden_dim: 1536
+    num_heads: 12
+    head_dim: 128
+    n_encoder_layers: 2
+    tokens_per_frame: 880
+    Q_frames: 3
+    M_tokens_per_frame: 880
+    num_query_groups: 1
+    bptt_clips: 1
+    encoder_lr_multiplier: 5.0
+    use_sink_anchor: false
+    use_batch_update: false
+    use_residual_update: false
+    use_post_norm: true
+    use_vib: false
+    initializer_range: 0.014
+
+algorithm:
+  trainer: dreamx_infmem_streaming_diffusion
+  i2v: true
+  causal: true
+  teacher_forcing: true
+  independent_first_frame: true
+  num_train_timestep: 1000
+  denoising_loss_type: flow
+
+training:
+  lr: 1.0e-05
+  weight_decay: 0.0
+  beta1: 0.0
+  beta2: 0.999
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  ema_weight: 0.99
+  ema_start_step: 100
+  log_iters: 10
+  max_checkpoints: 3
+  max_iters: 3000
+  gc_interval: 100
+
+  infmem_streaming_training: true
+  use_lora: true
+  train_memory_only: false
+
+  # LongLive-v1-style scheduling: one optimizer step trains one bounded
+  # 20-frame GT window, while KV/memory/action position persist across all
+  # twelve windows of the same 240-frame trajectory.
+  streaming_bounded_window_size: 20
+
+  # Required invariant: GT is the generated-frame loss target only. clean
+  # recache and memory advancement consume x0_pred (apart from the fixed first
+  # I2V conditioning frame); setting this to gt is rejected.
+  streaming_cache_source: prediction
+  infmem_clean_update_no_grad: true
+  streaming_activation_checkpointing: true
+  streaming_fsdp_no_sync: true
+  context_noise: 0
+  infmem_strict_update: true
+  infmem_max_grad_norm: 10.0
+  infmem_verify_sync_interval: 100
+  allow_partial_infmem_resume: false
+  allow_ema_without_encoder_ema: false
+  allow_legacy_missing_infmem_ema: false
+
+  # Keep this first-stage objective pure AR SFT. Error recycling can be enabled
+  # in a later ablation without changing the x0_pred recache invariant.
+  error_recycling:
+    enabled: false
+
+adapter:
+  type: lora
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: bfloat16
+  verbose: true
+
+checkpoints:
+  # Immutable DreamX Camera AR base used before LoRA injection.
+  generator_ckpt: logs/train_dreamx_camera_i2v_ar_b300/checkpoint_model_001540/model.pt
+
+data:
+  data_path: data/train/sekai_vipe/data_f240_h44_w80_part
+  image_or_video_shape: [1, 240, 48, 44, 80]
+  dataset_repeat: 1
+  # Camera LMDB stores GT latents + viewmats/Ks directly.
+  load_raw_video: false
+
+inference:
+  sampling_steps: 50
+  sink_size: 4
+  multi_shot_sink: false
+  multi_shot_rope_offset: 0
+  guidance_scale: 3.0
+  independent_first_frame: true
+
+evaluation:
+  interval: 0
+  num_frames: 240
+  use_ema: true
+  val_batch_size: 1
+  save_latents_only: true
+
+logging:
+  seed: 0
+  wandb_key: null
+  wandb_entity: null
+  wandb_project: LongLive-DreamXCamera-I2V-AR-Long-InfMem-LoRA256

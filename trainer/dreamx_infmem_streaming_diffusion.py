@@ -14,13 +14,15 @@ from __future__ import annotations
 import gc
 import logging
 import random
+import time
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 import wandb
 
-from utils.distributed import EMA_FSDP
+from utils.config import section_get
+from utils.distributed import EMA_FSDP, barrier
 from .diffusion import Trainer as DiffusionTrainer
 
 
@@ -57,6 +59,48 @@ class Trainer(DiffusionTrainer):
         self.streaming_fsdp_no_sync = bool(
             getattr(config, "streaming_fsdp_no_sync", True)
         )
+        self.streaming_cache_source = str(
+            getattr(config, "streaming_cache_source", "prediction")
+        ).strip().lower()
+        if self.streaming_cache_source != "prediction":
+            raise ValueError(
+                "DreamX InfMem long-rollout training requires "
+                "streaming_cache_source='prediction'. Feeding GT latents into "
+                "the clean recache path creates a train/inference mismatch and "
+                f"can hide rollout drift; got {self.streaming_cache_source!r}."
+            )
+        self.streaming_bounded_window_size = int(
+            getattr(config, "streaming_bounded_window_size", 0) or 0
+        )
+        self._streaming_sequence_state = None
+        if self.streaming_bounded_window_size > 0:
+            block_size = int(self.model.num_frame_per_block)
+            if self.streaming_bounded_window_size % block_size != 0:
+                raise ValueError(
+                    "streaming_bounded_window_size must be divisible by "
+                    f"num_frame_per_block={block_size}; got "
+                    f"{self.streaming_bounded_window_size}."
+                )
+            if self.streaming_bounded_window_size <= int(
+                config.model_kwargs.local_attn_size
+            ):
+                raise ValueError(
+                    "streaming_bounded_window_size must exceed local_attn_size "
+                    "so every full window exercises physical KV eviction."
+                )
+            if int(getattr(config, "gradient_accumulation_steps", 1)) != 1:
+                raise ValueError(
+                    "Persistent bounded-window rollout currently requires "
+                    "gradient_accumulation_steps=1."
+                )
+            evaluation_interval = section_get(
+                config, "evaluation", "interval", 0
+            )
+            if int(evaluation_interval or 0) != 0:
+                raise ValueError(
+                    "Persistent bounded-window rollout requires evaluation.interval=0; "
+                    "inference would reset the live training cache/memory state."
+                )
         if self.streaming_fsdp_no_sync and not hasattr(
             self.model.generator, "no_sync"
         ):
@@ -74,6 +118,16 @@ class Trainer(DiffusionTrainer):
                 "[DreamXInfMemStreaming] FSDP gradient synchronization is deferred "
                 "to the final chunk of the final accumulation micro-step."
             )
+        if self.is_main_process:
+            print(
+                "[DreamXInfMemStreaming] clean cache/memory advancement uses "
+                f"{self.streaming_cache_source!r} latents."
+            )
+            if self.streaming_bounded_window_size > 0:
+                print(
+                    "[DreamXInfMemStreaming] persistent long rollout enabled: "
+                    f"bounded_window={self.streaming_bounded_window_size} frames."
+                )
 
     def _fsdp_gradient_sync_context(self, sync_gradients):
         """Return root-FSDP no_sync for intermediate streaming backwards."""
@@ -82,6 +136,93 @@ class Trainer(DiffusionTrainer):
                 or not self.streaming_fsdp_no_sync):
             return nullcontext()
         return self.model.generator.no_sync()
+
+    def _select_streaming_cache_base(self, x0_pred):
+        """Detach the model prediction used to advance persistent KV/memory."""
+        if self.streaming_cache_source != "prediction":
+            raise RuntimeError(
+                "Persistent recache must use x0_pred, never the GT latent."
+            )
+        return x0_pred.detach().clone()
+
+    @staticmethod
+    def _next_bounded_window(cursor, num_frame, window_size):
+        """Return the next globally aligned half-open rollout window."""
+        cursor = int(cursor)
+        num_frame = int(num_frame)
+        window_size = int(window_size)
+        if cursor < 0 or cursor >= num_frame:
+            raise ValueError(
+                f"cursor={cursor} must satisfy 0 <= cursor < {num_frame}."
+            )
+        if window_size <= 0:
+            raise ValueError("window_size must be positive.")
+        return cursor, min(cursor + window_size, num_frame)
+
+    def _start_bounded_sequence(self, batch):
+        """Initialize one GT trajectory while preserving self-fed runtime state."""
+        if batch is None:
+            raise RuntimeError("A new bounded rollout requires a camera batch.")
+        clean_latent, viewmats, Ks, conditional_dict = self._prepare_camera_batch(
+            batch
+        )
+        batch_size, num_frame, _, height, width = clean_latent.shape
+        block_size = int(self.model.num_frame_per_block)
+        if num_frame % block_size != 0:
+            raise ValueError(
+                f"num_frame={num_frame} must be divisible by block_size={block_size}."
+            )
+        if num_frame % self.streaming_bounded_window_size != 0:
+            raise ValueError(
+                f"num_frame={num_frame} must be divisible by "
+                f"streaming_bounded_window_size={self.streaming_bounded_window_size}."
+            )
+
+        frame_seq_length = (height * width) // 4
+        context_frames = 1 if getattr(self.config, "i2v", False) else 0
+        initial_latent = (
+            clean_latent[:, :context_frames].to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            if context_frames > 0
+            else None
+        )
+        kv_cache, crossattn_cache = self.model._build_streaming_caches(
+            batch_size, self.dtype, self.device, frame_seq_length
+        )
+        from utils.infinity_memory_hooks import reset_infmem
+
+        if not reset_infmem(
+            self.model.generator,
+            batch_size=batch_size,
+            device=self.device,
+            dtype=self.dtype,
+        ):
+            raise RuntimeError(
+                "Persistent bounded rollout requires QueryMemoryEncoder."
+            )
+        self._streaming_sequence_state = {
+            "clean_latent": clean_latent,
+            "viewmats": viewmats,
+            "Ks": Ks,
+            "conditional_dict": conditional_dict,
+            "batch_size": batch_size,
+            "num_frame": num_frame,
+            "frame_seq_length": frame_seq_length,
+            "context_frames": context_frames,
+            "initial_latent": initial_latent,
+            "kv_cache": kv_cache,
+            "crossattn_cache": crossattn_cache,
+            "cursor": 0,
+            "chunk_count": 0,
+        }
+        if self.is_main_process:
+            print(
+                "[DreamXInfMemStreaming] new persistent GT trajectory: "
+                f"frames={num_frame}, bounded_window="
+                f"{self.streaming_bounded_window_size}."
+            )
+        return self._streaming_sequence_state
 
     def _prepare_camera_batch(self, batch):
         """Prepare metadata while keeping the full video tensors on CPU.
@@ -223,40 +364,63 @@ class Trainer(DiffusionTrainer):
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
-        clean_latent_cpu, viewmats_cpu, Ks_cpu, conditional_dict = (
-            self._prepare_camera_batch(batch)
-        )
-        batch_size, num_frame, _, height, width = clean_latent_cpu.shape
-        frame_seq_length = (height * width) // 4
-        context_frames = 1 if getattr(self.config, "i2v", False) else 0
-        initial_latent = (
-            clean_latent_cpu[:, :context_frames].to(
-                device=self.device, dtype=self.dtype, non_blocking=True
-            )
-            if context_frames > 0
-            else None
-        )
+        from utils.infinity_memory_hooks import maybe_detach_infmem, reset_infmem
 
-        if num_frame % self.model.num_frame_per_block != 0:
-            raise ValueError(
-                f"num_frame={num_frame} must be divisible by "
-                f"num_frame_per_block={self.model.num_frame_per_block}."
+        persistent_window = self.streaming_bounded_window_size > 0
+        if persistent_window:
+            state = self._streaming_sequence_state
+            if state is None:
+                state = self._start_bounded_sequence(batch)
+            clean_latent_cpu = state["clean_latent"]
+            viewmats_cpu = state["viewmats"]
+            Ks_cpu = state["Ks"]
+            conditional_dict = state["conditional_dict"]
+            batch_size = state["batch_size"]
+            num_frame = state["num_frame"]
+            frame_seq_length = state["frame_seq_length"]
+            context_frames = state["context_frames"]
+            initial_latent = state["initial_latent"]
+            kv_cache = state["kv_cache"]
+            crossattn_cache = state["crossattn_cache"]
+            window_start, window_end = self._next_bounded_window(
+                state["cursor"], num_frame, self.streaming_bounded_window_size
             )
-
-        kv_cache, crossattn_cache = self.model._build_streaming_caches(
-            batch_size, self.dtype, self.device, frame_seq_length
-        )
-        from utils.infinity_memory_hooks import reset_infmem, maybe_detach_infmem
-
-        if not reset_infmem(
-            self.model.generator,
-            batch_size=batch_size,
-            device=self.device,
-            dtype=self.dtype,
-        ):
-            raise RuntimeError(
-                "Streaming InfMem trainer requires QueryMemoryEncoder, but reset failed."
+            chunk_count = int(state["chunk_count"])
+        else:
+            clean_latent_cpu, viewmats_cpu, Ks_cpu, conditional_dict = (
+                self._prepare_camera_batch(batch)
             )
+            batch_size, num_frame, _, height, width = clean_latent_cpu.shape
+            frame_seq_length = (height * width) // 4
+            context_frames = 1 if getattr(self.config, "i2v", False) else 0
+            initial_latent = (
+                clean_latent_cpu[:, :context_frames].to(
+                    device=self.device, dtype=self.dtype, non_blocking=True
+                )
+                if context_frames > 0
+                else None
+            )
+            if num_frame % self.model.num_frame_per_block != 0:
+                raise ValueError(
+                    f"num_frame={num_frame} must be divisible by "
+                    f"num_frame_per_block={self.model.num_frame_per_block}."
+                )
+            kv_cache, crossattn_cache = self.model._build_streaming_caches(
+                batch_size, self.dtype, self.device, frame_seq_length
+            )
+            if not reset_infmem(
+                self.model.generator,
+                batch_size=batch_size,
+                device=self.device,
+                dtype=self.dtype,
+            ):
+                raise RuntimeError(
+                    "Streaming InfMem trainer requires QueryMemoryEncoder, "
+                    "but reset failed."
+                )
+            window_start = 0
+            window_end = num_frame
+            chunk_count = 0
 
         if accumulation_step == 0:
             if self.generator_optimizer is not None:
@@ -277,10 +441,16 @@ class Trainer(DiffusionTrainer):
         er_latent_injected = False
         er_noise_injected = False
 
-        valid_count = float(batch_size * max(num_frame - context_frames, 1))
+        context_in_window = max(
+            0, min(window_end, context_frames) - window_start
+        )
+        valid_count = float(
+            batch_size * max(window_end - window_start - context_in_window, 1)
+        )
         total_loss_value = torch.zeros([], device=self.device, dtype=torch.float32)
-        chunk_count = 0
-        num_chunks = num_frame // self.model.num_frame_per_block
+        num_chunks = (
+            (window_end - window_start) // self.model.num_frame_per_block
+        )
         if (
             accumulation_step == 0
             and self.is_main_process
@@ -297,7 +467,10 @@ class Trainer(DiffusionTrainer):
             )
             self._fsdp_sync_schedule_logged = True
 
-        for block_index, start in enumerate(range(0, num_frame, self.model.num_frame_per_block)):
+        for start in range(
+            window_start, window_end, self.model.num_frame_per_block
+        ):
+            block_index = start // self.model.num_frame_per_block
             end = start + self.model.num_frame_per_block
             block_cond = self.model._conditional_for_streaming_block(
                 conditional_dict, batch_size, block_index
@@ -377,8 +550,11 @@ class Trainer(DiffusionTrainer):
                 )
                 training_target_chunk[:, :pinned] = 0
 
+            reached_sync_boundary = (
+                end == window_end if persistent_window else end == num_frame
+            )
             sync_gradients = (
-                end == num_frame
+                reached_sync_boundary
                 and accumulation_step == accumulation_steps - 1
             )
             with self._fsdp_gradient_sync_context(sync_gradients):
@@ -428,10 +604,12 @@ class Trainer(DiffusionTrainer):
                 crossattn_cache=crossattn_cache,
             )
 
-            # Echo-Infinity-style context/cache advancement: feed the model's
-            # denoised prediction (optionally with context_noise), not GT clean latent.
+            # Advance persistent KV/memory only from the model prediction.
+            # GT remains the supervised flow-matching target above and never
+            # enters generated-frame recache. The sole exception is the fixed
+            # first I2V conditioning frame, exactly as at inference.
             with torch.no_grad():
-                context_base = x0_pred.detach().clone()
+                context_base = self._select_streaming_cache_base(x0_pred)
                 if er_ready and not er_use_clean:
                     if (
                         getattr(self.model, "er_context_inject_on_self_feed", False)
@@ -534,6 +712,22 @@ class Trainer(DiffusionTrainer):
             if er_ready:
                 del latent_err, sigma, noise_err, lat_items, noise_items
 
+        sequence_complete = bool(persistent_window and window_end >= num_frame)
+        if persistent_window:
+            state["cursor"] = window_end
+            state["chunk_count"] = chunk_count
+            # The final recache update created the query state for the next
+            # window. Cut its old-parameter graph before optimizer.step while
+            # keeping the state values and physical KV cache alive.
+            from utils.infinity_memory_hooks import get_infmem_encoder
+
+            encoder = get_infmem_encoder(self.model.generator)
+            if encoder is None:
+                raise RuntimeError(
+                    "QueryMemoryEncoder disappeared during persistent rollout."
+                )
+            encoder.detach_state()
+
         if accumulation_step != accumulation_steps - 1:
             return None
 
@@ -580,6 +774,12 @@ class Trainer(DiffusionTrainer):
             "infmem_grad_norm": infmem_grad_norm.item(),
             "infmem_lr": self.infmem_optimizer.param_groups[0]["lr"],
         }
+        if persistent_window:
+            wandb_loss_dict.update({
+                "rollout_window_start": window_start,
+                "rollout_window_end": window_end,
+                "rollout_total_frames": num_frame,
+            })
         if self.model.error_buffer is not None:
             buf_stats = self.model.error_buffer.stats()
             noise_buf_stats = self.model.noise_error_buffer.stats()
@@ -600,10 +800,64 @@ class Trainer(DiffusionTrainer):
                 f"[stream-step {self.step:07d}] "
                 f"generator_loss={wandb_loss_dict['generator_loss']:.6f}, "
                 f"generator_grad_norm={wandb_loss_dict['generator_grad_norm']:.6f}"
-                f"{infmem_log_str}"
+                + (
+                    f", rollout_window={window_start}:{window_end}/{num_frame}"
+                    if persistent_window else ""
+                )
+                + f"{infmem_log_str}"
             )
+
+        if sequence_complete:
+            self._streaming_sequence_state = None
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
+
+    def train(self):
+        """Consume one dataset sample per persistent long rollout, not per window."""
+        if self.streaming_bounded_window_size <= 0:
+            return super().train()
+
+        if getattr(self.config, "generate_before_train", False):
+            if self.is_main_process:
+                print(
+                    "[generate_before_train] Running evaluation inference "
+                    "before training starts..."
+                )
+            self._run_evaluation_inference()
+            barrier()
+            return
+
+        while True:
+            batch = (
+                next(self.dataloader)
+                if self._streaming_sequence_state is None
+                else None
+            )
+            self.train_one_step(batch, accumulation_step=0, accumulation_steps=1)
+
+            if (
+                not self.config.no_save
+                and self.step % self.config.log_iters == 0
+            ):
+                torch.cuda.empty_cache()
+                self.save()
+                torch.cuda.empty_cache()
+
+            barrier()
+            if self.is_main_process:
+                current_time = time.time()
+                if self.previous_time is None:
+                    self.previous_time = current_time
+                else:
+                    if not self.disable_wandb:
+                        wandb.log(
+                            {"per iteration time": current_time - self.previous_time},
+                            step=self.step,
+                        )
+                    self.previous_time = current_time
+
+            if self.step >= self.config.max_iters:
+                break
