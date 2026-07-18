@@ -109,6 +109,24 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+        self.is_lora_enabled = bool(getattr(config, "use_lora", False))
+        self.lora_config = getattr(config, "adapter", None)
+        if self.is_lora_enabled:
+            if self.lora_config is None:
+                raise ValueError(
+                    "use_lora=true requires a top-level adapter section."
+                )
+            if bool(getattr(config, "train_memory_only", False)):
+                raise ValueError(
+                    "use_lora=true and train_memory_only=true are mutually exclusive. "
+                    "LoRA mode already freezes the generator backbone while keeping "
+                    "both LoRA adapters and QueryMemoryEncoder trainable."
+                )
+            if not getattr(config, "generator_ckpt", None):
+                raise ValueError(
+                    "use_lora=true requires checkpoints.generator_ckpt as the "
+                    "immutable base model for cold start and auto-resume."
+                )
 
         # Detect the combined DreamX+InfMem wrapper based on the real wrapper
         # class string so cold-start vs combined-resume can be distinguished.
@@ -350,26 +368,119 @@ class Trainer:
                 print(f"Loading checkpoint from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
+            # A LoRA resume checkpoint intentionally contains adapter weights,
+            # not a second copy of the frozen 5B base. Recreate the exact base
+            # from generator_ckpt before injecting/loading the adapter.
+            generator_checkpoint = checkpoint
+            generator_checkpoint_path = checkpoint_path
+            if self.is_lora_enabled and not is_cold_start_ckpt:
+                if "generator_lora" not in checkpoint:
+                    raise ValueError(
+                        f"LoRA resume checkpoint {checkpoint_path} is missing "
+                        f"'generator_lora'; found keys={list(checkpoint.keys())}. "
+                        f"Use a new logdir when switching from full SFT to LoRA."
+                    )
+                saved_adapter = checkpoint.get("adapter_config")
+                if saved_adapter is not None:
+                    for adapter_key in ("type", "rank", "alpha", "dropout"):
+                        saved_value = saved_adapter.get(adapter_key)
+                        current_value = self.lora_config.get(adapter_key)
+                        if saved_value != current_value:
+                            raise ValueError(
+                                f"LoRA adapter config mismatch for {adapter_key}: "
+                                f"checkpoint={saved_value!r}, current={current_value!r}."
+                            )
+                generator_checkpoint_path = config.generator_ckpt
+                if self.is_main_process:
+                    print(
+                        f"[LoRA] Loading immutable base generator from "
+                        f"{generator_checkpoint_path} before adapter resume."
+                    )
+                generator_checkpoint = torch.load(
+                    generator_checkpoint_path, map_location="cpu"
+                )
+
             # ---- Save the raw generator state BEFORE loading so we can verify
             # ---- the checkpoint actually contains cam_self_attn tensors.
-            raw_generator_state = checkpoint.get("generator", checkpoint.get("model", None))
-            if raw_generator_state is None and not ("generator" in checkpoint or "model" in checkpoint):
-                raw_generator_state = checkpoint
+            raw_generator_state = generator_checkpoint.get(
+                "generator", generator_checkpoint.get("model", None)
+            )
+            if raw_generator_state is None and not (
+                "generator" in generator_checkpoint or "model" in generator_checkpoint
+            ):
+                raw_generator_state = generator_checkpoint
 
-            if "generator" in checkpoint:
+            if "generator" in generator_checkpoint:
                 if self.is_main_process:
-                    print(f"Loading pretrained generator from {checkpoint_path}")
-                self.model.generator.load_state_dict(checkpoint["generator"], strict=True)
-                del checkpoint["generator"]
-            elif "model" in checkpoint:
+                    print(f"Loading pretrained generator from {generator_checkpoint_path}")
+                self.model.generator.load_state_dict(
+                    generator_checkpoint["generator"], strict=True
+                )
+                if generator_checkpoint is checkpoint:
+                    del checkpoint["generator"]
+            elif "model" in generator_checkpoint:
                 if self.is_main_process:
-                    print(f"Loading pretrained generator from {checkpoint_path}")
-                self.model.generator.load_state_dict(checkpoint["model"], strict=True)
-                del checkpoint["model"]
+                    print(f"Loading pretrained generator from {generator_checkpoint_path}")
+                self.model.generator.load_state_dict(
+                    generator_checkpoint["model"], strict=True
+                )
+                if generator_checkpoint is checkpoint:
+                    del checkpoint["model"]
             else:
                 if self.is_main_process:
-                    print(f"No 'generator'/'model' key found in {checkpoint_path}, treating as raw state_dict")
-                self.model.generator.load_state_dict(checkpoint, strict=True)
+                    print(
+                        f"No 'generator'/'model' key found in "
+                        f"{generator_checkpoint_path}, treating as raw state_dict"
+                    )
+                self.model.generator.load_state_dict(
+                    generator_checkpoint, strict=True
+                )
+
+            if self.is_lora_enabled:
+                from utils.lora_utils import (
+                    configure_lora_for_model,
+                    load_lora_checkpoint,
+                )
+
+                if self.is_main_process:
+                    print(
+                        f"[LoRA] Applying adapter before FSDP wrapping: "
+                        f"{self.lora_config}"
+                    )
+                self.model.generator.model = configure_lora_for_model(
+                    self.model.generator.model,
+                    model_name="generator",
+                    lora_config=self.lora_config,
+                    is_main_process=self.is_main_process,
+                )
+
+                lora_checkpoint = checkpoint if not is_cold_start_ckpt else None
+                lora_checkpoint_path = checkpoint_path if lora_checkpoint is not None else None
+                if lora_checkpoint is None and getattr(config, "lora_ckpt", None):
+                    lora_checkpoint_path = config.lora_ckpt
+                    lora_checkpoint = torch.load(
+                        lora_checkpoint_path, map_location="cpu"
+                    )
+
+                if lora_checkpoint is not None:
+                    lora_state = lora_checkpoint.get(
+                        "generator_lora", lora_checkpoint
+                    )
+                    load_lora_checkpoint(
+                        self.model.generator.model,
+                        lora_state,
+                        model_name="generator",
+                        is_main_process=self.is_main_process,
+                    )
+                    if lora_checkpoint is checkpoint:
+                        del checkpoint["generator_lora"]
+                    if self.is_main_process:
+                        print(f"[LoRA] Adapter loaded from {lora_checkpoint_path}.")
+                elif self.is_main_process:
+                    print("[LoRA] New adapter initialized from scratch.")
+
+            if generator_checkpoint is not checkpoint:
+                del generator_checkpoint
 
             # ---- QueryMemoryEncoder loading: branch cold-start vs combined-resume.
             allow_partial = bool(getattr(config, "allow_partial_infmem_resume", False))
@@ -968,8 +1079,10 @@ class Trainer:
         if (ema_weight is not None) and (ema_weight > 0.0) and (self.step >= config.ema_start_step):
             if self.is_main_process:
                 print(f"Setting up EMA with weight {ema_weight}")
-            if self.generator_optimizer is not None:
+            if self.generator_optimizer is not None and not self.is_lora_enabled:
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            elif self.is_lora_enabled and self.is_main_process:
+                print("[LoRA] Generator EMA disabled; adapter checkpoints stay compact.")
             from utils.infinity_memory_hooks import InfMemEMA, get_infmem_encoder
             if get_infmem_encoder(self.model.generator) is not None:
                 self.infmem_ema = InfMemEMA(self.model.generator, decay=ema_weight)
@@ -994,7 +1107,7 @@ class Trainer:
                 if self.is_main_process:
                     print("Resuming generator EMA...")
             else:
-                if self.is_main_process:
+                if self.is_main_process and not self.is_lora_enabled:
                     print("Warning: Generator EMA checkpoint not found.")
 
             if self.infmem_ema is not None and self.generator_ema is None:
@@ -1184,11 +1297,24 @@ class Trainer:
             FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
             FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True),
         ):
-            generator_state_dict  = self.model.generator.state_dict()
+            generator_state_dict = self.model.generator.state_dict()
             if self.generator_optimizer is not None:
                 generator_optimizer_state_dict = FSDP.optim_state_dict(
                     self.model.generator, self.generator_optimizer
                 )
+
+        generator_lora_state_dict = None
+        if self.is_lora_enabled:
+            if self.is_main_process:
+                from utils.lora_utils import lora_state_dict_from_full_generator
+
+                generator_lora_state_dict = lora_state_dict_from_full_generator(
+                    self.model.generator.model,
+                    generator_state_dict,
+                )
+            # The frozen base is reproducibly loaded from generator_ckpt and
+            # must not be duplicated in every parameter-efficient checkpoint.
+            del generator_state_dict
 
         query_memory_encoder_state_dict = None
         try:
@@ -1199,7 +1325,15 @@ class Trainer:
                 f"Failed to gather query_memory_encoder state for checkpoint: {e}"
             ) from e
 
-        if self.config.ema_start_step < self.step and self.generator_ema is not None:
+        if self.is_lora_enabled:
+            state_dict = {
+                "generator_lora": generator_lora_state_dict,
+                "adapter_config": OmegaConf.to_container(
+                    self.lora_config, resolve=True
+                ),
+                "step": self.step,
+            }
+        elif self.config.ema_start_step < self.step and self.generator_ema is not None:
             state_dict = {
                 "generator": generator_state_dict,
                 "generator_ema": self.generator_ema.state_dict(),
@@ -1493,6 +1627,7 @@ class Trainer:
         # Step 4: Update EMA (if enabled and after start step)
         if (self.step >= self.config.ema_start_step) and \
                 (self.generator_ema is None) and \
+                (not self.is_lora_enabled) and \
                 (getattr(self.config, "ema_weight", None) is not None) and \
                 (self.config.ema_weight > 0):
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
@@ -1641,6 +1776,7 @@ class Trainer:
 
         if (self.step >= self.config.ema_start_step) and \
                 (self.generator_ema is None) and \
+                (not self.is_lora_enabled) and \
                 (getattr(self.config, "ema_weight", None) is not None) and \
                 (self.config.ema_weight > 0):
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)

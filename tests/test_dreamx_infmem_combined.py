@@ -235,7 +235,9 @@ class TestConfigFiles(unittest.TestCase):
             "configs", "train_dreamx_camera_i2v_ar_infmem_streaming.yaml",
         )
         cfg = self._load_yaml(path)
-        self.assertTrue(cfg["training"].get("train_memory_only", False))
+        self.assertFalse(cfg["training"].get("train_memory_only", True))
+        self.assertFalse(cfg["training"].get("use_lora", True))
+        self.assertEqual(cfg["adapter"]["type"], "lora")
         memory_cfg = cfg["model_kwargs"]["memory_kwargs"]
         self.assertEqual(
             memory_cfg["M_tokens_per_frame"], memory_cfg["tokens_per_frame"]

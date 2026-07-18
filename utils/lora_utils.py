@@ -7,6 +7,8 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: Apache-2.0
+from collections.abc import Mapping
+
 import torch
 import peft
 from peft import get_peft_model_state_dict
@@ -44,7 +46,13 @@ def configure_lora_for_model(transformer, model_name, lora_config, is_main_proce
                 if isinstance(submodule, torch.nn.Linear):
                     target_linear_modules.add(full_submodule_name)
     
-    target_linear_modules = list(target_linear_modules)
+    target_linear_modules = sorted(target_linear_modules)
+
+    if not target_linear_modules:
+        raise ValueError(
+            f"No Linear layers were found in the LoRA target blocks for {model_name}. "
+            f"Expected one of: {adapter_target_modules}."
+        )
     
     if is_main_process:
         print(f"LoRA target modules for {model_name}: {len(target_linear_modules)} Linear layers")
@@ -74,6 +82,44 @@ def configure_lora_for_model(transformer, model_name, lora_config, is_main_proce
     return lora_model
 
 
+def lora_state_dict_from_full_generator(
+    lora_model,
+    full_generator_state_dict: Mapping[str, torch.Tensor],
+    *,
+    model_prefix: str = "model.",
+):
+    """Extract a PEFT adapter state from a full FSDP wrapper state dict.
+
+    Diffusion SFT wraps the complete ``WanDiffusionWrapper`` in FSDP, while
+    PEFT wraps only ``WanDiffusionWrapper.model``. A full FSDP state dict
+    therefore prefixes every PEFT key with ``model.``. Strip exactly that
+    wrapper prefix before asking PEFT to filter and normalize adapter keys.
+    """
+    if not isinstance(full_generator_state_dict, Mapping):
+        raise TypeError(
+            "full_generator_state_dict must be a mapping, "
+            f"got {type(full_generator_state_dict)!r}."
+        )
+
+    model_state_dict = {
+        name[len(model_prefix):]: value
+        for name, value in full_generator_state_dict.items()
+        if not model_prefix or name.startswith(model_prefix)
+    }
+    if not model_state_dict:
+        raise ValueError(
+            f"Full generator state contains no keys with prefix {model_prefix!r}."
+        )
+
+    adapter_state = get_peft_model_state_dict(
+        lora_model,
+        state_dict=model_state_dict,
+    )
+    if not adapter_state:
+        raise ValueError("No LoRA tensors were found in the full generator state dict.")
+    return adapter_state
+
+
 def gather_lora_state_dict(lora_model):
     with FSDP.state_dict_type(
         lora_model,                  
@@ -96,7 +142,16 @@ def load_lora_checkpoint(lora_model, lora_state_dict, model_name, is_main_proces
     if is_main_process:
         print(f"Loading LoRA {model_name} weights: {len(lora_state_dict)} keys in checkpoint")
     
-    peft.set_peft_model_state_dict(lora_model, lora_state_dict)
+    load_result = peft.set_peft_model_state_dict(lora_model, lora_state_dict)
+    missing_lora = [
+        name for name in load_result.missing_keys if "lora_" in name
+    ]
+    if missing_lora or load_result.unexpected_keys:
+        raise RuntimeError(
+            f"Invalid LoRA {model_name} checkpoint: "
+            f"missing_lora={missing_lora}, "
+            f"unexpected={load_result.unexpected_keys}."
+        )
     
     if is_main_process:
-        print(f"LoRA {model_name} weights loaded successfully") 
+        print(f"LoRA {model_name} weights loaded successfully")

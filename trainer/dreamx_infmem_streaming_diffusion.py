@@ -560,7 +560,11 @@ class Trainer(DiffusionTrainer):
             and self.config.ema_weight > 0
         )
         if ema_enabled:
-            if self.generator_optimizer is not None and self.generator_ema is None:
+            if (
+                self.generator_optimizer is not None
+                and not self.is_lora_enabled
+                and self.generator_ema is None
+            ):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
             if self.infmem_ema is None:
                 from utils.infinity_memory_hooks import InfMemEMA
