@@ -11,6 +11,7 @@ from wan_5b.distributed.sp_training import SequenceParallelHelper
 from utils.dataset import (
     MultiVideoConcatDataset, MultiTextConcatDataset, RepeatDataset, cycle,
     multi_video_collate_fn, eval_collate_fn, normalize_dataset_paths_and_repeats,
+    detect_camera_lmdb_paths,
 )
 from utils.config import section_get, wan_default_config
 from utils.misc import set_seed
@@ -547,14 +548,13 @@ class Trainer:
         # the VAE is not needed for training even if legacy configs set
         # load_raw_video=true. Also skip VAE when evaluation is disabled; keeping
         # Wan VAE on GPU wastes several GB and can trigger OOM on 4-GPU InfMem.
-        data_path = getattr(config, "data_path", "")
-        self.use_camera_lmdb = os.path.isfile(
-            os.path.join(data_path, "data.mdb")
-        ) or (
-            os.path.isdir(data_path)
-            and any(os.path.isfile(os.path.join(data_path, d, "data.mdb"))
-                    for d in os.listdir(data_path))
-        )
+        data_paths, camera_lmdb_flags = detect_camera_lmdb_paths(config.data_path)
+        if any(camera_lmdb_flags) and not all(camera_lmdb_flags):
+            raise ValueError(
+                "All data_path entries must be camera LMDBs when using multiple datasets; "
+                f"got {data_paths}."
+            )
+        self.use_camera_lmdb = all(camera_lmdb_flags)
         evaluation_interval = section_get(
             config, "evaluation", "interval", getattr(config, "generate_interval", 0)
         )
@@ -763,21 +763,6 @@ class Trainer:
 
         # Detect camera LMDB data (precomputed latents + viewmats + Ks).
         # ``data_path`` can be one LMDB (or a shard parent) or a list of LMDBs.
-        data_paths, _ = normalize_dataset_paths_and_repeats(config.data_path, 1)
-        def _is_camera_lmdb_path(path):
-            return os.path.isfile(os.path.join(path, "data.mdb")) or (
-                os.path.isdir(path)
-                and any(os.path.isfile(os.path.join(path, d, "data.mdb"))
-                        for d in os.listdir(path))
-            )
-        camera_lmdb_flags = [_is_camera_lmdb_path(path) for path in data_paths]
-        if any(camera_lmdb_flags) and not all(camera_lmdb_flags):
-            raise ValueError(
-                "All data_path entries must be camera LMDBs when using multiple datasets; "
-                f"got {data_paths}."
-            )
-        self.use_camera_lmdb = all(camera_lmdb_flags)
-
         if self.use_camera_lmdb:
             from utils.camera_dataset import CameraLatentLMDBDataset
             configured_shape = list(config.image_or_video_shape)

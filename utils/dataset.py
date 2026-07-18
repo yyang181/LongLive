@@ -71,6 +71,27 @@ def normalize_dataset_paths_and_repeats(data_path, dataset_repeat=None):
     return paths, repeats
 
 
+def detect_camera_lmdb_paths(data_path):
+    """Return normalized paths and whether each path is a Camera LMDB source.
+
+    A source can be either one LMDB directory containing ``data.mdb`` or a
+    directory whose immediate children are LMDB shards. Normalizing before
+    filesystem inspection is required because OmegaConf uses ``ListConfig``
+    for YAML/CLI lists, and that cannot be passed directly to ``os.path``.
+    """
+    paths, _ = normalize_dataset_paths_and_repeats(data_path, 1)
+
+    def is_camera_lmdb_path(path):
+        return os.path.isfile(os.path.join(path, "data.mdb")) or (
+            os.path.isdir(path)
+            and any(
+                os.path.isfile(os.path.join(path, entry, "data.mdb"))
+                for entry in os.listdir(path)
+            )
+        )
+
+    return paths, [is_camera_lmdb_path(path) for path in paths]
+
 
 class RepeatDataset(Dataset):
     """Expose a dataset multiple times without copying its samples.
