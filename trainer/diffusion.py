@@ -46,6 +46,25 @@ def _camera_latent_collate_fn(batch):
     }
 
 
+def _canonical_camera_state_keys(state_dict):
+    """Return pre-LoRA camera keys independent of FSDP/wrapper prefixes."""
+    keys = set()
+    for key in state_dict.keys():
+        key = str(key)
+        for prefix in (
+            "_fsdp_wrapped_module.",
+            "_checkpoint_wrapped_module.",
+            "_orig_mod.",
+        ):
+            key = key.replace(prefix, "")
+        for prefix in ("base_model.model.", "model."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+        if "cam_self_attn" in key:
+            keys.add(key)
+    return keys
+
+
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
     """
     Save prompts for one generated video to a txt file.
@@ -405,6 +424,7 @@ class Trainer:
             raw_generator_state = generator_checkpoint.get(
                 "generator", generator_checkpoint.get("model", None)
             )
+            pre_lora_model_cam_keys = None
             if raw_generator_state is None and not (
                 "generator" in generator_checkpoint or "model" in generator_checkpoint
             ):
@@ -435,6 +455,14 @@ class Trainer:
                 self.model.generator.load_state_dict(
                     generator_checkpoint, strict=True
                 )
+
+            # Capture the raw DreamX camera namespace before PEFT wraps
+            # ``generator.model``. The later PEFT namespace adds
+            # ``base_model.model`` / ``base_layer`` segments and cannot be
+            # compared directly with a pre-LoRA full-model checkpoint.
+            pre_lora_model_cam_keys = _canonical_camera_state_keys(
+                self.model.generator.model.state_dict()
+            )
 
             if self.is_lora_enabled:
                 from utils.lora_utils import (
@@ -582,31 +610,14 @@ class Trainer:
                     normalized_generator_state = clean_fsdp_state_dict_keys(
                         raw_generator_state
                     )
-                    # Also strip the "model." wrapper prefix so checkpoint
-                    # keys (model.blocks.0...) align with inner-model keys
-                    # (blocks.0...). This is the canonical normalization used
-                    # for comparing camera tensors.
-                    def _canon_key(k):
-                        k = str(k)
-                        for _pfx in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
-                            k = k.replace(_pfx, "")
-                        # Strip a leading "model." so wrapper-level keys match
-                        # the inner CausalWanModel state_dict keys.
-                        if k.startswith("model."):
-                            k = k[len("model."):]
-                        return k
-
-                    checkpoint_generator_keys = set(
-                        _canon_key(k) for k in normalized_generator_state.keys()
+                    checkpoint_cam_keys = _canonical_camera_state_keys(
+                        normalized_generator_state
                     )
-                    checkpoint_cam_keys = {
-                        k for k in checkpoint_generator_keys
-                        if ".cam_self_attn." in k or "cam_self_attn" in k
-                    }
-                    model_cam_keys = {
-                        k for k in inner.state_dict().keys()
-                        if "cam_self_attn" in k
-                    }
+                    model_cam_keys = pre_lora_model_cam_keys
+                    if model_cam_keys is None:
+                        model_cam_keys = _canonical_camera_state_keys(
+                            inner.state_dict()
+                        )
                     missing_cam_keys = model_cam_keys - checkpoint_cam_keys
                     unexpected_cam_keys = checkpoint_cam_keys - model_cam_keys
 

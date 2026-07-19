@@ -272,6 +272,29 @@ class TestCameraCheckpointValidation(unittest.TestCase):
         # normalizes by stripping "model." to match inner-model keys.
         self.assertIn("model.blocks.0.cam_self_attn.q.weight", cam_keys)
 
+    def test_pre_lora_and_peft_camera_keys_canonicalize_identically(self):
+        """LoRA must not make a complete cold-start camera ckpt look partial."""
+        from trainer.diffusion import _canonical_camera_state_keys
+
+        raw_checkpoint = {
+            "model.blocks.0.cam_self_attn.q.weight": torch.zeros(1),
+            "model.blocks.0.cam_self_attn.k.weight": torch.zeros(1),
+        }
+        pre_lora_model = {
+            "blocks.0.cam_self_attn.q.weight": torch.zeros(1),
+            "blocks.0.cam_self_attn.k.weight": torch.zeros(1),
+        }
+        peft_wrapped_model = {
+            "base_model.model.blocks.0.cam_self_attn.q.base_layer.weight": torch.zeros(1),
+            "base_model.model.blocks.0.cam_self_attn.k.base_layer.weight": torch.zeros(1),
+        }
+        checkpoint_keys = _canonical_camera_state_keys(raw_checkpoint)
+        pre_lora_keys = _canonical_camera_state_keys(pre_lora_model)
+        peft_keys = _canonical_camera_state_keys(peft_wrapped_model)
+
+        self.assertEqual(checkpoint_keys, pre_lora_keys)
+        self.assertNotEqual(checkpoint_keys, peft_keys)
+
 
 if __name__ == "__main__":
     unittest.main()

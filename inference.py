@@ -59,6 +59,7 @@ from utils.nvfp4_checkpoint import (
 )
 
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
+from utils.camera_dataset import CameraLatentLMDBDataset
 
 try:
     from PIL import Image as _PIL_Image
@@ -143,6 +144,45 @@ def three_file_i2v_collate_fn(batch):
     }
 
 
+class IndexedCameraLMDBInferenceDataset(torch.utils.data.Dataset):
+    """Add stable sample indices to camera-LMDB records for inference output."""
+
+    _mode = "CameraLatentLMDBInference"
+
+    def __init__(self, lmdb_path, *, max_samples, target_num_frames,
+                 expected_latent_shape):
+        self.dataset = CameraLatentLMDBDataset(
+            lmdb_path,
+            max_pair=max_samples,
+            target_num_frames=target_num_frames,
+            expected_latent_shape=expected_latent_shape,
+        )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = dict(self.dataset[idx])
+        item["idx"] = int(idx)
+        return item
+
+
+def camera_lmdb_i2v_collate_fn(batch):
+    """Collate one camera-LMDB record into inference.py's batch contract."""
+    if len(batch) != 1:
+        raise ValueError("Camera LMDB inference currently requires batch_size=1.")
+    item = batch[0]
+    return {
+        "idx": torch.tensor(item["idx"], dtype=torch.long),
+        # Keep this nested shape: downstream expects prompts[0] to be the
+        # per-causal-block prompt list.
+        "prompts": [[str(item["prompts"])]],
+        "clean_latent": item["clean_latent"].unsqueeze(0),
+        "viewmats": item["viewmats"].unsqueeze(0),
+        "Ks": item["Ks"].unsqueeze(0),
+    }
+
+
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
     """Save per-block prompts alongside the video.
 
@@ -172,6 +212,31 @@ def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_proces
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
+parser.add_argument(
+    "--lmdb_path",
+    type=str,
+    default=None,
+    help=(
+        "Optional camera LMDB test set. Each record supplies its prompt, "
+        "I2V first latent, viewmats and Ks; configured image/prompt/trajectory "
+        "inputs are ignored."
+    ),
+)
+parser.add_argument(
+    "--max_clips",
+    type=int,
+    default=-1,
+    help="Maximum LMDB records to render; <= 0 renders the complete test set.",
+)
+parser.add_argument(
+    "--max_lmdb_frames",
+    type=int,
+    default=None,
+    help=(
+        "Optional decoded-frame cap for --lmdb_path. Must be 4*k+1 so it "
+        "aligns with Wan's temporal VAE stride (for example 77 or 149)."
+    ),
+)
 te_quant_group = parser.add_mutually_exclusive_group()
 te_quant_group.add_argument(
     "--use_te_quant",
@@ -217,6 +282,31 @@ config.num_samples = section_get(config, "inference", "num_samples", getattr(con
 config.num_output_frames = getattr(config, "num_output_frames", config.image_or_video_shape[1])
 config.save_with_index = getattr(config, "save_with_index", False)
 config.inference_iter = getattr(config, "inference_iter", -1)
+lmdb_path = args.lmdb_path or section_get(
+    config, "inference", "lmdb_path", getattr(config, "lmdb_path", None)
+)
+lmdb_max_samples = int(args.max_clips)
+if lmdb_path:
+    if not getattr(config, "i2v", False):
+        raise ValueError("--lmdb_path requires an I2V inference config.")
+    if lmdb_max_samples == 0:
+        raise ValueError("--max_clips must be positive or negative (for all samples).")
+    if not config.save_with_index:
+        config.save_with_index = True
+        print("[data] LMDB mode forces save_with_index=true to avoid prompt-name collisions.")
+    if args.max_lmdb_frames is not None:
+        if args.max_lmdb_frames < 1 or (args.max_lmdb_frames - 1) % 4 != 0:
+            raise ValueError(
+                "--max_lmdb_frames must be a positive 4*k+1 value "
+                f"(for example 77 or 149), got {args.max_lmdb_frames}."
+            )
+        lmdb_latent_frames = (args.max_lmdb_frames - 1) // 4 + 1
+        config.num_output_frames = lmdb_latent_frames
+        config.image_or_video_shape[1] = lmdb_latent_frames
+        print(
+            f"[data] LMDB inference limited to {lmdb_latent_frames} latent "
+            f"frames ({args.max_lmdb_frames} decoded frames)."
+        )
 
 if bool(getattr(config, "fp8_quant", False)) and bool(
     getattr(config, "model_quant", False)
@@ -723,10 +813,28 @@ else:
 
 # Create dataset
 nfpb = getattr(config, 'num_frame_per_block', 8)
-data_path = config.data_path
+data_path = getattr(config, "data_path", None)
 chunks_per_shot = getattr(config, 'chunks_per_shot', 0)
 scene_cut_prefix = getattr(config, 'scene_cut_prefix', "The scene transitions. ")
-if getattr(config, "i2v", False):
+if lmdb_path:
+    shape = list(config.image_or_video_shape)
+    lmdb_limit = int(1e8) if lmdb_max_samples < 0 else lmdb_max_samples
+    dataset = IndexedCameraLMDBInferenceDataset(
+        lmdb_path,
+        max_samples=lmdb_limit,
+        target_num_frames=config.num_output_frames,
+        expected_latent_shape=tuple(int(value) for value in shape[2:]),
+    )
+    if len(dataset) == 0:
+        raise ValueError(f"No samples found in camera LMDB: {lmdb_path}")
+    collate_fn = camera_lmdb_i2v_collate_fn
+    num_blocks = config.num_output_frames // nfpb
+    if local_rank == 0:
+        print(
+            f"[data] camera LMDB mode: path={lmdb_path}, samples={len(dataset)}, "
+            f"latent_frames={config.num_output_frames}."
+        )
+elif getattr(config, "i2v", False):
     model_name = config.model_kwargs.model_name
     frame_raw_height = list(config.image_or_video_shape)[3] * wan_default_config[model_name]["spatial_compression_ratio"]
     frame_raw_width = list(config.image_or_video_shape)[4] * wan_default_config[model_name]["spatial_compression_ratio"]
@@ -903,12 +1011,20 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     initial_latent = None
     if getattr(config, "i2v", False):
-        image = batch["image"].to(device=device, dtype=torch.bfloat16)
-        if image.ndim == 4:
-            image = image.unsqueeze(2)
-        elif image.ndim != 5:
-            raise ValueError(f"Expected i2v image with shape [B,C,H,W] or [B,C,T,H,W], got {tuple(image.shape)}")
-        initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
+        if lmdb_path:
+            # The camera LMDB stores the VAE latent used during AR training.
+            # Only frame zero is I2V conditioning; the remaining GT latents
+            # are deliberately not passed to inference.
+            initial_latent = batch["clean_latent"][:, :1].to(
+                device=device, dtype=torch.bfloat16, non_blocking=True
+            )
+        else:
+            image = batch["image"].to(device=device, dtype=torch.bfloat16)
+            if image.ndim == 4:
+                image = image.unsqueeze(2)
+            elif image.ndim != 5:
+                raise ValueError(f"Expected i2v image with shape [B,C,H,W] or [B,C,T,H,W], got {tuple(image.shape)}")
+            initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
         if initial_latent.shape[0] != config.num_samples:
             initial_latent = initial_latent.repeat(config.num_samples, 1, 1, 1, 1)
         if config.num_output_frames <= initial_latent.shape[1]:
@@ -938,7 +1054,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     raw_c2w_per_sample = None
     cam_algo = getattr(config, "algorithm", {}) or {}
     use_camera = bool(cam_algo.get("use_camera", False)) or bool(getattr(config, "use_camera", False))
-    if use_camera:
+    if use_camera and not lmdb_path:
         inf_cfg = section_get(config, "inference", None, None) or {}
         traj_path = getattr(config, "trajectory_path", inf_cfg.get("trajectory_path", None))
         traj_fmt = str(getattr(config, "trajectory_format", inf_cfg.get("trajectory_format", "worldplaygen"))).lower()
@@ -1022,6 +1138,36 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         inference_kwargs["Ks"] = Ks
         if action_overlay:
             raw_c2w_per_sample = raw_c2w_list
+
+    if lmdb_path:
+        # Override any hand-authored trajectory with the test record's exact
+        # camera tensors. These are already normalized by
+        # CameraLatentLMDBDataset in the same convention used for training.
+        lmdb_viewmats = batch["viewmats"][:, :config.num_output_frames]
+        lmdb_Ks = batch["Ks"][:, :config.num_output_frames]
+        if lmdb_viewmats.shape[1] != config.num_output_frames:
+            raise ValueError(
+                f"LMDB sample has {lmdb_viewmats.shape[1]} camera frames, but "
+                f"inference requests {config.num_output_frames}."
+            )
+        if lmdb_Ks.shape[1] != config.num_output_frames:
+            raise ValueError(
+                f"LMDB sample has {lmdb_Ks.shape[1]} intrinsic frames, but "
+                f"inference requests {config.num_output_frames}."
+            )
+        lmdb_viewmats = lmdb_viewmats.to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        lmdb_Ks = lmdb_Ks.to(
+            device=device, dtype=torch.bfloat16, non_blocking=True
+        )
+        if lmdb_viewmats.shape[0] != config.num_samples:
+            lmdb_viewmats = lmdb_viewmats.repeat(config.num_samples, 1, 1, 1)
+            lmdb_Ks = lmdb_Ks.repeat(config.num_samples, 1, 1, 1)
+        inference_kwargs["viewmats"] = lmdb_viewmats
+        inference_kwargs["Ks"] = lmdb_Ks
+        if action_overlay and local_rank == 0:
+            print("[inference] action_overlay is unavailable for LMDB camera inputs.")
 
     with torch.inference_mode():
         generated = pipeline.inference(**inference_kwargs)
