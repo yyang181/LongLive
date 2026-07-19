@@ -491,10 +491,16 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         # X0 prediction
         if kv_cache is not None:
-            # Stock causal models do not accept the InfMem-only kwarg. Pass it
-            # only when the specialized streaming trainer explicitly enables it.
+            # Stock causal models do not accept InfMem-only kwargs. The
+            # inference pipeline always uses the default ``False`` value, so
+            # omit it completely; the specialized InfMem trainer explicitly
+            # enables it only on the patched model.
             checkpoint_kwargs = (
                 {"checkpoint_blocks": True} if checkpoint_blocks else {}
+            )
+            memory_kwargs = (
+                {"memory_update_with_grad": True}
+                if memory_update_with_grad else {}
             )
             flow_pred = self._call_model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
@@ -506,11 +512,11 @@ class WanDiffusionWrapper(torch.nn.Module):
                 cache_start=cache_start,
                 defer_cache_updates=defer_cache_updates,
                 update_memory=update_memory,
-                memory_update_with_grad=memory_update_with_grad,
                 apply_deferred_cache_updates=apply_cache_updates,
                 viewmats=viewmats,
                 Ks=Ks,
                 **checkpoint_kwargs,
+                **memory_kwargs,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

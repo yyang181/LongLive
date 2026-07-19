@@ -107,6 +107,40 @@ class TestInfMemSignatureCompatibility(unittest.TestCase):
         self.assertIn("Ks", params)
         self.assertIn("checkpoint_blocks", params)
 
+    def test_stock_causal_forward_omits_infmem_grad_kwarg(self):
+        """Normal DreamX AR inference must not receive an InfMem-only kwarg."""
+        import types
+        from utils.wan_5b_wrapper import WanDiffusionWrapper
+
+        wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.uniform_timestep = False
+        wrapper.seq_len = 1
+        calls = []
+
+        def fake_call_model(_self, x, **kwargs):
+            calls.append(kwargs)
+            return x
+
+        wrapper._call_model = types.MethodType(fake_call_model, wrapper)
+        wrapper._convert_flow_pred_to_x0 = types.MethodType(
+            lambda _self, flow_pred, **_kwargs: flow_pred, wrapper
+        )
+        latent = torch.zeros(1, 4, 2, 1, 1)
+        cond = {"prompt_embeds": torch.zeros(1, 1, 1)}
+        timestep = torch.zeros(1, 4)
+        WanDiffusionWrapper.forward(
+            wrapper, latent, cond, timestep, kv_cache=[{}],
+            crossattn_cache=[{}], memory_update_with_grad=False,
+        )
+        self.assertNotIn("memory_update_with_grad", calls[-1])
+
+        WanDiffusionWrapper.forward(
+            wrapper, latent, cond, timestep, kv_cache=[{}],
+            crossattn_cache=[{}], memory_update_with_grad=True,
+        )
+        self.assertTrue(calls[-1]["memory_update_with_grad"])
+
 
 # ---------------------------------------------------------------------------
 # Test 3: Relative RoPE position bounds
