@@ -272,7 +272,13 @@ config.output_folder = section_get(config, "inference", "output_folder", getattr
 # If the ckpt path encodes a training step (e.g. ``checkpoint_model_000200``),
 # append that suffix to the output_folder so different checkpoints don't
 # clobber each other (mirrors scripts/inference/inference_bidir_camera.py).
-_ckpt_for_suffix = getattr(config, "generator_ckpt", None) or ""
+# For parameter-efficient runs the LoRA checkpoint is the trained artifact and
+# generator_ckpt is only the immutable base, so name outputs after lora_ckpt.
+_ckpt_for_suffix = (
+    getattr(config, "lora_ckpt", None)
+    or getattr(config, "generator_ckpt", None)
+    or ""
+)
 if _ckpt_for_suffix:
     _m = re.search(r"checkpoint_model_(\d+)", _ckpt_for_suffix)
     if _m:
@@ -492,6 +498,7 @@ if has_lora_adapter and (
 materialize_quantized_weights_for_inference = None
 generator_checkpoint = None
 generator_lora_state = None
+lora_checkpoint = None
 generator_ckpt_path = getattr(config, "generator_ckpt", None)
 loaded_prequantized_generator = False
 prequantized_generator_backend = None
@@ -623,17 +630,27 @@ if has_lora_adapter:
 elif merge_lora and local_rank == 0:
     print("merge_lora=True requested but no adapter config was found; continuing without LoRA merge")
 
-# Load query_memory_encoder before deleting checkpoint (InfMem combined path).
-# Keep its raw/EMA selection paired with the generator selection above.
+# Load query_memory_encoder before deleting checkpoints (InfMem combined path).
+# LoRA InfMem training stores the adapter and QueryMemoryEncoder together in
+# lora_ckpt while generator_ckpt remains the immutable full-model base.  Prefer
+# that training checkpoint for memory state, falling back to generator_ckpt for
+# full-model InfMem checkpoints.
 _infmem_enc_loaded = False
-if isinstance(generator_checkpoint, dict):
+infmem_checkpoint = generator_checkpoint
+if isinstance(lora_checkpoint, dict) and any(
+    key in lora_checkpoint
+    for key in ("query_memory_encoder", "query_memory_encoder_ema")
+):
+    infmem_checkpoint = lora_checkpoint
+
+if isinstance(infmem_checkpoint, dict):
     from utils.infinity_memory_hooks import (
         get_infmem_encoder,
         select_infmem_checkpoint_state,
     )
 
     enc_state, enc_state_source = select_infmem_checkpoint_state(
-        generator_checkpoint,
+        infmem_checkpoint,
         use_ema=config.use_ema,
     )
     _enc = get_infmem_encoder(pipeline.generator)
@@ -641,7 +658,7 @@ if isinstance(generator_checkpoint, dict):
         # Validate the saved runtime architecture before load_state_dict. This
         # turns opaque query_init size mismatches into an actionable config
         # error (for example M_tokens_per_frame=32 vs 880).
-        enc_meta = generator_checkpoint.get("query_memory_encoder_meta")
+        enc_meta = infmem_checkpoint.get("query_memory_encoder_meta")
         if isinstance(enc_meta, dict):
             inner = getattr(pipeline.generator, "model", None)
             expected_meta = {
@@ -712,6 +729,8 @@ if isinstance(generator_checkpoint, dict):
             "randomly-initialized encoder for inference."
         )
 
+del infmem_checkpoint
+del lora_checkpoint
 del generator_checkpoint
 
 
