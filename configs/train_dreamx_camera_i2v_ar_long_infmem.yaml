@@ -72,7 +72,7 @@ training:
   ema_start_step: 100
   log_iters: 10
   max_checkpoints: 3
-  max_iters: 3000
+  max_iters: 999999999999999999
   gc_interval: 100
 
   infmem_streaming_training: true
