@@ -34,6 +34,7 @@ if not hasattr(_tv_io, "read_video"):
     _tv_io.read_video = _shim_read_video
 
 import argparse
+import json
 import torch
 from omegaconf import OmegaConf
 import numpy as np
@@ -42,6 +43,7 @@ from tqdm import tqdm
 from torchvision.io import write_video
 from einops import rearrange
 import torch.distributed as dist
+from pathlib import Path
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
@@ -59,7 +61,7 @@ from utils.nvfp4_checkpoint import (
 )
 
 from utils.memory import get_cuda_free_memory_gb, DynamicSwapInstaller
-from utils.camera_dataset import CameraLatentLMDBDataset
+from utils.camera_dataset import CameraLatentLMDBDataset, build_viewmats_and_Ks
 
 try:
     from PIL import Image as _PIL_Image
@@ -167,20 +169,198 @@ class IndexedCameraLMDBInferenceDataset(torch.utils.data.Dataset):
         return item
 
 
+def _is_camera_lmdb_path(path: str) -> bool:
+    """Whether *path* is an encoded camera LMDB (or a parent of shards)."""
+    root = Path(path).expanduser()
+    if (root / "data.mdb").is_file():
+        return True
+    try:
+        return any(
+            (child / "data.mdb").is_file()
+            for child in root.iterdir()
+            if child.is_dir()
+        )
+    except OSError:
+        return False
+
+
+def _discover_mind_action_space_samples(root: str):
+    """Return interleaved first-/third-person MIND action-space test clips.
+
+    MIND evaluation data is intentionally kept as ``video.mp4`` plus
+    ``action.json`` rather than being VAE-encoded.  Supporting that layout
+    here makes ``--lmdb_path`` behave like the established camera inference
+    entry point while avoiding a second, large LMDB-preprocessing job.
+    """
+    root_path = Path(root).expanduser().resolve()
+    groups = []
+    for perspective in ("1st_data", "3rd_data"):
+        action_dir = root_path / perspective / "test" / "action_space_test"
+
+        def sort_key(path):
+            match = re.match(r"data-(\d+)", path.parent.name)
+            return (int(match.group(1)) if match else 10**9, path.parent.name)
+
+        group = []
+        for action_path in sorted(action_dir.glob("*/action.json"), key=sort_key):
+            video_path = action_path.parent / "video.mp4"
+            if not video_path.is_file():
+                continue
+            try:
+                with action_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                frames = meta.get("data", [])
+                if not frames:
+                    raise ValueError("empty data array")
+                for frame_idx, frame in enumerate(frames):
+                    missing = {"ws", "ad", "ud", "lr"}.difference(frame)
+                    if missing:
+                        raise ValueError(
+                            f"frame {frame_idx} missing {sorted(missing)}"
+                        )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                print(f"[data] skip malformed MIND sample {action_path}: {exc}")
+                continue
+            group.append({
+                "video_path": str(video_path),
+                "sample_id": f"{perspective}_{action_path.parent.name}",
+                "frames": frames,
+                "caption": meta.get("caption", ""),
+            })
+        groups.append(group)
+
+    # Keep the two perspectives balanced in a short --max_clips run.
+    return [
+        sample
+        for index in range(max((len(group) for group in groups), default=0))
+        for group in groups
+        if index < len(group)
+        for sample in (group[index],)
+    ]
+
+
+class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
+    """MIND action-space test data adapted to inference.py's I2V contract."""
+
+    _mode = "RawMINDI2VInference"
+
+    def __init__(self, root, *, max_samples, target_num_frames, target_height,
+                 target_width, inference_config):
+        # Reuse exactly the action-to-camera / frame-decoding functions used by
+        # build_camera_lmdb_5b_mind.py, so raw-MIND and encoded-LMDB camera
+        # controls follow the same convention.
+        from scripts.data_preprocessing.build_camera_lmdb_5b_mind import (
+            default_intrinsics_from_fov,
+            load_video_frames,
+            poses_from_c2w_array,
+            poses_from_mind_actions,
+        )
+
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.is_dir():
+            raise ValueError(
+                f"--lmdb_path does not exist or is not a directory: {root}"
+            )
+        raw_frames_needed = 4 * (int(target_num_frames) - 1) + 1
+        camera_fov = float(inference_config.get("mind_camera_fov", 90.0))
+        intrinsics = default_intrinsics_from_fov(
+            camera_fov,
+            int(inference_config.get("mind_orig_w", 1920)),
+            int(inference_config.get("mind_orig_h", 1080)),
+        )
+        default_caption = str(inference_config.get(
+            "mind_default_caption",
+            "A high-quality gameplay video with detailed 3D environments, "
+            "smooth character animation, and dynamic camera movement.",
+        ))
+        strategy = str(inference_config.get("mind_cam_sample_strategy", "last"))
+        samples = _discover_mind_action_space_samples(str(root_path))
+        if not samples:
+            raise ValueError(
+                f"{root} is neither a camera LMDB nor a MIND root with "
+                "1st_data/3rd_data/test/action_space_test clips"
+            )
+
+        self.samples = []
+        for sample in samples:
+            if len(sample["frames"]) < raw_frames_needed:
+                print(
+                    f"[data] skip short MIND sample {sample['sample_id']}: "
+                    f"{len(sample['frames'])} < {raw_frames_needed} frames"
+                )
+                continue
+            raw_c2w = poses_from_mind_actions(
+                sample["frames"][:raw_frames_needed],
+                forward_speed=float(inference_config.get("mind_forward_speed", 0.08)),
+                yaw_speed_deg=float(inference_config.get("mind_yaw_speed_deg", 3.0)),
+                pitch_speed_deg=float(inference_config.get("mind_pitch_speed_deg", 3.0)),
+            )
+            sample_intrinsics, poses = poses_from_c2w_array(
+                raw_c2w,
+                int(target_num_frames),
+                intrinsics,
+                vae_time_stride=4,
+                cam_sample_strategy=strategy,
+            )
+            viewmats, Ks = build_viewmats_and_Ks(sample_intrinsics, poses)
+            self.samples.append({
+                "video_path": sample["video_path"],
+                "prompt": str(sample["caption"] or default_caption),
+                "viewmats": torch.from_numpy(viewmats),
+                "Ks": torch.from_numpy(Ks),
+            })
+            if max_samples > 0 and len(self.samples) >= max_samples:
+                break
+        if not self.samples:
+            raise ValueError(
+                f"No MIND action-space samples in {root} have the required "
+                f"{raw_frames_needed} frames"
+            )
+        self.target_height = int(target_height)
+        self.target_width = int(target_width)
+        self._load_video_frames = load_video_frames
+        print(
+            f"[data] raw MIND mode: path={root_path}, samples={len(self.samples)}, "
+            f"latent_frames={target_num_frames}, decoded_frames={raw_frames_needed}."
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        frames = self._load_video_frames(
+            sample["video_path"], 1, self.target_height, self.target_width
+        )
+        if frames is None:
+            raise ValueError(f"Could not decode first frame from {sample['video_path']}")
+        return {
+            "idx": int(idx),
+            "image": frames[:, 0],  # [C,H,W] in [-1,1]
+            "prompts": sample["prompt"],
+            "viewmats": sample["viewmats"],
+            "Ks": sample["Ks"],
+        }
+
+
 def camera_lmdb_i2v_collate_fn(batch):
-    """Collate one camera-LMDB record into inference.py's batch contract."""
+    """Collate encoded-LMDB or raw-MIND camera records for I2V inference."""
     if len(batch) != 1:
         raise ValueError("Camera LMDB inference currently requires batch_size=1.")
     item = batch[0]
-    return {
+    result = {
         "idx": torch.tensor(item["idx"], dtype=torch.long),
         # Keep this nested shape: downstream expects prompts[0] to be the
         # per-causal-block prompt list.
         "prompts": [[str(item["prompts"])]],
-        "clean_latent": item["clean_latent"].unsqueeze(0),
         "viewmats": item["viewmats"].unsqueeze(0),
         "Ks": item["Ks"].unsqueeze(0),
     }
+    if "clean_latent" in item:
+        result["clean_latent"] = item["clean_latent"].unsqueeze(0)
+    else:
+        result["image"] = item["image"].unsqueeze(0)
+    return result
 
 
 def save_prompts_to_txt(prompts_for_sample, prompt_txt_path: str, is_main_process: bool):
@@ -217,23 +397,26 @@ parser.add_argument(
     type=str,
     default=None,
     help=(
-        "Optional camera LMDB test set. Each record supplies its prompt, "
-        "I2V first latent, viewmats and Ks; configured image/prompt/trajectory "
-        "inputs are ignored."
+        "Optional encoded camera LMDB or raw MIND test root. Encoded records "
+        "supply their prompt, I2V first latent, viewmats and Ks; raw MIND "
+        "clips derive camera tensors from action.json and encode video frame 0. "
+        "Configured image/prompt/trajectory inputs are ignored."
     ),
 )
 parser.add_argument(
     "--max_clips",
     type=int,
     default=-1,
-    help="Maximum LMDB records to render; <= 0 renders the complete test set.",
+    help="Maximum camera-data records to render; <= 0 renders the complete test set.",
 )
 parser.add_argument(
     "--max_lmdb_frames",
     type=int,
     default=None,
     help=(
+        "aligns with Wan's temporal VAE stride (for example 77 or 149)."
         "Optional decoded-frame cap for --lmdb_path. Must be 4*k+1 so it "
+        "aligns with Wan's temporal VAE stride (for example 77 or 149)."
         "aligns with Wan's temporal VAE stride (for example 77 or 149)."
     ),
 )
@@ -295,8 +478,6 @@ lmdb_max_samples = int(args.max_clips)
 if lmdb_path:
     if not getattr(config, "i2v", False):
         raise ValueError("--lmdb_path requires an I2V inference config.")
-    if lmdb_max_samples == 0:
-        raise ValueError("--max_clips must be positive or negative (for all samples).")
     if not config.save_with_index:
         config.save_with_index = True
         print("[data] LMDB mode forces save_with_index=true to avoid prompt-name collisions.")
@@ -837,20 +1018,40 @@ chunks_per_shot = getattr(config, 'chunks_per_shot', 0)
 scene_cut_prefix = getattr(config, 'scene_cut_prefix', "The scene transitions. ")
 if lmdb_path:
     shape = list(config.image_or_video_shape)
-    lmdb_limit = int(1e8) if lmdb_max_samples < 0 else lmdb_max_samples
-    dataset = IndexedCameraLMDBInferenceDataset(
-        lmdb_path,
-        max_samples=lmdb_limit,
-        target_num_frames=config.num_output_frames,
-        expected_latent_shape=tuple(int(value) for value in shape[2:]),
-    )
-    if len(dataset) == 0:
-        raise ValueError(f"No samples found in camera LMDB: {lmdb_path}")
+    lmdb_limit = int(1e8) if lmdb_max_samples <= 0 else lmdb_max_samples
+    if _is_camera_lmdb_path(str(lmdb_path)):
+        dataset = IndexedCameraLMDBInferenceDataset(
+            lmdb_path,
+            max_samples=lmdb_limit,
+            target_num_frames=config.num_output_frames,
+            expected_latent_shape=tuple(int(value) for value in shape[2:]),
+        )
+        if len(dataset) == 0:
+            raise ValueError(f"No samples found in camera LMDB: {lmdb_path}")
+        camera_input_kind = "encoded camera LMDB"
+    else:
+        model_name = config.model_kwargs.model_name
+        target_height = (
+            int(shape[3]) * wan_default_config[model_name]["spatial_compression_ratio"]
+        )
+        target_width = (
+            int(shape[4]) * wan_default_config[model_name]["spatial_compression_ratio"]
+        )
+        inf_cfg_for_mind = section_get(config, "inference", None, None) or {}
+        dataset = RawMINDI2VInferenceDataset(
+            lmdb_path,
+            max_samples=lmdb_limit,
+            target_num_frames=config.num_output_frames,
+            target_height=target_height,
+            target_width=target_width,
+            inference_config=inf_cfg_for_mind,
+        )
+        camera_input_kind = "raw MIND action-space data"
     collate_fn = camera_lmdb_i2v_collate_fn
     num_blocks = config.num_output_frames // nfpb
     if local_rank == 0:
         print(
-            f"[data] camera LMDB mode: path={lmdb_path}, samples={len(dataset)}, "
+            f"[data] {camera_input_kind} mode: path={lmdb_path}, samples={len(dataset)}, "
             f"latent_frames={config.num_output_frames}."
         )
 elif getattr(config, "i2v", False):
@@ -1051,7 +1252,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     initial_latent = None
     if getattr(config, "i2v", False):
-        if lmdb_path:
+        if lmdb_path and "clean_latent" in batch:
             # The camera LMDB stores the VAE latent used during AR training.
             # Only frame zero is I2V conditioning; the remaining GT latents
             # are deliberately not passed to inference.
