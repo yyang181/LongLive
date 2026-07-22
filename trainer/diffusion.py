@@ -31,18 +31,20 @@ from torch.distributed.fsdp import (
 def _camera_latent_collate_fn(batch):
     """Collate function for CameraLatentLMDBDataset items.
 
-    Each item has keys: prompts (str), clean_latent (T,F,C,H,W),
+    Each item has keys: prompts (str), idx (int), clean_latent (T,F,C,H,W),
     viewmats (T,4,4), Ks (T,3,3).
     """
     clean_latents = torch.stack([b["clean_latent"] for b in batch], dim=0)
     viewmats = torch.stack([b["viewmats"] for b in batch], dim=0)
     Ks = torch.stack([b["Ks"] for b in batch], dim=0)
     prompts = [b["prompts"] for b in batch]
+    idx = torch.tensor([b["idx"] for b in batch], dtype=torch.long)
     return {
         "clean_latent": clean_latents,
         "viewmats": viewmats,
         "Ks": Ks,
         "prompts": prompts,
+        "idx": idx,
     }
 
 

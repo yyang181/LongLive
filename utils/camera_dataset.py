@@ -80,7 +80,7 @@ def cycle(dl):
 # Dataset
 # ---------------------------------------------------------------------------
 class CameraLatentLMDBDataset(Dataset):
-    """LMDB dataset yielding `clean_latent`, `viewmats`, `Ks`, `prompts`.
+    """LMDB dataset yielding `clean_latent`, `viewmats`, `Ks`, `prompts`, `idx`.
 
     `data_path` may either be:
       * a single LMDB directory (contains ``data.mdb``); or
@@ -283,6 +283,10 @@ class CameraLatentLMDBDataset(Dataset):
         viewmats, Ks = build_viewmats_and_Ks(intrinsics, poses)
         item = {
             "prompts": prompts,
+            # Keep the same batch contract as the raw-video dataset.  Sequence
+            # parallel synchronization broadcasts this identifier with prompts,
+            # and evaluation also uses it to name generated samples.
+            "idx": int(idx),
             "clean_latent": latents_t,
             "viewmats": torch.tensor(viewmats, dtype=torch.float32),
             "Ks": torch.tensor(Ks, dtype=torch.float32),
