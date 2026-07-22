@@ -38,7 +38,7 @@ import json
 import torch
 from omegaconf import OmegaConf
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 from tqdm import tqdm
 from torchvision.io import write_video
 from einops import rearrange
@@ -239,6 +239,40 @@ def _discover_mind_action_space_samples(root: str):
     ]
 
 
+def _resample_c2w_for_overlay(c2w: np.ndarray, target_frames: int) -> np.ndarray:
+    """Match a camera trajectory to decoded video frames for action overlay.
+
+    Camera LMDB records are stored at Wan's latent-frame rate, whereas the
+    generated video is decoded at the original frame rate.  Interpolate
+    translation and SLERP rotation so short actions remain visible throughout
+    the overlay instead of freezing after the final latent pose.
+    """
+    poses = np.asarray(c2w, dtype=np.float32)
+    target_frames = int(target_frames)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError(f"Expected c2w shape (T,4,4), got {poses.shape}")
+    if target_frames <= 0:
+        raise ValueError(f"target_frames must be positive, got {target_frames}")
+    if len(poses) == target_frames:
+        return poses
+    if len(poses) == 1:
+        return np.repeat(poses, target_frames, axis=0)
+
+    source_t = np.arange(len(poses), dtype=np.float64)
+    target_t = np.linspace(0.0, float(len(poses) - 1), target_frames)
+    translations = np.stack([
+        np.interp(target_t, source_t, poses[:, axis, 3])
+        for axis in range(3)
+    ], axis=1)
+    rotations = Slerp(
+        source_t, Rotation.from_matrix(poses[:, :3, :3])
+    )(target_t).as_matrix()
+    result = np.tile(np.eye(4, dtype=np.float32), (target_frames, 1, 1))
+    result[:, :3, :3] = rotations.astype(np.float32)
+    result[:, :3, 3] = translations.astype(np.float32)
+    return result
+
+
 class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
     """MIND action-space test data adapted to inference.py's I2V contract."""
 
@@ -308,6 +342,10 @@ class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
                 "prompt": str(sample["caption"] or default_caption),
                 "viewmats": torch.from_numpy(viewmats),
                 "Ks": torch.from_numpy(Ks),
+                # Keep the native-rate action integration for a responsive
+                # WASD/joystick overlay; camera tensors above remain sampled
+                # at latent rate for model conditioning.
+                "raw_c2w": torch.from_numpy(raw_c2w),
             })
             if max_samples > 0 and len(self.samples) >= max_samples:
                 break
@@ -340,6 +378,7 @@ class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
             "prompts": sample["prompt"],
             "viewmats": sample["viewmats"],
             "Ks": sample["Ks"],
+            "raw_c2w": sample["raw_c2w"],
         }
 
 
@@ -360,6 +399,8 @@ def camera_lmdb_i2v_collate_fn(batch):
         result["clean_latent"] = item["clean_latent"].unsqueeze(0)
     else:
         result["image"] = item["image"].unsqueeze(0)
+    if "raw_c2w" in item:
+        result["raw_c2w"] = item["raw_c2w"].unsqueeze(0)
     return result
 
 
@@ -1407,8 +1448,22 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             lmdb_Ks = lmdb_Ks.repeat(config.num_samples, 1, 1, 1)
         inference_kwargs["viewmats"] = lmdb_viewmats
         inference_kwargs["Ks"] = lmdb_Ks
-        if action_overlay and local_rank == 0:
-            print("[inference] action_overlay is unavailable for LMDB camera inputs.")
+        if action_overlay:
+            if "raw_c2w" in batch:
+                # Raw MIND datasets retain the source action integration at
+                # decoded-frame rate, preserving short button presses.
+                camera_c2w = batch["raw_c2w"].cpu().numpy()
+            else:
+                # Encoded LMDB stores normalized w2c viewmats on the latent
+                # grid. Invert them, then resample before drawing below.
+                camera_c2w = np.linalg.inv(
+                    batch["viewmats"][:, :config.num_output_frames]
+                    .cpu().numpy()
+                ).astype(np.float32)
+            raw_c2w_per_sample = [
+                camera_c2w[min(sample_idx, len(camera_c2w) - 1)]
+                for sample_idx in range(config.num_samples)
+            ]
 
     with torch.inference_mode():
         generated = pipeline.inference(**inference_kwargs)
@@ -1466,8 +1521,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                     from utils.action_overlay import apply_overlay
                     _vid = video[seed_idx]  # (T, H, W, C) float [0, 255]
                     _vid_thwc = _vid.clamp(0, 255).to(torch.uint8).cpu().numpy()
+                    _overlay_c2w = _resample_c2w_for_overlay(
+                        raw_c2w_per_sample[seed_idx],
+                        target_frames=int(_vid_thwc.shape[0]),
+                    )
                     _vid_thwc = apply_overlay(
-                        _vid_thwc, raw_c2w_per_sample[seed_idx],
+                        _vid_thwc, _overlay_c2w,
                         corner=overlay_corner,
                     )
                     video[seed_idx] = torch.from_numpy(_vid_thwc).to(_vid.device).float()
