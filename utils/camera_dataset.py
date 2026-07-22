@@ -94,14 +94,20 @@ class CameraLatentLMDBDataset(Dataset):
         max_pair: int = int(1e8),
         target_num_frames: Optional[int] = None,
         expected_latent_shape: Optional[Tuple[int, int, int]] = None,
+        skip_short_lmdb: bool = False,
     ):
         """Create a camera-LMDB dataset with optional prefix time cropping.
 
         Temporal cropping is applied identically to VAE latents and camera
         poses. Spatial/channel changes are rejected: they require VAE
-        re-encoding rather than resizing stored latents.
+        re-encoding rather than resizing stored latents.  When
+        ``skip_short_lmdb`` is set, an LMDB (or a shard in a shard directory)
+        with fewer than ``target_num_frames`` is excluded instead of aborting
+        dataset construction.
         """
         self.max_pair = max_pair
+        self.skip_short_lmdb = bool(skip_short_lmdb)
+        self.skipped_short_lmdbs = []  # (path, available latent frames)
         self.target_num_frames = (
             None if target_num_frames is None else int(target_num_frames)
         )
@@ -127,9 +133,17 @@ class CameraLatentLMDBDataset(Dataset):
             self.latents_shape = _get_array_shape(self.env, "latents")
             self.intrinsics_shape = _get_array_shape(self.env, "intrinsics")
             self.poses_shape = _get_array_shape(self.env, "poses")
-            self._validate_storage_shapes(
+            latent_frames = self._validate_storage_shapes(
                 self.latents_shape, self.poses_shape, data_path
             )
+            if self._exclude_short_lmdb(data_path, latent_frames):
+                # Keep this object valid but empty so a mixed list of source
+                # datasets can simply concatenate it with the valid sources.
+                self.env.close()
+                self.env = None
+                self._empty = True
+            else:
+                self._empty = False
             return
 
         # ---- Sharded path ----
@@ -147,18 +161,37 @@ class CameraLatentLMDBDataset(Dataset):
                 continue
             env = lmdb.open(sub, readonly=True, lock=False,
                             readahead=False, meminit=False)
-            sid = len(self.envs)
-            self.envs.append(env)
             ls = _get_array_shape(env, "latents")
             ps = _get_array_shape(env, "poses")
-            self._validate_storage_shapes(ls, ps, sub)
+            latent_frames = self._validate_storage_shapes(ls, ps, sub)
+            if self._exclude_short_lmdb(sub, latent_frames):
+                env.close()
+                continue
+            sid = len(self.envs)
+            self.envs.append(env)
             self._latents_shapes.append(ls)
             self._intrinsics_shapes.append(_get_array_shape(env, "intrinsics"))
             self._poses_shapes.append(ps)
             for j in range(ls[0]):
                 self.index.append((sid, j))
 
-    def _validate_storage_shapes(self, latents_shape, poses_shape, source: str):
+    def _exclude_short_lmdb(self, source: str, latent_frames: int) -> bool:
+        """Return whether a valid-but-short LMDB should be excluded."""
+        if (
+            self.target_num_frames is None
+            or latent_frames >= self.target_num_frames
+        ):
+            return False
+        if not self.skip_short_lmdb:
+            raise ValueError(
+                f"Camera LMDB at {source} has {latent_frames} frames, but config "
+                f"requests {self.target_num_frames}. Padding is not supported. "
+                "Set skip_short_lmdb=True to exclude this LMDB."
+            )
+        self.skipped_short_lmdbs.append((source, latent_frames))
+        return True
+
+    def _validate_storage_shapes(self, latents_shape, poses_shape, source: str) -> int:
         """Validate temporal cropping without hiding latent/pose mismatches."""
         if latents_shape is None or poses_shape is None:
             raise ValueError(f"Camera LMDB at {source} is missing latent or pose shape metadata.")
@@ -197,15 +230,13 @@ class CameraLatentLMDBDataset(Dataset):
                 f"but config requests {self.expected_latent_shape}. Only temporal "
                 "cropping is supported; re-encode the videos for a new resolution."
             )
-        if self.target_num_frames is not None and self.target_num_frames > latent_frames:
-            raise ValueError(
-                f"Camera LMDB at {source} has {latent_frames} frames, but config "
-                f"requests {self.target_num_frames}. Padding is not supported."
-            )
+        return latent_frames
 
     def __len__(self):
         if self._sharded:
             return min(len(self.index), self.max_pair)
+        if self._empty:
+            return 0
         return min(self.latents_shape[0], self.max_pair)
 
     def __getitem__(self, idx):

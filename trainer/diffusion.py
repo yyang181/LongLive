@@ -894,6 +894,10 @@ class Trainer:
                     max_pair=int(1e8),
                     target_num_frames=int(configured_shape[1]),
                     expected_latent_shape=tuple(int(v) for v in configured_shape[2:]),
+                    # Short sources/shards have no usable fixed-length crop.
+                    # Leave them out instead of making every rank fail during
+                    # dataset construction.
+                    skip_short_lmdb=getattr(config, "skip_short_lmdb", True),
                 )
                 for data_path in data_paths
             ]
@@ -907,6 +911,21 @@ class Trainer:
                 print(f"[DiffusionTrainer] using {len(component_datasets)} CameraLatentLMDBDataset "
                       f"source(s), base_size={len(base_dataset)}, "
                       f"target_frames={configured_shape[1]}")
+                skipped_short_lmdbs = [
+                    item
+                    for component in component_datasets
+                    for item in component.skipped_short_lmdbs
+                ]
+                if skipped_short_lmdbs:
+                    print("[CameraLMDB] skipped short source/shard(s): " + ", ".join(
+                        f"{path} ({frames} < {configured_shape[1]} frames)"
+                        for path, frames in skipped_short_lmdbs
+                    ))
+            if len(base_dataset) == 0:
+                raise ValueError(
+                    "No Camera LMDB samples remain after excluding sources shorter "
+                    f"than target_num_frames={configured_shape[1]}."
+                )
         else:
             if len(data_paths) != 1:
                 raise ValueError(
