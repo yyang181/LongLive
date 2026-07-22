@@ -50,7 +50,7 @@ data:
   image_or_video_shape: [1, 140, 48, 44, 80]
 
 inference:
-  sampling_steps: 50
+  sampling_steps: 4
   sink_size: 4
   guidance_scale: 3.0
   multi_shot_sink: false
