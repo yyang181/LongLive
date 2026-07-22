@@ -274,6 +274,9 @@ class Trainer:
                 sp_dit_causal_forward_train,
                 sp_causal_attn_forward,
             )
+            from wan_5b.distributed.sequence_parallel_camera import (
+                sp_dreamx_camera_attn_forward,
+            )
             model = self.model.generator.model
             # Use the SP forward implementation in the training path.
             model._forward_train = types.MethodType(sp_dit_causal_forward_train, model)
@@ -281,16 +284,36 @@ class Trainer:
             # Keep the original self_attn.forward so inference can temporarily
             # disable SP.
             self._sp_attn_blocks = []
+            self._sp_cam_attn_blocks = []
             for block in model.blocks:
                 sa = block.self_attn
                 if not hasattr(sa, "_orig_forward"):
                     sa._orig_forward = sa.forward
                 sa.forward = types.MethodType(sp_causal_attn_forward, sa)
                 self._sp_attn_blocks.append(sa)
+                cam_sa = getattr(block, "cam_self_attn", None)
+                if cam_sa is not None:
+                    if cam_sa.num_heads % sp_size != 0:
+                        raise ValueError(
+                            f"DreamX cam_self_attn num_heads ({cam_sa.num_heads}) "
+                            f"must be divisible by sequence_parallel_size "
+                            f"({sp_size})."
+                        )
+                    if not hasattr(cam_sa, "_orig_forward"):
+                        cam_sa._orig_forward = cam_sa.forward
+                    cam_sa.forward = types.MethodType(
+                        sp_dreamx_camera_attn_forward, cam_sa
+                    )
+                    self._sp_cam_attn_blocks.append(cam_sa)
 
             if self.is_main_process:
                 print("[SP] sp_dit_causal_forward_train and sp_causal_attn_forward are enabled")
                 print("[SP] natural TF layout is the default training layout")
+                if self._sp_cam_attn_blocks:
+                    print(
+                        "[SP][E-PRoPE] balanced cam_self_attn enabled on "
+                        f"{len(self._sp_cam_attn_blocks)} blocks"
+                    )
                 if getattr(config, "load_raw_video", False):
                     print(f"[SP-VAE] chunk-halo VAE enabled, halo_latents={self.sp_helper.vae_halo_latents}")
 
@@ -1859,6 +1882,9 @@ class Trainer:
         # Lazy import to avoid failures under non-5B configurations.
         try:
             from wan_5b.distributed.sequence_parallel import sp_causal_attn_forward
+            from wan_5b.distributed.sequence_parallel_camera import (
+                sp_dreamx_camera_attn_forward,
+            )
         except Exception:
             return
 
@@ -1869,6 +1895,16 @@ class Trainer:
                 sa.forward = types.MethodType(sp_causal_attn_forward, sa)
             else:
                 sa.forward = sa._orig_forward
+
+        for cam_sa in getattr(self, "_sp_cam_attn_blocks", []):
+            if not hasattr(cam_sa, "_orig_forward"):
+                continue
+            if enabled:
+                cam_sa.forward = types.MethodType(
+                    sp_dreamx_camera_attn_forward, cam_sa
+                )
+            else:
+                cam_sa.forward = cam_sa._orig_forward
 
     @torch.no_grad()
     def _swap_ema_weights(self):

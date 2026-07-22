@@ -5,6 +5,12 @@
 # DreamX-camera checkpoint can be used as the initialization for AR training.
 
 infra:
+  # SP=1 preserves the original DreamX path.  Set this to >1 to enable
+  # Balanced SP for both the RoPE backbone and E-PRoPE cam_self_attn.  The
+  # latent frame count must be divisible by
+  # sequence_parallel_size * num_frame_per_block, and both backbone/camera
+  # head counts must be divisible by sequence_parallel_size.  Example:
+  # 128 latent frames, num_frame_per_block=4, sequence_parallel_size=8.
   sequence_parallel_size: 1
   sharding_strategy: hybrid_full
   mixed_precision: true

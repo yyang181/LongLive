@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sequence-parallel (Ulysses) self-attention for the camera-PRoPE
-bidirectional Wan2.2-TI2V-5B trainer.
+"""Sequence-parallel (Ulysses) attention for camera-conditioned Wan.
 
 Why this exists
 ---------------
@@ -42,12 +41,27 @@ Both attention residuals run through the same distributed attention:
 
 The patched attention is also a no-op-correct fallback when ``sp_size == 1``
 (``all_to_all`` short-circuits and ``full_seq_lens == seq_lens``).
+
+DreamX E-PRoPE
+---------------
+DreamX adds a separate ``cam_self_attn`` branch instead of reusing the
+backbone Q/K/V.  :func:`sp_dreamx_camera_attn_forward` gives that branch the
+same Ulysses treatment.  PRoPE is applied to each rank's local camera frames
+before all-to-all and inverted after the return all-to-all.  For causal
+teacher forcing, the local ``[clean, noisy]`` layout is intentionally left
+unchanged: all-to-all then produces the natural balanced-SP layout
+``[r0 clean, r0 noisy, r1 clean, r1 noisy, ...]`` expected by the shared
+global block mask.
 """
 
 import torch
 
 from ..modules.attention import flash_attention
-from .sp_training import all_to_all_with_grad, get_sp_world_size
+from .sp_training import (
+    all_to_all_with_grad,
+    distributed_flex_attention,
+    get_sp_world_size,
+)
 from .sequence_parallel import sp_rope_apply
 
 
@@ -132,3 +146,117 @@ def sp_camera_attn_forward(self, x, seq_lens, grid_sizes, freqs, prope_meta=None
         out = out + self.prope_o(x_prope)
 
     return out
+
+
+def sp_dreamx_camera_attn_forward(
+    self,
+    x,
+    cam_emb,
+    seq_lens=None,
+    block_mask=None,
+):
+    """Balanced-SP forward for DreamX ``PropeSelfAttention``.
+
+    ``x`` and ``cam_emb`` contain only the frames owned by the current SP
+    rank.  The function keeps PRoPE's camera-dependent transforms local while
+    making the actual attention global with an autograd-safe Ulysses
+    all-to-all.  ``block_mask=None`` is the bidirectional SFT path; a block
+    mask selects the causal AR path.
+
+    This function is monkey-patched only when ``sequence_parallel_size > 1``;
+    the original DreamX implementation remains untouched for SP=1.
+    """
+    from ..modules.prope import prope_qkv
+
+    b, s, _ = x.shape
+    n, d = self.num_heads, self.head_dim
+    sp_size = get_sp_world_size()
+    if n % sp_size != 0:
+        raise ValueError(
+            f"DreamX camera num_heads ({n}) must be divisible by "
+            f"sequence_parallel_size ({sp_size})."
+        )
+
+    q = self.norm_q(self.q_proj(x)).view(b, s, n, d)
+    k = self.norm_k(self.k_proj(x)).view(b, s, n, d)
+    v = self.v_proj(x).view(b, s, n, d)
+
+    viewmats = cam_emb["viewmats"]
+    Ks = cam_emb.get("K", cam_emb.get("Ks", None))
+    num_cams = int(viewmats.shape[1])
+    if num_cams <= 0:
+        raise ValueError("SP cam_self_attn received an empty camera sequence")
+
+    if seq_lens is not None:
+        base_seq_len = int(seq_lens[0].item())
+    else:
+        if s % num_cams != 0:
+            raise ValueError(
+                f"SP cam_self_attn sequence length {s} is not divisible by "
+                f"local camera frames {num_cams}."
+            )
+        base_seq_len = s
+    is_teacher_forcing = s == base_seq_len * 2
+
+    def apply_local_prope(q_local, k_local, v_local):
+        qp = q_local.transpose(1, 2).contiguous()
+        kp = k_local.transpose(1, 2).contiguous()
+        vp = v_local.transpose(1, 2).contiguous()
+        if qp.shape[2] % num_cams != 0:
+            raise ValueError(
+                f"SP cam_self_attn tokens {qp.shape[2]} are not divisible by "
+                f"local camera frames {num_cams}."
+            )
+        qp, kp, vp, inverse = prope_qkv(
+            qp,
+            kp,
+            vp,
+            viewmats=viewmats.to(dtype=qp.dtype),
+            Ks=Ks.to(dtype=qp.dtype) if Ks is not None else None,
+        )
+        return (
+            qp.transpose(1, 2).contiguous(),
+            kp.transpose(1, 2).contiguous(),
+            vp.transpose(1, 2).contiguous(),
+            inverse,
+        )
+
+    if is_teacher_forcing:
+        q_clean, q_noisy = q.split(base_seq_len, dim=1)
+        k_clean, k_noisy = k.split(base_seq_len, dim=1)
+        v_clean, v_noisy = v.split(base_seq_len, dim=1)
+        qp_clean, kp_clean, vp_clean, inverse = apply_local_prope(
+            q_clean, k_clean, v_clean
+        )
+        qp_noisy, kp_noisy, vp_noisy, _ = apply_local_prope(
+            q_noisy, k_noisy, v_noisy
+        )
+        qp = torch.cat([qp_clean, qp_noisy], dim=1)
+        kp = torch.cat([kp_clean, kp_noisy], dim=1)
+        vp = torch.cat([vp_clean, vp_noisy], dim=1)
+    else:
+        qp, kp, vp, inverse = apply_local_prope(q, k, v)
+
+    if block_mask is None:
+        full_seq_lens = seq_lens * sp_size if seq_lens is not None else None
+        out = _distributed_attention_with_grad(
+            qp,
+            kp,
+            vp,
+            full_seq_lens,
+            window_size=(-1, -1),
+        )
+    else:
+        # distributed_flex_attention preserves each rank's local
+        # [clean, noisy] ordering across the return all-to-all.
+        out = distributed_flex_attention(qp, kp, vp, block_mask)
+
+    if is_teacher_forcing:
+        out_clean, out_noisy = out.split(base_seq_len, dim=1)
+        out_clean = inverse(out_clean.transpose(1, 2)).transpose(1, 2)
+        out_noisy = inverse(out_noisy.transpose(1, 2)).transpose(1, 2)
+        out = torch.cat([out_clean, out_noisy], dim=1)
+    else:
+        out = inverse(out.transpose(1, 2)).transpose(1, 2)
+
+    return self.out_proj(out.flatten(2))

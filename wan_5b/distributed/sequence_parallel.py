@@ -243,13 +243,6 @@ def sp_dit_causal_forward_train(
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
-    if viewmats is not None:
-        raise NotImplementedError(
-            "DreamX camera EPRoPE causal training under sequence_parallel_size>1 "
-            "needs a distributed cam_self_attn path; use sequence_parallel_size=1 "
-            "until SP camera attention is implemented and validated."
-        )
-
     # Construct the blockwise causal attention mask. Frames are sharded across
     # SP ranks, so total frames = local frames per rank * sp_size.
     sp_size = get_world_size()
@@ -343,6 +336,35 @@ def sp_dit_causal_forward_train(
         e0_clean = self.time_projection(e_clean).unflatten(2, (6, self.dim))
         e0 = torch.cat([e0_clean, e0], dim=1)
 
+    # Camera tensors are already frame-sharded by the trainer.  E-PRoPE is
+    # applied locally before the cam_self_attn all-to-all, so prope_meta keeps
+    # the local (F, H, W) grid here.
+    prope_meta = None
+    if viewmats is not None:
+        viewmats = viewmats.to(device=device)
+        if Ks is not None:
+            Ks = Ks.to(device=device)
+        f_lat = int(grid_sizes[0, 0].item())
+        h_lat = int(grid_sizes[0, 1].item())
+        w_lat = int(grid_sizes[0, 2].item())
+        if viewmats.shape[1] != f_lat:
+            raise ValueError(
+                f"Local viewmats has {viewmats.shape[1]} camera frames but "
+                f"the SP latent grid has {f_lat} frames."
+            )
+        if Ks is not None and Ks.shape[1] != f_lat:
+            raise ValueError(
+                f"Local Ks has {Ks.shape[1]} camera frames but the SP latent "
+                f"grid has {f_lat} frames."
+            )
+        prope_meta = {
+            "viewmats": viewmats,
+            "Ks": Ks,
+            "F": f_lat,
+            "H": h_lat,
+            "W": w_lat,
+        }
+
 
     # arguments
     kwargs = dict(
@@ -358,6 +380,7 @@ def sp_dit_causal_forward_train(
         method=getattr(self, "rope_method", "linear"),
         original_seq_len=getattr(self, "original_seq_len", None),
         temporal_offset=getattr(self, "rope_temporal_offset", 0.0),
+        prope_meta=prope_meta,
     )
 
     def create_custom_forward(module):

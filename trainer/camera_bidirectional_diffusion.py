@@ -181,18 +181,39 @@ class Trainer:
         if self.sequence_parallel_size > 1:
             from wan_5b.distributed.sequence_parallel_camera import (
                 sp_camera_attn_forward,
+                sp_dreamx_camera_attn_forward,
             )
             wan_model = self.model.generator.model
             self._sp_attn_blocks = []
+            self._sp_cam_attn_blocks = []
             for block in wan_model.blocks:
                 sa = block.self_attn
                 if not hasattr(sa, "_orig_forward"):
                     sa._orig_forward = sa.forward
                 sa.forward = types.MethodType(sp_camera_attn_forward, sa)
                 self._sp_attn_blocks.append(sa)
+                cam_sa = getattr(block, "cam_self_attn", None)
+                if cam_sa is not None:
+                    if cam_sa.num_heads % sp_size != 0:
+                        raise ValueError(
+                            f"DreamX cam_self_attn num_heads ({cam_sa.num_heads}) "
+                            f"must be divisible by sequence_parallel_size "
+                            f"({sp_size})."
+                        )
+                    if not hasattr(cam_sa, "_orig_forward"):
+                        cam_sa._orig_forward = cam_sa.forward
+                    cam_sa.forward = types.MethodType(
+                        sp_dreamx_camera_attn_forward, cam_sa
+                    )
+                    self._sp_cam_attn_blocks.append(cam_sa)
             if self.is_main_process:
                 print("[CameraBiDiff][SP] sp_camera_attn_forward enabled on "
                       f"{len(self._sp_attn_blocks)} self-attention blocks")
+                if self._sp_cam_attn_blocks:
+                    print(
+                        "[CameraBiDiff][SP][E-PRoPE] balanced cam_self_attn "
+                        f"enabled on {len(self._sp_cam_attn_blocks)} blocks"
+                    )
 
         # FSDP-wrap the generator (the only trainable module).
         self.model.generator = fsdp_wrap(

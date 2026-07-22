@@ -7,7 +7,8 @@ storages from huge checkpoints. It checks source-level invariants and checkpoint
 metadata that are sufficient to catch the common P0 conversion bugs:
   * camera branch bypasses causal teacher-forcing mask;
   * clean/noisy streams share one camera list without stream-aware splitting;
-  * SP path silently drops camera kwargs;
+  * SP model forward drops camera kwargs or the trainer leaves cam_self_attn
+    on its rank-local implementation;
   * bidirectional checkpoint lacks cam_self_attn keys.
 """
 
@@ -44,6 +45,8 @@ def check_source(repo: Path) -> bool:
     dreamx = _read(repo / "wan_5b/modules/dreamx_camera.py")
     causal = _read(repo / "wan_5b/modules/causal_model.py")
     sp = _read(repo / "wan_5b/distributed/sequence_parallel.py")
+    sp_camera = _read(repo / "wan_5b/distributed/sequence_parallel_camera.py")
+    trainer = _read(repo / "trainer/diffusion.py")
 
     passed = True
     passed &= _ok(
@@ -63,9 +66,18 @@ def check_source(repo: Path) -> bool:
         "viewmats.shape[1] == f_lat" in causal and "Ks.shape[1] == f_lat" in causal,
     )
     passed &= _ok(
-        "SP path explicitly handles camera kwargs",
-        "viewmats=None" in sp and "DreamX camera EPRoPE causal training" in sp,
-        "currently expected to raise until distributed cam_self_attn is implemented",
+        "SP model forward preserves local camera metadata",
+        "prope_meta=prope_meta" in sp and "Local viewmats" in sp,
+    )
+    passed &= _ok(
+        "Balanced-SP EPRoPE attention is implemented",
+        "sp_dreamx_camera_attn_forward" in sp_camera
+        and "distributed_flex_attention" in sp_camera,
+    )
+    passed &= _ok(
+        "SP trainer patches DreamX camera branch",
+        "sp_dreamx_camera_attn_forward" in trainer
+        and "_sp_cam_attn_blocks" in trainer,
     )
     return passed
 
@@ -98,8 +110,11 @@ def check_config(config_path: Path) -> bool:
     passed &= _ok("config causal teacher-forcing", bool(get("causal")) and bool(get("teacher_forcing")))
     passed &= _ok("config I2V independent_first_frame", bool(get("i2v")) and bool(get("independent_first_frame")))
     passed &= _ok("config uses DreamX wrapper", "DreamXCameraWanDiffusionWrapper" in str(model_kwargs.get("wrapper_cls", "")))
-    passed &= _ok("config sequence_parallel_size", int(get("sequence_parallel_size", 1)) == 1,
-                  "SP>1 requires separate distributed EPRoPE implementation")
+    passed &= _ok(
+        "config keeps SP=1 default behavior",
+        int(get("sequence_parallel_size", 1)) == 1,
+        "set SP>1 explicitly for a block-aligned Balanced-SP run",
+    )
     return passed
 
 
