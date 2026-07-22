@@ -406,6 +406,25 @@ class SelfForcingTrainingPipeline:
             block_cache["pinned_start"].fill_(chunk_start)
             block_cache["pinned_len"].fill_(pin_len)
 
+    @staticmethod
+    def _camera_kwargs(viewmats, Ks, start_frame, num_frames):
+        """Slice camera conditioning so it stays aligned with an AR chunk."""
+        if viewmats is None and Ks is None:
+            return {}
+        if viewmats is None or Ks is None:
+            raise ValueError("Camera conditioning requires both viewmats and Ks.")
+        end_frame = start_frame + num_frames
+        if viewmats.shape[1] < end_frame or Ks.shape[1] < end_frame:
+            raise ValueError(
+                "Camera conditioning is shorter than the DMD rollout: "
+                f"need frames [0:{end_frame}], got viewmats={viewmats.shape[1]}, "
+                f"Ks={Ks.shape[1]}."
+            )
+        return {
+            "viewmats": viewmats[:, start_frame:end_frame],
+            "Ks": Ks[:, start_frame:end_frame],
+        }
+
     def _inference_with_trajectory_inner(
             self,
             noise: torch.Tensor,
@@ -418,6 +437,8 @@ class SelfForcingTrainingPipeline:
         from wan_5b.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
         batch_size, num_frames, num_channels, height, width = noise.shape
+        viewmats = conditional_dict.pop("viewmats", None)
+        Ks = conditional_dict.pop("Ks", None)
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         clamp_i2v_first_chunk = self.independent_first_frame and initial_latent is not None
         if clamp_i2v_first_chunk and num_input_frames != 1:
@@ -479,7 +500,8 @@ class SelfForcingTrainingPipeline:
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=current_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(viewmats, Ks, current_start_frame, 1),
                 )
             current_start_frame += 1
 
@@ -571,7 +593,10 @@ class SelfForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            **self._camera_kwargs(
+                                viewmats, Ks, current_start_frame, current_num_frames
+                            ),
                         )
                         latents = sample_scheduler.step(
                             flow_pred, t, latents, return_dict=False)[0]
@@ -589,7 +614,10 @@ class SelfForcingTrainingPipeline:
                                 timestep=timestep,
                                 kv_cache=self.kv_cache1,
                                 crossattn_cache=self.crossattn_cache,
-                                current_start=current_start_frame * self.frame_seq_length
+                                current_start=current_start_frame * self.frame_seq_length,
+                                **self._camera_kwargs(
+                                    viewmats, Ks, current_start_frame, current_num_frames
+                                ),
                             )
                     else:
                         grad_enable_mask[:, current_start_frame:current_start_frame + current_num_frames] = True
@@ -599,7 +627,10 @@ class SelfForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache1,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            **self._camera_kwargs(
+                                viewmats, Ks, current_start_frame, current_num_frames
+                            ),
                         )
                     if first_i2v_block:
                         denoised_pred = _overwrite_i2v_context(
@@ -640,7 +671,10 @@ class SelfForcingTrainingPipeline:
                     timestep=context_timestep,
                     kv_cache=self.kv_cache1,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=current_start_frame * self.frame_seq_length,
+                    **self._camera_kwargs(
+                        viewmats, Ks, current_start_frame, current_num_frames
+                    ),
                 )
 
             # Step 3.3b: pin KV on scene cut for multi-shot sink.

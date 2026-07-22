@@ -7,6 +7,7 @@ from utils.dataset import cycle
 from utils.dataset import (
     MultiVideoConcatDataset, MultiTextConcatDataset, RepeatDataset,
     multi_video_collate_fn, eval_collate_fn, DEFAULT_SCENE_CUT_PREFIX,
+    detect_camera_lmdb_paths, normalize_dataset_paths_and_repeats,
 )
 from utils.config import section_get, wan_default_config
 from utils.distributed import EMA_FSDP, fsdp_wrap, launch_distributed_job
@@ -35,6 +36,16 @@ from pipeline import (
     CausalDiffusionInferencePipeline
 )
 import time
+
+
+def _camera_latent_collate_fn(batch):
+    """Collate pre-encoded camera clips for camera-aware DMD."""
+    return {
+        "clean_latent": torch.stack([item["clean_latent"] for item in batch]),
+        "viewmats": torch.stack([item["viewmats"] for item in batch]),
+        "Ks": torch.stack([item["Ks"] for item in batch]),
+        "prompts": [item["prompts"] for item in batch],
+    }
 
 class Trainer:
     
@@ -240,13 +251,20 @@ class Trainer:
                     if self.is_main_process:
                         print("Critic weights loaded successfully")
                 # Load training step from checkpoint metadata.
-                if isinstance(generator_checkpoint, dict) and "step" in generator_checkpoint:
+                inherit_base_step = getattr(
+                    config, "inherit_base_checkpoint_step", True
+                )
+                if (
+                    inherit_base_step
+                    and isinstance(generator_checkpoint, dict)
+                    and "step" in generator_checkpoint
+                ):
                     self.step = generator_checkpoint["step"]
                     if self.is_main_process:
                         print(f"base_checkpoint step: {self.step}")
                 else:
                     if self.is_main_process:
-                        print("Warning: Step not found in checkpoint, starting from step 0.")
+                        print("Starting DMD optimization from step 0.")
                 del generator_checkpoint
                 gc.collect()
             else:
@@ -273,6 +291,29 @@ class Trainer:
             gc.collect()
             if self.is_main_process:
                 print(f"Successfully loaded real_score from {real_score_ckpt}")
+
+        # Camera DMD uses the AR camera checkpoint as the critic backbone too;
+        # otherwise every cam_self_attn in the fake-score model would start
+        # from a fresh random initialization while the student is conditioned
+        # on a trained camera trajectory.
+        fake_score_ckpt = getattr(config, "fake_score_ckpt", None)
+        if self.is_lora_enabled and fake_score_ckpt:
+            if self.is_main_process:
+                print(f"Loading fake_score base from {fake_score_ckpt}")
+            fake_ckpt = torch.load(fake_score_ckpt, map_location="cpu")
+            if isinstance(fake_ckpt, dict) and "critic" in fake_ckpt:
+                fake_state = fake_ckpt["critic"]
+            elif isinstance(fake_ckpt, dict) and "generator" in fake_ckpt:
+                fake_state = fake_ckpt["generator"]
+            elif isinstance(fake_ckpt, dict) and "model" in fake_ckpt:
+                fake_state = fake_ckpt["model"]
+            else:
+                fake_state = fake_ckpt
+            self.model.fake_score.load_state_dict(fake_state, strict=True)
+            del fake_ckpt, fake_state
+            gc.collect()
+            if self.is_main_process:
+                print(f"Successfully loaded fake_score base from {fake_score_ckpt}")
 
         # Apply LoRA wrapping if enabled (after all base weights are loaded, before FSDP)
         if self.is_lora_enabled:
@@ -404,8 +445,24 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
-        self.model.vae = self.model.vae.to(
-            device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+
+        data_paths, camera_lmdb_flags = detect_camera_lmdb_paths(config.data_path)
+        if any(camera_lmdb_flags) and not all(camera_lmdb_flags):
+            raise ValueError(
+                "All DMD data_path entries must be camera LMDBs when any camera "
+                f"LMDB is used; got {data_paths}."
+            )
+        self.use_camera_lmdb = all(camera_lmdb_flags)
+        vis_interval = section_get(
+            config, "evaluation", "interval", getattr(config, "vis_interval", -1)
+        )
+        # Camera LMDBs already contain Wan latents. A VAE is only needed when
+        # validation decodes samples (or for raw-video/non-camera training).
+        if not self.use_camera_lmdb or vis_interval > 0:
+            self.model.vae = self.model.vae.to(
+                device=self.device,
+                dtype=torch.bfloat16 if config.mixed_precision else torch.float32,
+            )
 
         # Step 3: Set up EMA parameter containers
         rename_param = (
@@ -485,7 +542,44 @@ class Trainer:
             config, "dataset_sample_warning_interval_seconds", 60.0
         )
 
-        if self.use_backward_simulation and not self.config.i2v:
+        if self.use_camera_lmdb:
+            from utils.camera_dataset import CameraLatentLMDBDataset
+
+            configured_shape = list(config.image_or_video_shape)
+            _, dataset_repeats = normalize_dataset_paths_and_repeats(
+                data_paths, getattr(config, "dataset_repeat", None)
+            )
+            components = [
+                CameraLatentLMDBDataset(
+                    path,
+                    max_pair=int(1e8),
+                    target_num_frames=int(configured_shape[1]),
+                    expected_latent_shape=tuple(int(v) for v in configured_shape[2:]),
+                )
+                for path in data_paths
+            ]
+            train_components = [
+                RepeatDataset(component, repeat) if repeat > 1 else component
+                for component, repeat in zip(components, dataset_repeats)
+            ]
+            base_dataset = (
+                components[0]
+                if len(components) == 1
+                else torch.utils.data.ConcatDataset(components)
+            )
+            dataset = (
+                train_components[0]
+                if len(train_components) == 1
+                else torch.utils.data.ConcatDataset(train_components)
+            )
+            collate_fn = _camera_latent_collate_fn
+            if self.is_main_process:
+                print(
+                    "[DMD] camera-aware training with "
+                    f"{len(components)} CameraLatentLMDBDataset source(s), "
+                    f"target_frames={configured_shape[1]}, repeats={dataset_repeats}."
+                )
+        elif self.use_backward_simulation and not self.config.i2v:
             dataset = MultiTextConcatDataset(
                 data_path=config.data_path,
                 num_blocks=num_blocks,
@@ -520,22 +614,25 @@ class Trainer:
             if dist.get_rank() == 0 and single_video_only:
                 print(f"[uniform_prompt] single_video_only enabled: each sample uses one video only")
 
-        base_dataset = dataset
-        dataset_repeat = getattr(config, "dataset_repeat", None)
-        alias_repeat = getattr(config, "repeat_dataset", None)
-        if alias_repeat is None:
-            alias_repeat = getattr(config, "repeat", None)
-        if alias_repeat is not None:
-            if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
-                raise ValueError("Conflicting dataset repeat values")
-            dataset_repeat = alias_repeat
-        if dataset_repeat is None:
-            dataset_repeat = 1
-        dataset_repeat = int(dataset_repeat)
-        if dataset_repeat < 1:
-            raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
-        if dataset_repeat > 1:
-            dataset = RepeatDataset(base_dataset, dataset_repeat)
+        if not self.use_camera_lmdb:
+            base_dataset = dataset
+            dataset_repeat = getattr(config, "dataset_repeat", None)
+            alias_repeat = getattr(config, "repeat_dataset", None)
+            if alias_repeat is None:
+                alias_repeat = getattr(config, "repeat", None)
+            if alias_repeat is not None:
+                if dataset_repeat not in (None, 1) and int(dataset_repeat) != int(alias_repeat):
+                    raise ValueError("Conflicting dataset repeat values")
+                dataset_repeat = alias_repeat
+            if dataset_repeat is None:
+                dataset_repeat = 1
+            dataset_repeat = int(dataset_repeat)
+            if dataset_repeat < 1:
+                raise ValueError(f"dataset_repeat must be >= 1, got {dataset_repeat}.")
+            if dataset_repeat > 1:
+                dataset = RepeatDataset(base_dataset, dataset_repeat)
+        else:
+            dataset_repeat = dataset_repeats
 
         sampler = build_training_sampler(dataset, seed=config.seed)
         dataloader = torch.utils.data.DataLoader(
@@ -545,7 +642,12 @@ class Trainer:
         )
 
         if dist.get_rank() == 0:
-            if dataset_repeat > 1:
+            if self.use_camera_lmdb:
+                print(
+                    f"DATASET SIZE {len(dataset)} (base_size={len(base_dataset)}, "
+                    f"repeats={dataset_repeat})"
+                )
+            elif dataset_repeat > 1:
                 print(f"DATASET SIZE {len(dataset)} (base_size={len(base_dataset)}, repeat={dataset_repeat})")
             else:
                 print("DATASET SIZE %d" % len(dataset))
@@ -1023,6 +1125,17 @@ class Trainer:
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
 
+        if self.use_camera_lmdb:
+            num_prompt_blocks = (
+                int(self.config.image_or_video_shape[1])
+                // int(self.config.num_frame_per_block)
+            )
+            # Camera LMDB stores one caption per clip; causal DMD expects one
+            # prompt embedding per AR block, so repeat that caption per block.
+            text_prompts = [
+                [prompt] * num_prompt_blocks for prompt in text_prompts
+            ]
+
         if getattr(self.config, "uniform_prompt", False):
             text_prompts = [[sample[0]] * len(sample) for sample in text_prompts]
 
@@ -1033,7 +1146,25 @@ class Trainer:
         # Step 1.5: Prepare clean_latent and initial_latent for off-policy mode
         clean_latent = None
         initial_latent = None
-        if not self.use_backward_simulation:
+        viewmats = None
+        Ks = None
+        if self.use_camera_lmdb:
+            camera_clean_latent = batch["clean_latent"].to(
+                device=self.device, dtype=self.dtype
+            )
+            viewmats = batch["viewmats"].to(device=self.device, dtype=self.dtype)
+            Ks = batch["Ks"].to(device=self.device, dtype=self.dtype)
+            if camera_clean_latent.shape[1] != image_or_video_shape[1]:
+                raise ValueError(
+                    "Camera latent window does not match DMD rollout length: "
+                    f"{camera_clean_latent.shape[1]} vs {image_or_video_shape[1]}."
+                )
+            # I2V conditioning replaces frame 0 in the rollout; it is not
+            # prepended as an extra latent frame.
+            initial_latent = camera_clean_latent[:, :1]
+            if not self.use_backward_simulation:
+                clean_latent = camera_clean_latent
+        elif not self.use_backward_simulation:
             if not getattr(self.config, "load_raw_video", False):
                 clean_latent = batch["ode_latent"][:, -1].to(
                     device=self.device, dtype=self.dtype)
@@ -1098,7 +1229,9 @@ class Trainer:
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=initial_latent
+                initial_latent=initial_latent,
+                viewmats=viewmats,
+                Ks=Ks,
             )
 
             # Scale loss for gradient accumulation and backward
@@ -1116,7 +1249,9 @@ class Trainer:
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             clean_latent=clean_latent,
-            initial_latent=initial_latent
+            initial_latent=initial_latent,
+            viewmats=viewmats,
+            Ks=Ks,
         )
 
         # Scale loss for gradient accumulation and backward

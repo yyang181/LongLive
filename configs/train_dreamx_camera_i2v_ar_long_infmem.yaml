@@ -97,10 +97,10 @@ training:
   # receives flow supervision at every denoising step, and recaches the final
   # solver latent. This is approximately sampling_steps times more expensive
   # than the default random single-step objective.
-  streaming_multistep_supervision: false
+  streaming_multistep_supervision: true
   # null reuses inference.sampling_steps below; set an integer for a cheaper
   # training-only rollout without changing evaluation/inference settings.
-  streaming_multistep_sampling_steps: null
+  streaming_multistep_sampling_steps: 4
 
   context_noise: 0
   infmem_strict_update: true

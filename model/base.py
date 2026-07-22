@@ -13,6 +13,25 @@ from utils.loss import get_denoising_loss
 from utils.wan_5b_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def _build_diffusion_wrapper(model_kwargs, *, is_causal):
+    """Build a diffusion wrapper, honoring the same dotted-path override as inference."""
+    model_kwargs = dict(model_kwargs or {})
+    wrapper_path = model_kwargs.pop("wrapper_cls", None)
+    if wrapper_path is None:
+        wrapper_cls = WanDiffusionWrapper
+    else:
+        import importlib
+
+        module_name, _, cls_name = str(wrapper_path).rpartition(".")
+        if not module_name or not cls_name:
+            raise ValueError(
+                "model_kwargs.wrapper_cls must be a fully-qualified dotted "
+                f"path, got {wrapper_path!r}."
+            )
+        wrapper_cls = getattr(importlib.import_module(module_name), cls_name)
+    return wrapper_cls(**model_kwargs, is_causal=is_causal)
+
+
 def build_default_denoising_step_list(sampling_steps, num_train_timesteps=1000, shift=1.0, include_zero=True):
     sigmas = torch.linspace(1.0, 0.0, int(sampling_steps) + 1, dtype=torch.float32)[:-1]
     sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
@@ -68,17 +87,23 @@ class BaseModel(nn.Module):
 
         # Generator
         generator_is_causal = getattr(args, "generator_is_causal", True)
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=generator_is_causal)
+        self.generator = _build_diffusion_wrapper(
+            getattr(args, "model_kwargs", {}), is_causal=generator_is_causal
+        )
         self.generator.model.requires_grad_(True)
 
         # Real Score
         real_kwargs = getattr(args, "real_model_kwargs", {"model_name": self.real_model_name})
-        self.real_score = WanDiffusionWrapper(**real_kwargs, is_causal=score_is_causal)
+        self.real_score = _build_diffusion_wrapper(
+            real_kwargs, is_causal=score_is_causal
+        )
         self.real_score.model.requires_grad_(False)
 
         # Fake Score
         fake_kwargs = getattr(args, "fake_model_kwargs", {"model_name": self.fake_model_name})
-        self.fake_score = WanDiffusionWrapper(**fake_kwargs, is_causal=score_is_causal)
+        self.fake_score = _build_diffusion_wrapper(
+            fake_kwargs, is_causal=score_is_causal
+        )
         self.fake_score.model.requires_grad_(True)
 
         # Text Encoder & VAE
@@ -154,6 +179,8 @@ class SelfForcingModel(BaseModel):
         slice_last_frames: int = 21,
         noise=None,
         clean_latent: torch.Tensor = None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Optionally simulate the generator's input from noise using backward simulation
@@ -180,6 +207,8 @@ class SelfForcingModel(BaseModel):
                 initial_latent=initial_latent,
                 slice_last_frames=slice_last_frames,
                 noise=noise,
+                viewmats=viewmats,
+                Ks=Ks,
             )
         else:
             assert clean_latent is not None, "clean_latent is required when backward_simulation=False"
@@ -188,6 +217,8 @@ class SelfForcingModel(BaseModel):
                 conditional_dict=conditional_dict,
                 clean_latent=clean_latent,
                 initial_latent=initial_latent,
+                viewmats=viewmats,
+                Ks=Ks,
             )
 
     def _run_generator_off_policy(
@@ -196,6 +227,8 @@ class SelfForcingModel(BaseModel):
         conditional_dict: dict,
         clean_latent: torch.Tensor,
         initial_latent: torch.Tensor = None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """
         Off-policy generator: add noise to clean_latent at each timestep in
@@ -272,6 +305,8 @@ class SelfForcingModel(BaseModel):
             conditional_dict=conditional_dict,
             timestep=timestep.float(),
             clean_x=clean_latent if getattr(self.args, "teacher_forcing", False) else None,
+            viewmats=viewmats,
+            Ks=Ks,
         )
         pred_x0 = pred_x0.to(self.dtype)
 
@@ -301,6 +336,8 @@ class SelfForcingModel(BaseModel):
         initial_latent: torch.tensor = None,
         slice_last_frames: int = 21,
         noise=None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         On-policy generator via backward simulation (original path).
@@ -328,10 +365,19 @@ class SelfForcingModel(BaseModel):
             noise = noise[:, :num_generated_frames]
         else:
             noise = torch.randn(noise_shape, device=self.device, dtype=self.dtype)
+
+        # Backward simulation may randomly choose a shorter rollout. Camera
+        # tensors must describe exactly the frames presented to the student.
+        if viewmats is not None:
+            viewmats = viewmats[:, :num_generated_frames]
+        if Ks is not None:
+            Ks = Ks[:, :num_generated_frames]
         
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=noise,
             slice_last_frames=slice_last_frames,
+            viewmats=viewmats,
+            Ks=Ks,
             **conditional_dict,
         )
 

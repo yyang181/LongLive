@@ -1,0 +1,100 @@
+# Stage 2: DreamX Camera causal I2V DMD distillation.
+# Initialize this config from the Stage-1 camera AR checkpoint. The same
+# camera-aware causal architecture is used by the student, teacher and critic.
+
+infra:
+  sharding_strategy: hybrid_full
+  mixed_precision: true
+  gradient_checkpointing: true
+  generator_fsdp_wrap_strategy: size
+  real_score_fsdp_wrap_strategy: size
+  fake_score_fsdp_wrap_strategy: size
+  text_encoder_fsdp_wrap_strategy: size
+
+model_kwargs:
+  wrapper_cls: utils.dreamx_camera_wrapper.DreamXCameraWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+  local_attn_size: -1
+  attn_compress: 1
+  qk_norm: true
+
+checkpoints:
+  # Required: override with the Stage-1 camera AR checkpoint.
+  generator_ckpt: null
+  # Keep teacher and critic camera branches aligned with that same AR base.
+  real_score_ckpt: ${checkpoints.generator_ckpt}
+  fake_score_ckpt: ${checkpoints.generator_ckpt}
+
+algorithm:
+  trainer: score_distillation
+  distribution_loss: dmd
+  i2v: true
+  use_camera: true
+  all_causal: true
+  backward_simulation: true
+  # generator_ckpt initializes Stage 2; it is not a DMD resume checkpoint.
+  inherit_base_checkpoint_step: false
+  teacher_forcing: false
+  independent_first_frame: true
+  ts_schedule: false
+  real_guidance_scale: 3.0
+  fake_guidance_scale: 0.0
+
+training:
+  lr: 1.0e-05
+  lr_critic: 2.0e-06
+  weight_decay: 0.0
+  beta1: 0.0
+  beta2: 0.999
+  beta1_critic: 0.0
+  beta2_critic: 0.999
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  ema_weight: 0.99
+  ema_start_step: 200
+  log_iters: 50
+  max_checkpoints: 3
+  max_iters: 5000
+  gc_interval: 100
+  dfake_gen_update_ratio: 5
+  min_num_training_frames: 20
+  num_training_frames: 20
+  slice_last_frames: 20
+
+data:
+  data_path:
+  - data/train/minWM-data/data
+  - data/train/MIND/data_f149_h44_w80
+  - data/train/p2pfull/data_f149_h44_w80
+  dataset_repeat: [1, 100, 1]
+  image_or_video_shape: [1, 20, 48, 44, 80]
+  load_raw_video: false
+
+inference:
+  sampling_steps: 4
+  sink_size: 0
+  multi_shot_rope_offset: 8
+  independent_first_frame: true
+
+evaluation:
+  interval: 0
+  num_frames: 20
+  use_ema: false
+  val_batch_size: 1
+  save_latents_only: true
+
+adapter:
+  type: lora
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  apply_to_critic: true
+  verbose: true
+
+logging:
+  seed: 0
+  wandb_key: null
+  wandb_entity: null
+  wandb_project: LongLive-DreamXCamera-I2V-DMD

@@ -80,7 +80,9 @@ class DMD(SelfForcingModel):
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
         normalization: bool = True,
-        clean_x: Optional[torch.Tensor] = None
+        clean_x: Optional[torch.Tensor] = None,
+        viewmats: Optional[torch.Tensor] = None,
+        Ks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -100,7 +102,9 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep,
-            clean_x=clean_x
+            clean_x=clean_x,
+            viewmats=viewmats,
+            Ks=Ks,
         )
 
         if self.fake_guidance_scale != 0.0:
@@ -108,7 +112,9 @@ class DMD(SelfForcingModel):
                 noisy_image_or_video=noisy_image_or_video,
                 conditional_dict=unconditional_dict,
                 timestep=timestep,
-                clean_x=clean_x
+                clean_x=clean_x,
+                viewmats=viewmats,
+                Ks=Ks,
             )
             pred_fake_image = pred_fake_image_cond + (
                 pred_fake_image_cond - pred_fake_image_uncond
@@ -121,14 +127,18 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep,
-            clean_x=clean_x
+            clean_x=clean_x,
+            viewmats=viewmats,
+            Ks=Ks,
         )
 
         _, pred_real_image_uncond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=unconditional_dict,
             timestep=timestep,
-            clean_x=clean_x
+            clean_x=clean_x,
+            viewmats=viewmats,
+            Ks=Ks,
         )
 
         pred_real_image = pred_real_image_cond + (
@@ -188,6 +198,8 @@ class DMD(SelfForcingModel):
         denoised_timestep_to: int = 0,
         clean_x: Optional[torch.Tensor] = None,
         initial_latent: Optional[torch.Tensor] = None,
+        viewmats: Optional[torch.Tensor] = None,
+        Ks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -251,7 +263,9 @@ class DMD(SelfForcingModel):
                 timestep=timestep,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
-                clean_x=clean_x
+                clean_x=clean_x,
+                viewmats=viewmats,
+                Ks=Ks,
             )
 
         context_mask = _i2v_loss_mask_like(original_latent, context_frames)
@@ -272,7 +286,9 @@ class DMD(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -301,7 +317,9 @@ class DMD(SelfForcingModel):
             initial_latent=initial_latent,
             slice_last_frames=slice_last_frames,
             noise=sampled_noise,
-            clean_latent=clean_latent
+            clean_latent=clean_latent,
+            viewmats=viewmats,
+            Ks=Ks,
         )
         gen_time = time.time() - _t_gen_start
         # Step 2: Compute the DMD loss
@@ -319,6 +337,10 @@ class DMD(SelfForcingModel):
             _new_segs = 1
         conditional_dict = self._slice_block_cond_dict(conditional_dict, _bs, _new_segs)
         unconditional_dict = self._slice_block_cond_dict(unconditional_dict, _bs, _new_segs)
+        score_viewmats = (
+            viewmats[:, -pred_image.shape[1]:] if viewmats is not None else None
+        )
+        score_Ks = Ks[:, -pred_image.shape[1]:] if Ks is not None else None
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
             conditional_dict=conditional_dict,
@@ -328,6 +350,8 @@ class DMD(SelfForcingModel):
             denoised_timestep_to=denoised_timestep_to,
             clean_x=score_clean_x,
             initial_latent=initial_latent if pred_image.shape[1] == image_or_video_shape[1] else None,
+            viewmats=score_viewmats,
+            Ks=score_Ks,
         )
         try:
             loss_val = dmd_loss.item()
@@ -348,7 +372,9 @@ class DMD(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        viewmats: torch.Tensor = None,
+        Ks: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and train the critic with generated samples.
@@ -378,7 +404,9 @@ class DMD(SelfForcingModel):
                 initial_latent=initial_latent,
                 slice_last_frames=slice_last_frames,
                 noise=sampled_noise,
-                clean_latent=clean_latent
+                clean_latent=clean_latent,
+                viewmats=viewmats,
+                Ks=Ks,
             )
         gen_time = time.time() - _t_gen_start
         score_initial_latent = (
@@ -388,6 +416,8 @@ class DMD(SelfForcingModel):
         )
         context_frames = _get_i2v_context_frames(generated_image, score_initial_latent)
         batch_size, num_frame = generated_image.shape[:2]
+        score_viewmats = viewmats[:, -num_frame:] if viewmats is not None else None
+        score_Ks = Ks[:, -num_frame:] if Ks is not None else None
 
         _new_segs = num_frame // self.num_frame_per_block
         if not getattr(self.args, "generator_is_causal", True):
@@ -444,7 +474,9 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=conditional_dict,
             timestep=critic_timestep,
-            clean_x=score_clean_x
+            clean_x=score_clean_x,
+            viewmats=score_viewmats,
+            Ks=score_Ks,
         )
 
         # Step 3: Compute the denoising loss for the fake critic

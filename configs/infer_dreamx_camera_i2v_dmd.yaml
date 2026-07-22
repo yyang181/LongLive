@@ -1,0 +1,62 @@
+# Inference for the LoRA student produced by
+# configs/train_dreamx_camera_i2v_dmd.yaml.
+
+model_kwargs:
+  wrapper_cls: utils.dreamx_camera_wrapper.DreamXCameraWanDiffusionWrapper
+  model_name: Wan2.2-TI2V-5B
+  timestep_shift: 5.0
+  num_frame_per_block: 4
+  local_attn_size: 32
+  sink_size: 4
+  attn_compress: 1
+  qk_norm: true
+
+algorithm:
+  causal: true
+  i2v: true
+  independent_first_frame: true
+  use_camera: true
+
+use_ema: false
+output_folder: videos/dreamx_camera_i2v_dmd
+num_samples: 1
+save_latents_only: false
+save_with_index: true
+
+data:
+  data_path: (unused; three-file i2v mode)
+  image_or_video_shape: [1, 128, 48, 44, 80]
+
+inference:
+  sampling_steps: 4
+  sink_size: 4
+  guidance_scale: 3.0
+  multi_shot_sink: true
+  multi_shot_rope_offset: 8
+  independent_first_frame: true
+  streaming_vae: false
+  async_vae: false
+  vae_type: wan
+  vae_device: "cuda:0"
+  trajectory_format: sana_dsl
+  prompt_path: prompts/prompts.txt
+  trajectory_path: prompts/trajectories_complex.txt
+  image_path: prompts/images.txt
+  action_overlay: true
+  overlay_corner: bottom-left
+
+checkpoints:
+  # Immutable Stage-1 camera AR base used to start DMD training.
+  generator_ckpt: logs/train_dreamx_camera_i2v_ar_all_b300/checkpoint_model_001930/model.pt
+  # LoRA-only checkpoint emitted by Stage-2 DMD training.
+  lora_ckpt: logs/train_dreamx_camera_i2v_dmd_all_b300/checkpoint_model_005000/model.pt
+
+adapter:
+  type: lora
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  verbose: false
+
+logging:
+  seed: 0
