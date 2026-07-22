@@ -975,6 +975,22 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
 
+    # Three-file I2V inputs carry the original reference-frame path through
+    # the dataset/collate function.  Prefer its basename for generated clips
+    # so outputs can be matched to their conditioning frames without relying
+    # on the line index in ``images.txt``.
+    reference_image_stem = None
+    reference_image_paths = batch.get("image_path") if isinstance(batch, dict) else None
+    if reference_image_paths:
+        if isinstance(reference_image_paths, (list, tuple)):
+            reference_image_path = reference_image_paths[0]
+        else:
+            reference_image_path = reference_image_paths
+        if isinstance(reference_image_path, (str, bytes, os.PathLike)):
+            reference_image_stem = os.path.splitext(
+                os.path.basename(os.fspath(reference_image_path))
+            )[0]
+
     # Skip already-completed videos (mirrors inference_bidir_camera.py):
     # check whether the expected output file exists and is non-empty, so
     # re-running a partially-finished inference job only processes the
@@ -990,7 +1006,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             _skip_rank = dist.get_rank()
         else:
             _skip_rank = 0
-        if config.save_with_index:
+        if reference_image_stem:
+            _skip_base = (
+                reference_image_stem if config.num_samples == 1
+                else f'{reference_image_stem}-{0}'
+            )
+        elif config.save_with_index:
             _skip_base = f'rank{_skip_rank}-{idx}-0_{_skip_model_type}'
         else:
             # prompt is not known yet here, so we can only skip in index mode
@@ -1219,7 +1240,15 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             model_type = "regular"
             
         for seed_idx in range(config.num_samples):
-            if config.save_with_index:
+            if reference_image_stem:
+                # Keep the reference name unchanged for the common one-sample
+                # case; add a seed suffix only when multiple clips are made
+                # from the same conditioning image.
+                base_name = (
+                    reference_image_stem if config.num_samples == 1
+                    else f'{reference_image_stem}-{seed_idx}'
+                )
+            elif config.save_with_index:
                 base_name = f'rank{rank}-{idx}-{seed_idx}_{model_type}'
             else:
                 base_name = f'rank{rank}-{prompt[:100]}-{seed_idx}_{model_type}'
