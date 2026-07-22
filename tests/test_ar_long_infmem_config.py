@@ -1,5 +1,6 @@
 import inspect
 import os
+import types
 import unittest
 
 import torch
@@ -36,6 +37,8 @@ class TestARLongInfMemConfig(unittest.TestCase):
         self.assertEqual(config.model_kwargs.local_attn_size, 12)
         self.assertEqual(config.model_kwargs.sink_size, 4)
         self.assertTrue(config.model_kwargs.enable_relative_rope)
+        self.assertFalse(config.streaming_multistep_supervision)
+        self.assertIsNone(config.streaming_multistep_sampling_steps)
 
     def test_cache_base_is_x0_prediction(self):
         trainer = Trainer.__new__(Trainer)
@@ -59,9 +62,40 @@ class TestARLongInfMemConfig(unittest.TestCase):
 
     def test_gt_is_target_but_not_clean_recache_source(self):
         source = inspect.getsource(Trainer._train_one_step_camera)
-        self.assertIn("training_target(\n                clean_chunk", source)
+        self.assertIn("self.model.scheduler.training_target(", source)
+        self.assertIn("self._streaming_multistep_flow_target(", source)
         self.assertIn("_select_streaming_cache_base(x0_pred)", source)
         self.assertNotIn("_select_streaming_cache_base(clean_chunk", source)
+
+    def test_multistep_mode_uses_solver_latent_for_recache(self):
+        source = inspect.getsource(Trainer._train_one_step_camera)
+        self.assertIn("if self.streaming_multistep_supervision:", source)
+        self.assertIn("sample_scheduler.step(", source)
+        self.assertIn("x0_pred = noisy_chunk", source)
+        self.assertIn("accumulation_steps * num_denoising_steps", source)
+        self.assertIn('getattr(encoder, "has_history", False)', source)
+
+    def test_inference_timestep_maps_to_training_grid(self):
+        trainer = Trainer.__new__(Trainer)
+        trainer.model = types.SimpleNamespace(
+            scheduler=types.SimpleNamespace(
+                timesteps=torch.tensor([1000.0, 750.0, 500.0, 250.0, 0.0])
+            )
+        )
+        indices = trainer._nearest_training_timestep_index(
+            torch.tensor(510.0), batch_size=2, num_frames=4
+        )
+        self.assertEqual(indices.shape, (2, 4))
+        self.assertTrue(torch.equal(indices, torch.full((2, 4), 2)))
+
+    def test_multistep_target_rectifies_current_solver_state(self):
+        clean = torch.tensor([[[[[2.0]]]]])
+        latent = torch.tensor([[[[[5.0]]]]], requires_grad=True)
+        target = Trainer._streaming_multistep_flow_target(
+            latent, clean, torch.tensor(500.0), 1000
+        )
+        self.assertTrue(torch.equal(target, torch.tensor([[[[[6.0]]]]])))
+        self.assertFalse(target.requires_grad)
 
 
 if __name__ == "__main__":

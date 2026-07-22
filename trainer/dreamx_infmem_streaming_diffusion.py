@@ -59,6 +59,26 @@ class Trainer(DiffusionTrainer):
         self.streaming_fsdp_no_sync = bool(
             getattr(config, "streaming_fsdp_no_sync", True)
         )
+        self.streaming_multistep_supervision = bool(
+            getattr(config, "streaming_multistep_supervision", False)
+        )
+        configured_multistep_steps = getattr(
+            config, "streaming_multistep_sampling_steps", None
+        )
+        if configured_multistep_steps is None:
+            configured_multistep_steps = section_get(
+                config, "inference", "sampling_steps", 50
+            )
+        self.streaming_multistep_sampling_steps = int(configured_multistep_steps)
+        if (
+            self.streaming_multistep_supervision
+            and self.streaming_multistep_sampling_steps < 2
+        ):
+            raise ValueError(
+                "streaming_multistep_supervision requires at least two "
+                "denoising steps; got streaming_multistep_sampling_steps="
+                f"{self.streaming_multistep_sampling_steps}."
+            )
         self.streaming_cache_source = str(
             getattr(config, "streaming_cache_source", "prediction")
         ).strip().lower()
@@ -128,6 +148,13 @@ class Trainer(DiffusionTrainer):
                     "[DreamXInfMemStreaming] persistent long rollout enabled: "
                     f"bounded_window={self.streaming_bounded_window_size} frames."
                 )
+            if self.streaming_multistep_supervision:
+                print(
+                    "[DreamXInfMemStreaming] inference-consistent multi-step "
+                    "supervision enabled: solver=unipc, "
+                    f"steps={self.streaming_multistep_sampling_steps}, "
+                    "loss_reduction=mean_over_steps."
+                )
 
     def _fsdp_gradient_sync_context(self, sync_gradients):
         """Return root-FSDP no_sync for intermediate streaming backwards."""
@@ -144,6 +171,40 @@ class Trainer(DiffusionTrainer):
                 "Persistent recache must use x0_pred, never the GT latent."
             )
         return x0_pred.detach().clone()
+
+    def _build_streaming_sample_scheduler(self, device):
+        """Build the same per-chunk UniPC schedule used by AR inference."""
+        from wan_5b.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+        scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=self.model.scheduler.num_train_timesteps,
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+        scheduler.set_timesteps(
+            self.streaming_multistep_sampling_steps,
+            device=device,
+            shift=float(self.model.scheduler.shift),
+        )
+        return scheduler
+
+    def _nearest_training_timestep_index(self, timestep, batch_size, num_frames):
+        """Map one inference timestep onto the flow-training scheduler grid."""
+        train_timesteps = self.model.scheduler.timesteps.to(timestep.device)
+        index = torch.argmin((train_timesteps - timestep).abs()).to(torch.long)
+        return index.reshape(1, 1).expand(batch_size, num_frames).clone()
+
+    @staticmethod
+    def _streaming_multistep_flow_target(
+        latents, clean_latents, timestep, num_train_timesteps
+    ):
+        """Velocity that rectifies the current solver state toward clean GT."""
+        sigma = (timestep.float() / float(num_train_timesteps)).clamp_min(1.0e-6)
+        return (
+            (latents.detach().float() - clean_latents.float())
+            .div(sigma)
+            .to(latents.dtype)
+        )
 
     @staticmethod
     def _next_bounded_window(cursor, num_frame, window_size):
@@ -364,7 +425,11 @@ class Trainer(DiffusionTrainer):
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
-        from utils.infinity_memory_hooks import maybe_detach_infmem, reset_infmem
+        from utils.infinity_memory_hooks import (
+            get_infmem_encoder,
+            maybe_detach_infmem,
+            reset_infmem,
+        )
 
         persistent_window = self.streaming_bounded_window_size > 0
         if persistent_window:
@@ -456,13 +521,19 @@ class Trainer(DiffusionTrainer):
             and self.is_main_process
             and not getattr(self, "_fsdp_sync_schedule_logged", False)
         ):
+            backwards_per_chunk = (
+                self.streaming_multistep_sampling_steps
+                if self.streaming_multistep_supervision
+                else 1
+            )
             sync_backwards = (
                 1 if self.streaming_fsdp_no_sync
-                else num_chunks * accumulation_steps
+                else num_chunks * backwards_per_chunk * accumulation_steps
             )
             print(
                 "[DreamXInfMemStreaming] FSDP backward sync schedule: "
                 f"chunks={num_chunks}, accumulation_steps={accumulation_steps}, "
+                f"backwards_per_chunk={backwards_per_chunk}, "
                 f"synchronized_backwards_per_optimizer_step={sync_backwards}."
             )
             self._fsdp_sync_schedule_logged = True
@@ -492,17 +563,30 @@ class Trainer(DiffusionTrainer):
             )
             current_start = start * frame_seq_length
             chunk_frames = end - start
-            index_chunk = self.model._get_timestep(
-                0,
-                self.model.scheduler.num_train_timesteps,
-                batch_size,
-                chunk_frames,
-                self.model.num_frame_per_block,
-                uniform_timestep=False,
-            )
-            timestep_chunk = self.model.scheduler.timesteps[index_chunk].to(
-                dtype=self.dtype, device=self.device
-            )
+            sample_scheduler = None
+            if self.streaming_multistep_supervision:
+                sample_scheduler = self._build_streaming_sample_scheduler(
+                    clean_chunk.device
+                )
+                first_timestep = sample_scheduler.timesteps[0]
+                index_chunk = self._nearest_training_timestep_index(
+                    first_timestep, batch_size, chunk_frames
+                )
+                timestep_chunk = first_timestep.to(
+                    dtype=torch.float32, device=self.device
+                ).reshape(1, 1).expand(batch_size, chunk_frames).clone()
+            else:
+                index_chunk = self.model._get_timestep(
+                    0,
+                    self.model.scheduler.num_train_timesteps,
+                    batch_size,
+                    chunk_frames,
+                    self.model.num_frame_per_block,
+                    uniform_timestep=False,
+                )
+                timestep_chunk = self.model.scheduler.timesteps[index_chunk].to(
+                    dtype=self.dtype, device=self.device
+                )
             if context_frames > 0 and start < context_frames:
                 pinned = min(chunk_frames, context_frames - start)
                 timestep_chunk[:, :pinned] = 0
@@ -535,63 +619,191 @@ class Trainer(DiffusionTrainer):
                     )
                     er_latent_injected = er_latent_injected or injected
 
-            noisy_chunk = self.model.scheduler.add_noise(
-                clean_chunk_for_noise.flatten(0, 1),
-                noise_chunk_for_train.flatten(0, 1),
-                timestep_chunk.flatten(0, 1),
-            ).unflatten(0, (batch_size, end - start))
-            training_target_chunk = self.model.scheduler.training_target(
-                clean_chunk, noise_chunk_for_train, timestep_chunk
-            )
-            if context_frames > 0 and start < context_frames:
-                pinned = max(0, min(end, context_frames) - start)
-                noisy_chunk[:, :pinned] = initial_latent[:, start:start + pinned].to(
-                    device=noisy_chunk.device, dtype=noisy_chunk.dtype
-                )
-                training_target_chunk[:, :pinned] = 0
-
             reached_sync_boundary = (
                 end == window_end if persistent_window else end == num_frame
             )
-            sync_gradients = (
-                reached_sync_boundary
-                and accumulation_step == accumulation_steps - 1
-            )
-            with self._fsdp_gradient_sync_context(sync_gradients):
-                flow_pred, x0_pred = self.model.generator(
-                    noisy_image_or_video=noisy_chunk,
-                    conditional_dict=block_cond,
-                    timestep=timestep_chunk,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=current_start,
-                    defer_cache_updates=True,
-                    update_memory=False,
-                    apply_cache_updates=False,
-                    checkpoint_blocks=self.streaming_activation_checkpointing,
-                    viewmats=chunk_viewmats,
-                    Ks=chunk_Ks,
-                )
+            pinned = max(0, min(end, context_frames) - start)
 
-                per_frame = torch.nn.functional.mse_loss(
-                    flow_pred.float(),
-                    training_target_chunk.float(),
-                    reduction="none",
-                ).mean(dim=(2, 3, 4))
-                weight = self.model.scheduler.training_weight(
-                    timestep_chunk
-                ).unflatten(0, (batch_size, end - start)).float()
-                per_frame = per_frame * weight
-                if context_frames > 0 and start < context_frames:
-                    per_frame[:, : max(0, min(end, context_frames) - start)] = 0
-                chunk_loss = per_frame.sum() / valid_count
-                scaled_chunk_loss = chunk_loss / accumulation_steps
-                if scaled_chunk_loss.requires_grad:
-                    scaled_chunk_loss.backward()
-                elif not bool(getattr(self.config, "train_memory_only", False)):
-                    raise RuntimeError(
-                        "Streaming chunk loss has no gradient path."
+            if self.streaming_multistep_supervision:
+                # Match inference: every AR chunk starts from pure noise and is
+                # advanced through the complete UniPC schedule. Each visited
+                # state receives flow supervision. The sampler transition is
+                # detached so memory stays bounded independently of step count.
+                noisy_chunk = noise_chunk_for_train.detach().clone()
+                if pinned > 0:
+                    noisy_chunk[:, :pinned] = initial_latent[
+                        :, start:start + pinned
+                    ].to(device=noisy_chunk.device, dtype=noisy_chunk.dtype)
+                chunk_loss = torch.zeros(
+                    [], device=self.device, dtype=torch.float32
+                )
+                num_denoising_steps = len(sample_scheduler.timesteps)
+                for denoise_index, inference_timestep in enumerate(
+                    sample_scheduler.timesteps
+                ):
+                    timestep_chunk = inference_timestep.to(
+                        dtype=torch.float32, device=self.device
+                    ).reshape(1, 1).expand(batch_size, chunk_frames).clone()
+                    index_chunk = self._nearest_training_timestep_index(
+                        inference_timestep, batch_size, chunk_frames
                     )
+                    if pinned > 0:
+                        noisy_chunk[:, :pinned] = initial_latent[
+                            :, start:start + pinned
+                        ].to(device=noisy_chunk.device, dtype=noisy_chunk.dtype)
+                        timestep_chunk[:, :pinned] = 0
+
+                    # Rectify the actual on-policy solver state toward GT. For
+                    # a flow path x_sigma=(1-sigma)*x0+sigma*noise, the target
+                    # velocity is (x_sigma-x0)/sigma. This equals noise-x0 on
+                    # the first step and stays well-defined after rollout drift.
+                    training_target_chunk = self._streaming_multistep_flow_target(
+                        noisy_chunk,
+                        clean_chunk,
+                        inference_timestep,
+                        self.model.scheduler.num_train_timesteps,
+                    )
+                    if pinned > 0:
+                        training_target_chunk[:, :pinned] = 0
+
+                    is_last_denoise_step = (
+                        denoise_index == num_denoising_steps - 1
+                    )
+                    sync_gradients = (
+                        reached_sync_boundary
+                        and is_last_denoise_step
+                        and accumulation_step == accumulation_steps - 1
+                    )
+                    with self._fsdp_gradient_sync_context(sync_gradients):
+                        flow_pred, step_x0_pred = self.model.generator(
+                            noisy_image_or_video=noisy_chunk,
+                            conditional_dict=block_cond,
+                            timestep=timestep_chunk,
+                            kv_cache=kv_cache,
+                            crossattn_cache=crossattn_cache,
+                            current_start=current_start,
+                            defer_cache_updates=True,
+                            update_memory=False,
+                            apply_cache_updates=False,
+                            checkpoint_blocks=self.streaming_activation_checkpointing,
+                            viewmats=chunk_viewmats,
+                            Ks=chunk_Ks,
+                        )
+                        per_frame = torch.nn.functional.mse_loss(
+                            flow_pred.float(),
+                            training_target_chunk.float(),
+                            reduction="none",
+                        ).mean(dim=(2, 3, 4))
+                        weight = self.model.scheduler.training_weight(
+                            timestep_chunk
+                        ).unflatten(0, (batch_size, chunk_frames)).float()
+                        per_frame = per_frame * weight
+                        if pinned > 0:
+                            per_frame[:, :pinned] = 0
+                        step_loss = per_frame.sum() / valid_count
+                        scaled_chunk_loss = step_loss / (
+                            accumulation_steps * num_denoising_steps
+                        )
+                        if scaled_chunk_loss.requires_grad:
+                            scaled_chunk_loss.backward()
+                        elif not bool(
+                            getattr(self.config, "train_memory_only", False)
+                        ):
+                            raise RuntimeError(
+                                "Streaming multi-step loss has no gradient path."
+                            )
+                    chunk_loss = chunk_loss + (
+                        step_loss.detach() / num_denoising_steps
+                    )
+
+                    # The prior query state is shared by all denoising steps.
+                    # Its update graph has already been consumed by the first
+                    # backward, so cut only that compact state graph before the
+                    # next supervised forward. Encoder projections and the
+                    # generator remain trainable at every denoising step.
+                    if denoise_index == 0 and num_denoising_steps > 1:
+                        encoder = get_infmem_encoder(self.model.generator)
+                        if (
+                            encoder is not None
+                            and getattr(encoder, "has_history", False)
+                            and encoder.query_state is not None
+                        ):
+                            encoder.detach_state()
+
+                    with torch.no_grad():
+                        noisy_chunk = sample_scheduler.step(
+                            flow_pred.detach(),
+                            inference_timestep,
+                            noisy_chunk,
+                            return_dict=False,
+                        )[0].detach()
+                        if pinned > 0:
+                            noisy_chunk[:, :pinned] = initial_latent[
+                                :, start:start + pinned
+                            ].to(
+                                device=noisy_chunk.device,
+                                dtype=noisy_chunk.dtype,
+                            )
+                    del step_x0_pred, step_loss
+
+                # Inference recaches the final solver latent, not a one-step x0
+                # estimate. Preserve that exact self-fed state transition.
+                x0_pred = noisy_chunk
+            else:
+                training_target_chunk = self.model.scheduler.training_target(
+                    clean_chunk, noise_chunk_for_train, timestep_chunk
+                )
+                if pinned > 0:
+                    training_target_chunk[:, :pinned] = 0
+                noisy_chunk = self.model.scheduler.add_noise(
+                    clean_chunk_for_noise.flatten(0, 1),
+                    noise_chunk_for_train.flatten(0, 1),
+                    timestep_chunk.flatten(0, 1),
+                ).unflatten(0, (batch_size, end - start))
+                if pinned > 0:
+                    noisy_chunk[:, :pinned] = initial_latent[
+                        :, start:start + pinned
+                    ].to(device=noisy_chunk.device, dtype=noisy_chunk.dtype)
+                sync_gradients = (
+                    reached_sync_boundary
+                    and accumulation_step == accumulation_steps - 1
+                )
+                with self._fsdp_gradient_sync_context(sync_gradients):
+                    flow_pred, x0_pred = self.model.generator(
+                        noisy_image_or_video=noisy_chunk,
+                        conditional_dict=block_cond,
+                        timestep=timestep_chunk,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start,
+                        defer_cache_updates=True,
+                        update_memory=False,
+                        apply_cache_updates=False,
+                        checkpoint_blocks=self.streaming_activation_checkpointing,
+                        viewmats=chunk_viewmats,
+                        Ks=chunk_Ks,
+                    )
+                    per_frame = torch.nn.functional.mse_loss(
+                        flow_pred.float(),
+                        training_target_chunk.float(),
+                        reduction="none",
+                    ).mean(dim=(2, 3, 4))
+                    weight = self.model.scheduler.training_weight(
+                        timestep_chunk
+                    ).unflatten(0, (batch_size, chunk_frames)).float()
+                    per_frame = per_frame * weight
+                    if pinned > 0:
+                        per_frame[:, :pinned] = 0
+                    chunk_loss = per_frame.sum() / valid_count
+                    scaled_chunk_loss = chunk_loss / accumulation_steps
+                    if scaled_chunk_loss.requires_grad:
+                        scaled_chunk_loss.backward()
+                    elif not bool(
+                        getattr(self.config, "train_memory_only", False)
+                    ):
+                        raise RuntimeError(
+                            "Streaming chunk loss has no gradient path."
+                        )
             total_loss_value = total_loss_value + chunk_loss.detach()
 
             # Let the loss consume the prior query state before truncating
@@ -709,6 +921,8 @@ class Trainer(DiffusionTrainer):
                 context_timestep,
                 context_noisy,
             )
+            if self.streaming_multistep_supervision:
+                del sample_scheduler, num_denoising_steps
             if er_ready:
                 del latent_err, sigma, noise_err, lat_items, noise_items
 
@@ -773,6 +987,14 @@ class Trainer(DiffusionTrainer):
             "generator_grad_norm": generator_grad_norm.item(),
             "infmem_grad_norm": infmem_grad_norm.item(),
             "infmem_lr": self.infmem_optimizer.param_groups[0]["lr"],
+            "streaming_multistep_supervision": int(
+                self.streaming_multistep_supervision
+            ),
+            "streaming_denoising_steps": (
+                self.streaming_multistep_sampling_steps
+                if self.streaming_multistep_supervision
+                else 1
+            ),
         }
         if persistent_window:
             wandb_loss_dict.update({
