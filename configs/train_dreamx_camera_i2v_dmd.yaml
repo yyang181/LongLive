@@ -50,13 +50,13 @@ training:
   beta2: 0.999
   beta1_critic: 0.0
   beta2_critic: 0.999
-  batch_size: 1
+  batch_size: 8
   gradient_accumulation_steps: 1
   ema_weight: 0.99
   ema_start_step: 200
   log_iters: 50
   max_checkpoints: 3
-  max_iters: 5000
+  max_iters: 50000000
   gc_interval: 100
   dfake_gen_update_ratio: 5
   min_num_training_frames: 20
@@ -87,8 +87,8 @@ evaluation:
 
 adapter:
   type: lora
-  rank: 128
-  alpha: 128
+  rank: 256
+  alpha: 256
   dropout: 0.0
   apply_to_critic: true
   verbose: true
