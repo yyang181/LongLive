@@ -13,6 +13,7 @@ Top-level keys store global shapes:
 """
 
 import os
+from pathlib import Path
 from typing import Optional, Tuple
 
 import lmdb
@@ -42,6 +43,31 @@ def _retrieve_row(env, array_name, dtype, idx, shape=None):
     if shape is not None and len(shape) > 0:
         arr = arr.reshape(shape)
     return arr
+
+
+def _retrieve_optional_text(env, array_name, idx):
+    """Read an optional UTF-8 metadata field from an LMDB record."""
+    with env.begin() as txn:
+        raw = txn.get(f"{array_name}_{idx}_data".encode())
+    return None if raw is None else raw.decode("utf-8")
+
+
+def _reference_name_from_source_path(source_path: str) -> str:
+    """Derive a collision-resistant output name from a stored source path.
+
+    MIND stores every source clip as ``.../<sample>/video.mp4``.  In that
+    case the video stem alone is not useful, so retain its sample directory
+    and (when present) its first-/third-person dataset component.
+    """
+    path = Path(source_path)
+    if path.stem != "video":
+        return path.stem
+    perspective = next(
+        (parent.name for parent in path.parents
+         if parent.name in {"1st_data", "3rd_data"}),
+        None,
+    )
+    return f"{perspective}_{path.parent.name}" if perspective else path.parent.name
 
 
 def cycle(dl):
@@ -193,11 +219,13 @@ class CameraLatentLMDBDataset(Dataset):
             prompts = _retrieve_row(env, "prompts", str, local_idx)
             intrinsics = _retrieve_row(env, "intrinsics", np.float32, local_idx, ints[1:])
             poses = _retrieve_row(env, "poses", np.float32, local_idx, ps[1:])
+            source_path = _retrieve_optional_text(env, "paths", local_idx)
         else:
             latents = _retrieve_row(self.env, "latents", np.float16, idx, self.latents_shape[1:])
             prompts = _retrieve_row(self.env, "prompts", str, idx)
             intrinsics = _retrieve_row(self.env, "intrinsics", np.float32, idx, self.intrinsics_shape[1:])
             poses = _retrieve_row(self.env, "poses", np.float32, idx, self.poses_shape[1:])
+            source_path = _retrieve_optional_text(self.env, "paths", idx)
 
         if self.target_num_frames is not None:
             # Crop the same latent-frame prefix for image and camera streams.
@@ -222,12 +250,15 @@ class CameraLatentLMDBDataset(Dataset):
             latents_t = torch.from_numpy(latents[-1].copy())
 
         viewmats, Ks = build_viewmats_and_Ks(intrinsics, poses)
-        return {
+        item = {
             "prompts": prompts,
             "clean_latent": latents_t,
             "viewmats": torch.tensor(viewmats, dtype=torch.float32),
             "Ks": torch.tensor(Ks, dtype=torch.float32),
         }
+        if source_path:
+            item["reference_name"] = _reference_name_from_source_path(source_path)
+        return item
 
 
 def build_viewmats_and_Ks(
