@@ -339,6 +339,10 @@ class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
             viewmats, Ks = build_viewmats_and_Ks(sample_intrinsics, poses)
             self.samples.append({
                 "video_path": sample["video_path"],
+                # ``video.mp4`` is the same basename for every MIND clip.
+                # Preserve the unique source-clip identifier instead, so the
+                # output remains traceable to its first (reference) frame.
+                "reference_name": sample["sample_id"],
                 "prompt": str(sample["caption"] or default_caption),
                 "viewmats": torch.from_numpy(viewmats),
                 "Ks": torch.from_numpy(Ks),
@@ -375,6 +379,7 @@ class RawMINDI2VInferenceDataset(torch.utils.data.Dataset):
         return {
             "idx": int(idx),
             "image": frames[:, 0],  # [C,H,W] in [-1,1]
+            "reference_name": sample["reference_name"],
             "prompts": sample["prompt"],
             "viewmats": sample["viewmats"],
             "Ks": sample["Ks"],
@@ -401,6 +406,8 @@ def camera_lmdb_i2v_collate_fn(batch):
         result["image"] = item["image"].unsqueeze(0)
     if "raw_c2w" in item:
         result["raw_c2w"] = item["raw_c2w"].unsqueeze(0)
+    if "reference_name" in item:
+        result["reference_name"] = [item["reference_name"]]
     return result
 
 
@@ -1222,16 +1229,24 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # so outputs can be matched to their conditioning frames without relying
     # on the line index in ``images.txt``.
     reference_image_stem = None
-    reference_image_paths = batch.get("image_path") if isinstance(batch, dict) else None
-    if reference_image_paths:
-        if isinstance(reference_image_paths, (list, tuple)):
-            reference_image_path = reference_image_paths[0]
-        else:
-            reference_image_path = reference_image_paths
-        if isinstance(reference_image_path, (str, bytes, os.PathLike)):
-            reference_image_stem = os.path.splitext(
-                os.path.basename(os.fspath(reference_image_path))
-            )[0]
+    reference_name = batch.get("reference_name") if isinstance(batch, dict) else None
+    if isinstance(reference_name, (list, tuple)):
+        reference_name = reference_name[0] if reference_name else None
+    if isinstance(reference_name, (str, bytes, os.PathLike)):
+        reference_image_stem = os.path.splitext(
+            os.path.basename(os.fspath(reference_name))
+        )[0]
+    else:
+        reference_image_paths = batch.get("image_path") if isinstance(batch, dict) else None
+        if reference_image_paths:
+            if isinstance(reference_image_paths, (list, tuple)):
+                reference_image_path = reference_image_paths[0]
+            else:
+                reference_image_path = reference_image_paths
+            if isinstance(reference_image_path, (str, bytes, os.PathLike)):
+                reference_image_stem = os.path.splitext(
+                    os.path.basename(os.fspath(reference_image_path))
+                )[0]
 
     # Skip already-completed videos (mirrors inference_bidir_camera.py):
     # check whether the expected output file exists and is non-empty, so
